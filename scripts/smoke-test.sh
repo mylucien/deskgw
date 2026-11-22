@@ -127,4 +127,27 @@ python3 "$SCRIPT_DIR/rdp-tunnel-test.py" https://127.0.0.1:18443 smoke-test-pw |
 }
 ok
 
+echo "== 10. 文件网关鉴权 =="
+# 无文件令牌访问文件接口应被拒（令牌校验在任何 SMB 连接之前发生）
+code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" \
+	'https://127.0.0.1:18443/api/files/list?path=')
+[ "$code" = "401" ] || fail "无文件令牌访问应返回 401，实际 $code"
+# 伪造令牌应被拒
+code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" -H 'X-File-Token: bogus' \
+	'https://127.0.0.1:18443/api/files/list?path=')
+[ "$code" = "401" ] || fail "伪造文件令牌应返回 401，实际 $code"
+# 签发令牌需要有效会话；不存在的会话应返回 404
+code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" \
+	-H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" \
+	-X POST https://127.0.0.1:18443/api/files/token \
+	-d '{"session_id":999999,"username":"u","password":"p"}')
+[ "$code" = "404" ] || fail "无效会话签发文件令牌应返回 404，实际 $code"
+ok
+
+echo "== 11. 审计 CSV 导出 =="
+csv=$(curl -ksS -b "$WORK/jar" 'https://127.0.0.1:18443/api/admin/audit/export')
+echo "$csv" | grep -q '动作' || fail "审计 CSV 缺少表头"
+echo "$csv" | grep -q 'host.create' || fail "审计 CSV 缺少事件"
+ok
+
 echo "全部通过"

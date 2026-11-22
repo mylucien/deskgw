@@ -19,6 +19,7 @@ import (
 	"github.com/mylucien/deskgw/internal/audit"
 	"github.com/mylucien/deskgw/internal/auth"
 	"github.com/mylucien/deskgw/internal/config"
+	"github.com/mylucien/deskgw/internal/filegw"
 	"github.com/mylucien/deskgw/internal/host"
 	"github.com/mylucien/deskgw/internal/tunnel"
 	"github.com/mylucien/deskgw/internal/user"
@@ -30,12 +31,13 @@ const csrfCookie = "deskgw_csrf"
 
 // Server 保存 API 依赖。
 type Server struct {
-	db      *sql.DB
-	auth    *auth.Manager
-	cfg     config.Config
-	tickets *tunnel.TicketManager
-	gateway *tunnel.Gateway
-	started time.Time
+	db         *sql.DB
+	auth       *auth.Manager
+	cfg        config.Config
+	tickets    *tunnel.TicketManager
+	gateway    *tunnel.Gateway
+	fileTokens *filegw.TokenManager
+	started    time.Time
 }
 
 type ctxKey int
@@ -46,6 +48,7 @@ const sessionKey ctxKey = 1
 func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 	s := &Server{db: db, auth: mgr, cfg: cfg, started: time.Now()}
 	s.tickets = tunnel.NewTicketManager(30 * time.Second)
+	s.fileTokens = filegw.NewTokenManager(30 * time.Minute)
 	s.gateway = tunnel.NewGateway(db, s.tickets,
 		func(uid any, action, target, detail, ip string) {
 			writeAudit(s, uid, action, target, detail, ip)
@@ -58,7 +61,7 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		ok(w, map[string]any{
-			"status": "ok", "version": "0.2.0",
+			"status": "ok", "version": "0.3.0",
 			"uptime": int(time.Since(s.started).Seconds()),
 		})
 	})
@@ -79,6 +82,16 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 		r.Get("/api/hosts", s.myHosts)
 		r.Post("/api/sessions", s.createSession)
 
+		r.Route("/api/files", func(r chi.Router) {
+			r.Post("/token", s.createFileToken)
+			r.Get("/list", s.listFiles)
+			r.Post("/upload", s.uploadFile)
+			r.Get("/download", s.downloadFile)
+			r.Post("/mkdir", func(w http.ResponseWriter, q *http.Request) { s.fileMutation(w, q, "mkdir") })
+			r.Post("/rename", func(w http.ResponseWriter, q *http.Request) { s.fileMutation(w, q, "rename") })
+			r.Post("/delete", func(w http.ResponseWriter, q *http.Request) { s.fileMutation(w, q, "delete") })
+		})
+
 		r.Route("/api/admin", func(r chi.Router) {
 			r.Use(s.requireAdmin)
 			r.Route("/users", func(r chi.Router) {
@@ -94,6 +107,7 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 				r.Delete("/{id}", s.deleteHost)
 			})
 			r.Get("/audit", s.listAudit)
+			r.Get("/audit/export", s.exportAudit)
 			r.Get("/sessions", s.listSessions)
 			r.Delete("/sessions/{id}", s.killSession)
 			r.Get("/settings", s.getSettings)
@@ -517,6 +531,41 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 	ok(w, list)
 }
 
+// exportAudit 把审计事件导出为 CSV（最多 10000 条）。
+func (s *Server) exportAudit(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	uid, _ := strconv.ParseInt(q.Get("user_id"), 10, 64)
+	list, err := audit.List(s.db, uid, q.Get("action"), q.Get("q"), 10000, 0)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="deskgw-audit.csv"`)
+	w.Write([]byte("\xef\xbb\xbf时间,用户,动作,目标,详情,来源IP\n"))
+	for _, e := range list {
+		row := []string{
+			time.Unix(e.TS, 0).Format("2006-01-02 15:04:05"),
+			e.Username, e.Action, e.Target, e.Detail, e.ClientIP,
+		}
+		for i, cell := range row {
+			if i > 0 {
+				w.Write([]byte(","))
+			}
+			w.Write([]byte(csvCell(cell)))
+		}
+		w.Write([]byte("\n"))
+	}
+	writeAudit(s, idFromContext(r), "audit.export", "", strconv.Itoa(len(list)), clientIP(r))
+}
+
+func csvCell(s string) string {
+	if !strings.ContainsAny(s, ",\"\n\r") {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
 type sessionView struct {
 	ID        int64  `json:"id"`
 	Username  string `json:"username"`
@@ -578,6 +627,7 @@ func (s *Server) killSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.gateway.CloseSession(id)
+	s.fileTokens.RevokeSession(id)
 	_, _ = s.db.Exec(`UPDATE sessions SET state='killed', ended_at=? WHERE id=? AND ended_at IS NULL`,
 		time.Now().Unix(), id)
 	writeAudit(s, idFromContext(r), "rdp.kill", strconv.FormatInt(id, 10), "", clientIP(r))

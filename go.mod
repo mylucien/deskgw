@@ -5,12 +5,14 @@ go 1.26.0
 require (
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/hirochachacha/go-smb2 v1.1.0
 	golang.org/x/crypto v0.59.0
 	modernc.org/sqlite v1.62.0
 )
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
+	github.com/geoffgarside/ber v1.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect

@@ -69,11 +69,29 @@
       <p class="muted small">主机 ID 同时作为性能模式被控端的控制码，创建后不建议修改。</p>
     </section>
 
+    <section v-else-if="tab === 'sessions'" class="panel">
+      <div class="panel-head"><h3>在线会话</h3><button @click="load">刷新</button></div>
+      <p class="muted small">Web 登录会话 {{ sessions.web_sessions }} 个；下方为远程桌面会话记录。</p>
+      <table>
+        <thead><tr><th>ID</th><th>用户</th><th>主机</th><th>来源 IP</th><th>开始</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="s in sessions.sessions" :key="s.id">
+            <td>{{ s.id }}</td><td>{{ s.username || '—' }}</td>
+            <td>{{ s.host_name || s.host_id }}</td><td>{{ s.client_ip }}</td>
+            <td>{{ new Date(s.started_at * 1000).toLocaleString() }}</td>
+            <td><span class="tag" :class="s.live ? 'ok' : 'off'">{{ s.live ? '在线' : s.state }}</span></td>
+            <td><button v-if="s.live" class="danger" @click="kill(s.id)">强制下线</button><span v-else>—</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
     <section v-else-if="tab === 'audit'" class="panel">
       <div class="panel-head">
         <h3>审计日志</h3>
         <input v-model="auditQuery" placeholder="按用户 / 目标 / 详情搜索" @keyup.enter="loadAudit" />
         <button @click="loadAudit">查询</button>
+        <button @click="exportAudit">导出 CSV</button>
       </div>
       <table>
         <thead><tr><th>时间</th><th>用户</th><th>动作</th><th>目标</th><th>详情</th><th>来源 IP</th></tr></thead>
@@ -110,8 +128,8 @@ import { get, post, put, del } from '../api'
 
 const tabs = [
   { key: 'users', label: '用户' }, { key: 'hosts', label: '主机' },
-  { key: 'audit', label: '审计' }, { key: 'settings', label: '设置' },
-  { key: 'status', label: '状态' },
+  { key: 'sessions', label: '会话' }, { key: 'audit', label: '审计' },
+  { key: 'settings', label: '设置' }, { key: 'status', label: '状态' },
 ]
 const tab = ref('users')
 const error = ref('')
@@ -119,6 +137,7 @@ const users = ref<any[]>([])
 const hosts = ref<any[]>([])
 const audit = ref<any[]>([])
 const auditQuery = ref('')
+const sessions = ref<{ web_sessions: number; sessions: any[] }>({ web_sessions: 0, sessions: [] })
 const status = ref('')
 const settings = reactive({ session_idle_min: 30, max_upload_mb: 2048 })
 const userForm = ref<any>(null)
@@ -142,7 +161,7 @@ async function load() {
     const [us, hs, st] = await Promise.all([
       get<any[]>('/admin/users'), get<any[]>('/admin/hosts'), get<any>('/admin/sessions'),
     ])
-    users.value = us; hosts.value = hs; status.value = JSON.stringify(st, null, 2)
+    users.value = us; hosts.value = hs; sessions.value = st; status.value = JSON.stringify(st, null, 2)
     const cfg = await get<Record<string, string>>('/admin/settings')
     settings.session_idle_min = Number(cfg.session_idle_min || 30)
     settings.max_upload_mb = Number(cfg.max_upload_mb || 2048)
@@ -178,6 +197,23 @@ async function saveHost() {
 async function removeHost(h: any) {
   if (!confirm(`删除主机 ${h.name}？`)) return
   try { await del(`/admin/hosts/${h.id}`); await load() } catch (e: any) { error.value = e.message }
+}
+async function kill(id: number) {
+  if (!confirm(`强制断开会话 ${id}？`)) return
+  try { await del(`/admin/sessions/${id}`); await load() } catch (e: any) { error.value = e.message }
+}
+async function exportAudit() {
+  try {
+    const q = auditQuery.value.trim() ? `?q=${encodeURIComponent(auditQuery.value.trim())}` : ''
+    const res = await fetch('/api/admin/audit/export' + q, { credentials: 'same-origin' })
+    if (!res.ok) throw new Error('导出失败')
+    const blob = await res.blob()
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = 'deskgw-audit.csv'
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000)
+  } catch (e: any) { error.value = e.message }
 }
 async function saveSettings() {
   try {

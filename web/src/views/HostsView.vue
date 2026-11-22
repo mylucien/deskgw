@@ -39,7 +39,7 @@
     <div v-if="dialog" class="modal-mask" @click.self="closeDialog">
       <div class="modal">
         <h3>连接到 {{ target?.name }}</h3>
-        <p class="muted note">凭据仅用于本次 NLA 认证，不会保存，也不会经过网关。</p>
+        <p class="muted note">凭据用于本次 NLA 认证；文件传输复用该凭据在网关内存中建立短期会话，不落盘、不写日志。</p>
         <form @submit.prevent="submit">
           <label>用户名<input v-model="form.username" required autocomplete="off" /></label>
           <label>密码<input v-model="form.password" type="password" required autocomplete="off" /></label>
@@ -61,6 +61,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { get, post } from '../api'
+import { openTab, workspace, MAX_TABS } from '../sessionTabs'
 
 interface Host {
   id: number; name: string; address: string; rdp_port: number
@@ -103,18 +104,25 @@ function closeDialog() {
 
 async function submit() {
   if (!target.value || submitting.value) return
+  if (workspace.tabs.length >= MAX_TABS) {
+    dialogError.value = `最多同时打开 ${MAX_TABS} 个会话，请先关闭一个标签`
+    return
+  }
   submitting.value = true
   dialogError.value = ''
   try {
     const t = await post<SessionTicket>('/sessions', { host_id: target.value.id })
-    // 凭据经 history.state 传入会话页，不写入 URL，也不持久存储。
-    router.push({
-      name: 'session',
-      query: { name: target.value.name, session_id: String(t.session_id), ws: t.ws_path },
-      state: { deskgwCreds: { ...form } },
+    // 连接信息进入内存标签 store，凭据不写入 URL，也不持久存储。
+    openTab({
+      hostName: target.value.name,
+      hostId: target.value.id,
+      sessionId: t.session_id,
+      wsPath: t.ws_path,
+      creds: { ...form },
     })
     form.password = ''
     dialog.value = false
+    router.push({ name: 'session' })
   } catch (e: any) {
     dialogError.value = e.message || '连接失败'
   } finally {

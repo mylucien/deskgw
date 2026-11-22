@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/mylucien/deskgw/internal/api"
+	"github.com/mylucien/deskgw/internal/audit"
 	"github.com/mylucien/deskgw/internal/auth"
 	"github.com/mylucien/deskgw/internal/config"
 	"github.com/mylucien/deskgw/internal/store"
@@ -58,6 +59,18 @@ func run(cfg config.Config) error {
 	if fp, err := certFingerprint(certFile); err == nil {
 		log.Printf("deskgw 证书 SHA-256 指纹: %s", fp)
 	}
+
+	// 审计日志保留 90 天，每 24 小时清理一次过期记录。
+	go func() {
+		_ = audit.Purge(st.DB, 90)
+		t := time.NewTicker(24 * time.Hour)
+		defer t.Stop()
+		for range t.C {
+			if err := audit.Purge(st.DB, 90); err != nil {
+				log.Printf("清理审计日志失败: %v", err)
+			}
+		}
+	}()
 
 	mgr := auth.NewManager(cfg.SessionIdleMin)
 	srv := &http.Server{
