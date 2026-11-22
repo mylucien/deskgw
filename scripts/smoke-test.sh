@@ -115,4 +115,10 @@ echo "$body" | tail -1 | grep -q '^200$' || { echo "$body" | head -c 500 >&2; fa
 echo "$body" | grep -q '<div id="app"' || { echo "$body" | head -c 500 >&2; fail "首页不是前端 HTML"; }
 ok
 
+echo "== 9. RDP 隧道（票据 / WS / 地址隔离）=="
+command -v python3 >/dev/null || fail "缺少 python3"
+TUNNEL_TEST="$(cd "$(dirname "$0")" && pwd)/rdp-tunnel-test.py"
+python3 "$TUNNEL_TEST" https://127.0.0.1:18443 smoke-test-pw || fail "RDP 隧道测试失败"
+ok
+
 echo "全部通过"

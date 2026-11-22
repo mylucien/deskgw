@@ -20,6 +20,7 @@ import (
 	"github.com/mylucien/deskgw/internal/auth"
 	"github.com/mylucien/deskgw/internal/config"
 	"github.com/mylucien/deskgw/internal/host"
+	"github.com/mylucien/deskgw/internal/tunnel"
 	"github.com/mylucien/deskgw/internal/user"
 	"github.com/mylucien/deskgw/web"
 )
@@ -29,9 +30,11 @@ const csrfCookie = "deskgw_csrf"
 
 // Server 保存 API 依赖。
 type Server struct {
-	db     *sql.DB
-	auth   *auth.Manager
-	cfg    config.Config
+	db      *sql.DB
+	auth    *auth.Manager
+	cfg     config.Config
+	tickets *tunnel.TicketManager
+	gateway *tunnel.Gateway
 	started time.Time
 }
 
@@ -42,6 +45,11 @@ const sessionKey ctxKey = 1
 // New 构造 HTTP handler。
 func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 	s := &Server{db: db, auth: mgr, cfg: cfg, started: time.Now()}
+	s.tickets = tunnel.NewTicketManager(30 * time.Second)
+	s.gateway = tunnel.NewGateway(db, s.tickets,
+		func(uid any, action, target, detail, ip string) {
+			writeAudit(s, uid, action, target, detail, ip)
+		})
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
@@ -50,11 +58,18 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		ok(w, map[string]any{
-			"status": "ok", "version": "0.1.0",
+			"status": "ok", "version": "0.2.0",
 			"uptime": int(time.Since(s.started).Seconds()),
 		})
 	})
 	r.Post("/api/login", s.login)
+
+	// WebSocket 握手由浏览器发起，无法附加自定义 CSRF 头；
+	// 会话 Cookie 同源、Origin 校验与一次性票据共同提供保护。
+	r.Group(func(r chi.Router) {
+		r.Use(s.requireSession)
+		r.Get("/ws/rdp", s.rdpWebSocket)
+	})
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireSession)
@@ -62,6 +77,7 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 		r.Post("/api/logout", s.logout)
 		r.Get("/api/me", s.me)
 		r.Get("/api/hosts", s.myHosts)
+		r.Post("/api/sessions", s.createSession)
 
 		r.Route("/api/admin", func(r chi.Router) {
 			r.Use(s.requireAdmin)
@@ -79,6 +95,7 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 			})
 			r.Get("/audit", s.listAudit)
 			r.Get("/sessions", s.listSessions)
+			r.Delete("/sessions/{id}", s.killSession)
 			r.Get("/settings", s.getSettings)
 			r.Put("/settings", s.putSettings)
 		})
@@ -222,6 +239,84 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ok(w, map[string]any{"user": u, "csrf": csrfFrom(r.Context())})
+}
+
+// createSession 校验权限与并发上限后签发一次性 RDP 连接票据。
+func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
+	sess := fromContext(r.Context())
+	var in struct {
+		HostID int64 `json:"host_id"`
+	}
+	if err := readJSON(r, &in); err != nil || in.HostID < 1 {
+		fail(w, http.StatusBadRequest, "badRequest", "请求格式不正确")
+		return
+	}
+	h, err := host.Get(s.db, in.HostID)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !h.Enabled) {
+		fail(w, http.StatusNotFound, "notFound", "主机不存在或已停用")
+		return
+	}
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if sess.Role != "admin" {
+		var granted int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_hosts WHERE user_id=? AND host_id=?`,
+			sess.UserID, in.HostID).Scan(&granted); err != nil {
+			serverError(w, err)
+			return
+		}
+		if granted == 0 {
+			fail(w, http.StatusForbidden, "forbidden", "无权访问该主机")
+			return
+		}
+	}
+	var active int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE user_id=? AND state IN ('pending','active')`,
+		sess.UserID).Scan(&active); err != nil {
+		serverError(w, err)
+		return
+	}
+	u, err := user.Get(s.db, sess.UserID)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	limit := u.MaxSessions
+	if limit <= 0 {
+		limit = 2
+	}
+	if active >= limit {
+		fail(w, http.StatusTooManyRequests, "limit", "已达到并发会话上限")
+		return
+	}
+
+	res, err := s.db.Exec(`INSERT INTO sessions (user_id, host_id, client_ip, started_at, state, mode)
+		VALUES (?, ?, ?, ?, 'pending', 'rdp')`,
+		sess.UserID, in.HostID, clientIP(r), time.Now().Unix())
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	sid, err := res.LastInsertId()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	tok, err := s.tickets.Issue(sess.UserID, in.HostID, sid, clientIP(r))
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	writeAudit(s, sess.UserID, "rdp.ticket", h.Name, strconv.FormatInt(sid, 10), clientIP(r))
+	ok(w, map[string]any{"ticket": tok, "session_id": sid, "ws_path": "/ws/rdp?ticket=" + tok})
+}
+
+// rdpWebSocket 将已登录的请求交给隧道网关处理。
+func (s *Server) rdpWebSocket(w http.ResponseWriter, r *http.Request) {
+	sess := fromContext(r.Context())
+	s.gateway.Serve(w, r, sess)
 }
 
 func (s *Server) myHosts(w http.ResponseWriter, r *http.Request) {
@@ -422,12 +517,71 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 	ok(w, list)
 }
 
-func (s *Server) listSessions(w http.ResponseWriter, _ *http.Request) {
+type sessionView struct {
+	ID        int64  `json:"id"`
+	Username  string `json:"username"`
+	HostID    int64  `json:"host_id"`
+	HostName  string `json:"host_name"`
+	ClientIP  string `json:"client_ip"`
+	StartedAt int64  `json:"started_at"`
+	EndedAt   any    `json:"ended_at"`
+	State     string `json:"state"`
+	Mode      string `json:"mode"`
+	Live      bool   `json:"live"`
+}
+
+func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`SELECT se.id, COALESCE(u.username,''), se.host_id,
+		COALESCE(h.name,''), se.client_ip, se.started_at, se.ended_at, se.state, se.mode
+		FROM sessions se LEFT JOIN users u ON u.id=se.user_id
+		LEFT JOIN hosts h ON h.id=se.host_id
+		ORDER BY se.id DESC LIMIT ?`, limit)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	defer rows.Close()
+	live := s.gateway.LiveIDs()
+	out := []sessionView{}
+	for rows.Next() {
+		var v sessionView
+		var ended sql.NullInt64
+		if err := rows.Scan(&v.ID, &v.Username, &v.HostID, &v.HostName, &v.ClientIP,
+			&v.StartedAt, &ended, &v.State, &v.Mode); err != nil {
+			serverError(w, err)
+			return
+		}
+		if ended.Valid {
+			v.EndedAt = ended.Int64
+		}
+		v.Live = live[v.ID]
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		serverError(w, err)
+		return
+	}
 	ok(w, map[string]any{
 		"web_sessions": s.auth.ActiveSessions(),
-		"rdp_sessions": 0,
-		"note":         "M1 仅实现 Web 登录会话；远程桌面会话在 M2 接入后显示",
+		"sessions":     out,
 	})
+}
+
+func (s *Server) killSession(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		fail(w, http.StatusBadRequest, "badRequest", "ID 不正确")
+		return
+	}
+	s.gateway.CloseSession(id)
+	_, _ = s.db.Exec(`UPDATE sessions SET state='killed', ended_at=? WHERE id=? AND ended_at IS NULL`,
+		time.Now().Unix(), id)
+	writeAudit(s, idFromContext(r), "rdp.kill", strconv.FormatInt(id, 10), "", clientIP(r))
+	ok(w, map[string]any{})
 }
 
 var allowedSettings = map[string]bool{

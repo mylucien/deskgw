@@ -1,6 +1,6 @@
 <template>
   <div class="shell">
-    <header v-if="state.user" class="topbar">
+    <header v-if="state.user && !inSession" class="topbar">
       <div class="brand">
         <span class="logo">DG</span>
         <span>deskgw <small>远程桌面网关</small></span>
@@ -20,11 +20,14 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
 import { state } from './state'
 import { post } from './api'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 
 const router = useRouter()
+const route = useRoute()
+const inSession = computed(() => route.name === 'session')
 async function logout() {
   try { await post('/logout') } catch { /* ignore */ }
   state.user = null

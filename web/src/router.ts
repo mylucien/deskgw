@@ -6,6 +6,7 @@ export const router = createRouter({
   routes: [
     { path: '/login', name: 'login', component: () => import('./views/LoginView.vue') },
     { path: '/', name: 'hosts', component: () => import('./views/HostsView.vue') },
+    { path: '/session', name: 'session', component: () => import('./views/SessionView.vue') },
     { path: '/admin', name: 'admin', component: () => import('./views/AdminView.vue') },
   ],
 })

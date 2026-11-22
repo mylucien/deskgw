@@ -98,6 +98,8 @@ jobs:
             echo "check $f"
             node -e 'new Function(require("fs").readFileSync(process.argv[1],"utf8"))' "$f"
           done
+      - name: Python 语法
+        run: python3 -m py_compile scripts/rdp-tunnel-test.py
 
   ui:
     name: 构建前端
@@ -335,7 +337,7 @@ jobs:
             dist/deskgw-*.sha256
           body: |
             版本：${{ needs.prepare.outputs.version }} @ ${{ needs.prepare.outputs.short }}
-            范围：M1（登录、用户与主机授权、SQLite、审计、基础前端）
+            范围：M2（M1 全部功能 + RDP 隧道、RDCleanPath 网关、浏览器 NLA、会话管理）
 
             | 文件 | 用途 |
             |---|---|

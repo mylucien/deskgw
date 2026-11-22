@@ -29,26 +29,56 @@
           <dt>备注</dt><dd>{{ h.note || '—' }}</dd>
         </dl>
         <div class="host-actions">
-          <button disabled title="M2 实现">连接（RDP）</button>
-          <button v-if="modes(h.modes).includes('perf')" disabled title="M8 实现">性能模式</button>
+          <button class="primary" :disabled="!h.enabled || !modes(h.modes).includes('rdp')"
+            @click="openDialog(h)">连接（RDP）</button>
+          <button v-if="modes(h.modes).includes('perf')" disabled title="性能模式在 M8 提供">性能模式</button>
         </div>
       </article>
+    </div>
+
+    <div v-if="dialog" class="modal-mask" @click.self="closeDialog">
+      <div class="modal">
+        <h3>连接到 {{ target?.name }}</h3>
+        <p class="muted note">凭据仅用于本次 NLA 认证，不会保存，也不会经过网关。</p>
+        <form @submit.prevent="submit">
+          <label>用户名<input v-model="form.username" required autocomplete="off" /></label>
+          <label>密码<input v-model="form.password" type="password" required autocomplete="off" /></label>
+          <label>域（可选）<input v-model="form.domain" placeholder="留空则使用本机账户" autocomplete="off" /></label>
+          <p v-if="dialogError" class="error">{{ dialogError }}</p>
+          <div class="modal-actions">
+            <button type="button" @click="closeDialog">取消</button>
+            <button type="submit" class="primary" :disabled="submitting">
+              {{ submitting ? '连接中…' : '连接' }}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { get } from '../api'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { get, post } from '../api'
 
 interface Host {
   id: number; name: string; address: string; rdp_port: number
   group_name: string; note: string; enabled: boolean; modes: string
 }
+interface SessionTicket { ticket: string; session_id: number; ws_path: string }
+
+const router = useRouter()
 const hosts = ref<Host[]>([])
 const query = ref('')
 const loading = ref(true)
 const error = ref('')
+const dialog = ref(false)
+const target = ref<Host | null>(null)
+const submitting = ref(false)
+const dialogError = ref('')
+const form = reactive({ username: '', password: '', domain: '' })
+
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase()
   if (!q) return hosts.value
@@ -58,9 +88,54 @@ const filtered = computed(() => {
 function modes(s: string) { return s.split(',').map(x => x.trim()).filter(Boolean) }
 function modeName(m: string) { return m === 'perf' ? '性能模式' : 'RDP' }
 
+function openDialog(h: Host) {
+  target.value = h
+  dialogError.value = ''
+  form.username = ''
+  form.password = ''
+  form.domain = ''
+  dialog.value = true
+}
+function closeDialog() {
+  dialog.value = false
+  form.password = ''
+}
+
+async function submit() {
+  if (!target.value || submitting.value) return
+  submitting.value = true
+  dialogError.value = ''
+  try {
+    const t = await post<SessionTicket>('/sessions', { host_id: target.value.id })
+    // 凭据经 history.state 传入会话页，不写入 URL，也不持久存储。
+    router.push({
+      name: 'session',
+      query: { name: target.value.name, session_id: String(t.session_id), ws: t.ws_path },
+      state: { deskgwCreds: { ...form } },
+    })
+    form.password = ''
+    dialog.value = false
+  } catch (e: any) {
+    dialogError.value = e.message || '连接失败'
+  } finally {
+    submitting.value = false
+  }
+}
+
 onMounted(async () => {
   try { hosts.value = await get<Host[]>('/hosts') }
   catch (e: any) { error.value = e.message }
   finally { loading.value = false }
 })
 </script>
+
+<style scoped>
+.modal-mask { position: fixed; inset: 0; display: grid; place-items: center;
+  background: rgba(15,17,21,.5); z-index: 20; }
+.modal { width: 380px; max-width: 92%; background: #fff; border-radius: 12px;
+  padding: 22px; box-shadow: 0 8px 30px rgba(0,0,0,.18); }
+.modal h3 { margin: 0 0 4px; font-size: 17px; }
+.modal .note { font-size: 12px; margin-bottom: 16px; }
+.modal form { display: flex; flex-direction: column; gap: 12px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+</style>
