@@ -15,6 +15,10 @@ on:
         description: '手动触发时是否发布 Release'
         type: boolean
         default: false
+      gensum:
+        description: '生成并提交 go.sum（仅用于初始化依赖）'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -27,6 +31,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  gensum:
+    name: 生成 go.sum
+    if: github.event_name == 'workflow_dispatch' && inputs.gensum
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: go mod tidy 并提交
+        env:
+          GOFLAGS: ''
+        run: |
+          set -e
+          go mod tidy
+          git config user.name 'deskgw-bot'
+          git config user.email 'bot@users.noreply.github.com'
+          git add go.mod go.sum
+          git diff --cached --quiet || git commit -m 'chore: 生成 go.sum'
+          git push origin HEAD:main
+
   prepare:
     name: 读取版本
     runs-on: ubuntu-24.04
