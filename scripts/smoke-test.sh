@@ -78,7 +78,7 @@ ok
 echo "== 6. 认证与授权 =="
 CSRF=$(awk '$6=="deskgw_csrf" {print $7}' "$WORK/jar")
 [ -n "$CSRF" ] || fail "未收到 CSRF Cookie"
-code=$(curl -ksS -o /dev/null -w '%{http_code}' -X POST https://127.0.0.1:18443/api/login \
+code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" -X POST https://127.0.0.1:18443/api/login \
 	-H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" \
 	-d '{"username":"admin","password":"wrong"}')
 [ "$code" = "401" ] || fail "错误密码应返回 401，实际 $code"
