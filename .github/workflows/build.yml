@@ -307,14 +307,8 @@ jobs:
           pattern: sdk-*
           merge-multiple: true
           path: dist
-      - name: 重命名预编译包
-        run: |
-          set -e
-          for f in dist/deskgw-*.tar.gz; do
-            [ -e "$f" ] || continue
-            mv "$f" "dist/prebuilt-$(basename "$f")"
-          done
-          ls -l dist
+      - name: 列出产物
+        run: ls -l dist
       - name: 决定 tag
         id: rel
         run: |
@@ -337,7 +331,8 @@ jobs:
           files: |
             dist/*.ipk
             dist/*.apk
-            dist/prebuilt-*
+            dist/deskgw-*.tar.gz
+            dist/deskgw-*.sha256
           body: |
             版本：${{ needs.prepare.outputs.version }} @ ${{ needs.prepare.outputs.short }}
             范围：M1（登录、用户与主机授权、SQLite、审计、基础前端）
@@ -346,7 +341,7 @@ jobs:
             |---|---|
             | `*.ipk` | OpenWrt / ImmortalWrt 24.10（opkg） |
             | `*.apk` | ImmortalWrt 25.12 / snapshot（apk），an7581 只能用这个 |
-            | `prebuilt-*.tar.gz` | `openwrt/Makefile` 的二进制来源 |
+            | `deskgw-<arch>.tar.gz` | `openwrt/Makefile` 的二进制来源 |
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: bin
@@ -354,7 +349,8 @@ jobs:
           prerelease: true
           make_latest: false
           files: |
-            dist/prebuilt-*
+            dist/deskgw-*.tar.gz
+            dist/deskgw-*.sha256
           body: |
             滚动更新的预编译二进制，供 `openwrt/Makefile` 的 `Build/Prepare` 使用。
             来源：${{ needs.prepare.outputs.version }} @ ${{ needs.prepare.outputs.short }}
