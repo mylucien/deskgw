@@ -108,7 +108,8 @@ def fake_rdp(listener, sslctx, ready, stop):
     conn.settimeout(10)
     try:
         conn.recv(4096)                     # X.224 Connection Request
-        x224_cc = bytes([3, 0, 0, 11]) + b'\xe0\x00\x00\x00\x00\x00\x00\x00'
+        x224_payload = b'\xe0\x00\x00\x00\x00\x00\x00'   # 7 字节 X.224 CC
+        x224_cc = bytes([3, 0, 0, 4 + len(x224_payload)]) + x224_payload
         conn.sendall(x224_cc)              # X.224 Connection Confirm (TPKT)
         tls = sslctx.wrap_socket(conn, server_side=True)   # TLS 握手
         ready.set()

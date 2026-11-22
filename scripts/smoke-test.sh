@@ -120,7 +120,11 @@ ok
 
 echo "== 9. RDP 隧道（票据 / WS / 地址隔离）=="
 command -v python3 >/dev/null || fail "缺少 python3"
-python3 "$SCRIPT_DIR/rdp-tunnel-test.py" https://127.0.0.1:18443 smoke-test-pw || fail "RDP 隧道测试失败"
+python3 "$SCRIPT_DIR/rdp-tunnel-test.py" https://127.0.0.1:18443 smoke-test-pw || {
+  echo "--- 网关日志（隧道测试失败）---" >&2
+  cat "$WORK/server.log" >&2
+  fail "RDP 隧道测试失败"
+}
 ok
 
 echo "全部通过"
