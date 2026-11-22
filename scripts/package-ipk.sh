@@ -60,7 +60,12 @@ Description: OpenWrt Web 远程桌面网关
 EOF
 echo "2.0" > "$STAGE/debian-binary"
 
-( cd "$CTRL" && tar -czf "$STAGE/control.tar.gz" --owner=0 --group=0 --numeric-owner ./control )
+# conffiles 声明配置文件：opkg 升级时保留用户已修改的 UCI 配置，不整体覆盖。
+cat > "$CTRL/conffiles" <<EOF
+/etc/config/deskgw
+EOF
+
+( cd "$CTRL" && tar -czf "$STAGE/control.tar.gz" --owner=0 --group=0 --numeric-owner ./control ./conffiles )
 ( cd "$ROOT" && tar -czf "$STAGE/data.tar.gz" --owner=0 --group=0 --numeric-owner ./ )
 
 IPK="$OUTDIR/${PKG}_${PKGVER}_${ARCH}.ipk"

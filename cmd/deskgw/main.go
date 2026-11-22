@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -148,15 +149,27 @@ func ensureInitialUser(db *sql.DB, cfg config.Config) error {
 		if err := os.WriteFile(p, []byte(password+"\n"), 0o600); err != nil {
 			log.Printf("警告: 无法保存初始密码: %v", err)
 		}
-		log.Printf("初始管理员 admin 密码: %s（另存于 %s）", password, p)
+		// 不把明文密码写进 syslog / 串口控制台：日志常被转发到远端或留在闪存里。
+		log.Printf("已创建初始管理员 admin，初始密码见 %s（首次登录后请立即修改）", p)
 	}
 	return nil
 }
 
 // ensureCert 在证书缺失时生成自签 ECDSA P-256 证书。
+// 若现有证书是本程序生成的自签证书，而 DESKGW_CERT_NAMES 已经变化，
+// 则重新签发，使 LuCI 里修改证书名称后重启即可生效。
+// 用户自备的证书（非自签或 CN 不是 deskgw）不会被覆盖。
 func ensureCert(cfg config.Config) (string, string, error) {
 	if fileExists(cfg.CertFile) && fileExists(cfg.KeyFile) {
-		return cfg.CertFile, cfg.KeyFile, nil
+		cert, err := loadCert(cfg.CertFile)
+		if err != nil {
+			// 证书损坏或格式不受支持：让 TLS 启动时报错，不擅自覆盖用户文件。
+			return cfg.CertFile, cfg.KeyFile, nil
+		}
+		if !isOwnCert(cert) || certCovers(cert, cfg.CertNames) {
+			return cfg.CertFile, cfg.KeyFile, nil
+		}
+		log.Printf("证书名称已变更，重新生成自签证书: %v", cfg.CertNames)
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -201,16 +214,55 @@ func ensureCert(cfg config.Config) (string, string, error) {
 	return cfg.CertFile, cfg.KeyFile, nil
 }
 
-func certFingerprint(path string) (string, error) {
+func loadCert(path string) (*x509.Certificate, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	block, _ := pem.Decode(raw)
 	if block == nil {
-		return "", errors.New("证书格式不正确")
+		return nil, errors.New("证书格式不正确")
 	}
-	cert, err := x509.ParseCertificate(block.Bytes)
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// isOwnCert 判断证书是否由本程序自动生成（自签且 CN=deskgw）。
+func isOwnCert(cert *x509.Certificate) bool {
+	return cert.Subject.CommonName == "deskgw" && cert.Issuer.String() == cert.Subject.String()
+}
+
+// certCovers 检查证书的 SAN 是否覆盖所有配置的域名/IP。
+func certCovers(cert *x509.Certificate, names []string) bool {
+	for _, n := range names {
+		if ip := net.ParseIP(n); ip != nil {
+			found := false
+			for _, have := range cert.IPAddresses {
+				if have.Equal(ip) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+			continue
+		}
+		found := false
+		for _, have := range cert.DNSNames {
+			if strings.EqualFold(have, n) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func certFingerprint(path string) (string, error) {
+	cert, err := loadCert(path)
 	if err != nil {
 		return "", err
 	}

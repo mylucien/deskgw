@@ -79,8 +79,8 @@
             <td>{{ s.id }}</td><td>{{ s.username || '—' }}</td>
             <td>{{ s.host_name || s.host_id }}</td><td>{{ s.client_ip }}</td>
             <td>{{ new Date(s.started_at * 1000).toLocaleString() }}</td>
-            <td><span class="tag" :class="s.live ? 'ok' : 'off'">{{ s.live ? '在线' : s.state }}</span></td>
-            <td><button v-if="s.live" class="danger" @click="kill(s.id)">强制下线</button><span v-else>—</span></td>
+            <td><span class="tag" :class="s.live ? 'ok' : 'off'">{{ s.live ? '在线' : stateName(s.state) }}</span></td>
+            <td><button v-if="s.closable" class="danger" @click="kill(s.id)">强制下线</button><span v-else>—</span></td>
           </tr>
         </tbody>
       </table>
@@ -93,6 +93,7 @@
         <button @click="loadAudit">查询</button>
         <button @click="exportAudit">导出 CSV</button>
       </div>
+      <p class="muted small">列表显示最近 100 条匹配记录；需要完整数据请使用「导出 CSV」。</p>
       <table>
         <thead><tr><th>时间</th><th>用户</th><th>动作</th><th>目标</th><th>详情</th><th>来源 IP</th></tr></thead>
         <tbody>
@@ -112,7 +113,7 @@
         <label>单文件上传上限（MB）<input v-model.number="settings.max_upload_mb" type="number" min="1" /></label>
         <div class="full"><button class="primary" type="submit">保存</button></div>
       </form>
-      <p class="muted small">性能模式设置将在 M8 启用。</p>
+      <p class="muted small">保存后立即生效。未保存过时，默认值来自 UCI 配置的对应选项。性能模式设置将在 M8 启用。</p>
     </section>
 
     <section v-else class="panel">
@@ -142,6 +143,13 @@ const status = ref('')
 const settings = reactive({ session_idle_min: 30, max_upload_mb: 2048 })
 const userForm = ref<any>(null)
 const hostForm = ref<any>(null)
+
+const SESSION_STATES: Record<string, string> = {
+  pending: '等待连接', active: '进行中', closed: '已结束', killed: '已强制下线',
+  timeout: '超时回收', stale: '重启前遗留', failed: '建立失败',
+  handshake_failed: '握手失败', upgrade_failed: '升级失败',
+}
+function stateName(state: string) { return SESSION_STATES[state] || state }
 
 function resetUser() {
   return { id: 0, username: '', password: '', role: 'user', enabled: true,

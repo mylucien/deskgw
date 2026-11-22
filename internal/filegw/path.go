@@ -16,11 +16,12 @@ var (
 var shareRE = regexp.MustCompile(`^[A-Za-z0-9_$.-]{1,64}$`)
 
 // NormalizeShare 校验共享名。默认 C$，管理共享为 C$ / D$。
+// 拒绝 "." / ".."：它们只是相对目录记号，不是合法共享名。
 func NormalizeShare(share string) (string, error) {
 	if share == "" {
 		share = "C$"
 	}
-	if !shareRE.MatchString(share) {
+	if share == "." || share == ".." || !shareRE.MatchString(share) {
 		return "", ErrBadShare
 	}
 	return share, nil
@@ -62,23 +63,4 @@ func NormalizePath(p string) (string, error) {
 		return "", nil
 	}
 	return strings.Join(out, "\\"), nil
-}
-
-// JoinPath 拼接目录与文件名，再做一次规范化，防止二次穿越。
-func JoinPath(dir, name string) (string, error) {
-	d, err := NormalizePath(dir)
-	if err != nil {
-		return "", err
-	}
-	n, err := NormalizePath(name)
-	if err != nil {
-		return "", err
-	}
-	if n == "" {
-		return "", ErrBadPath
-	}
-	if d == "" {
-		return n, nil
-	}
-	return d + "\\" + n, nil
 }

@@ -7,6 +7,14 @@ export interface ApiError extends Error {
   code?: string
 }
 
+// 登录态在服务端滑动过期；任一接口返回 401 说明会话已失效，
+// 直接回登录页，避免页面停留在"看似可用、点击全失败"的状态。
+function redirectIfUnauthorized(status: number) {
+  if (status !== 401) return
+  if (location.pathname === '/login') return
+  location.assign('/login')
+}
+
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const method = (options.method || 'GET').toUpperCase()
   const headers = new Headers(options.headers)
@@ -21,6 +29,7 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
   let payload: any
   try { payload = await res.json() } catch { payload = null }
   if (!res.ok || !payload?.ok) {
+    redirectIfUnauthorized(res.status)
     const err: ApiError = new Error(payload?.error?.message || `请求失败 (${res.status})`)
     err.code = payload?.error?.code
     throw err
@@ -44,6 +53,7 @@ export async function uploadChunk<T = any>(p: string, chunk: Blob, headers: Reco
   let payload: any
   try { payload = await res.json() } catch { payload = null }
   if (!res.ok || !payload?.ok) {
+    redirectIfUnauthorized(res.status)
     const err: ApiError = new Error(payload?.error?.message || `上传失败 (${res.status})`)
     err.code = payload?.error?.code
     throw err
@@ -55,7 +65,10 @@ export async function uploadChunk<T = any>(p: string, chunk: Blob, headers: Reco
 export async function downloadBlob(p: string, headers: Record<string, string>): Promise<{ blob: Blob; name: string }> {
   const h = new Headers(headers)
   const res = await fetch('/api' + p, { headers: h, credentials: 'same-origin' })
-  if (!res.ok) throw new Error(`下载失败 (${res.status})`)
+  if (!res.ok) {
+    redirectIfUnauthorized(res.status)
+    throw new Error(`下载失败 (${res.status})`)
+  }
   const blob = await res.blob()
   const cd = res.headers.get('Content-Disposition') || ''
   const m = cd.match(/filename\*=UTF-8''([^;]+)/i)

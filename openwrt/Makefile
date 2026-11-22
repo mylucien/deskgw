@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=deskgw
-PKG_VERSION:=0.1.0
+PKG_VERSION:=0.3.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=mylucien
@@ -27,8 +27,9 @@ define Package/deskgw
 endef
 
 define Package/deskgw/description
- 在路由器上提供基于浏览器的 Windows 远程桌面网关。M1 包含 HTTPS 管理界面、
- 多用户与主机授权、审计日志；远程桌面通道在后续里程碑接入。
+ 在路由器上提供基于浏览器的 Windows 远程桌面网关。包含 HTTPS 管理界面、
+ 多用户与主机授权、审计日志、RDP 隧道与浏览器端 NLA 认证、应用内多标签
+ 会话，以及基于 SMB 的文件传输。
 endef
 
 define Build/Prepare

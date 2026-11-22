@@ -24,8 +24,8 @@ var ErrTicketInvalid = errors.New("连接票据无效")
 
 // TicketManager 在内存中保存短时票据。
 type TicketManager struct {
-	mu   sync.Mutex
-	ttl  time.Duration
+	mu    sync.Mutex
+	ttl   time.Duration
 	items map[string]*Ticket
 }
 

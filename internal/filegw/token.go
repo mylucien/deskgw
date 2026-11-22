@@ -16,13 +16,11 @@ type Credentials struct {
 	Domain   string
 }
 
-// Wipe 在会话结束时清除内存中的明文密码。
+// Wipe 清除内存中的凭据引用。Go 的 string 不可变，逐字节覆写只会不断复制，
+// 并不能保证擦除底层内存；真正的防护是凭据只驻留内存、不落盘、不写日志。
 func (c *Credentials) Wipe() {
 	if c == nil {
 		return
-	}
-	for i := range c.Password {
-		c.Password = c.Password[:i] + "\x00" + c.Password[i+1:]
 	}
 	c.Password = ""
 	c.Username = ""
@@ -126,14 +124,6 @@ func (m *TokenManager) RevokeSession(sessionID int64) {
 			m.dropLocked(secret)
 		}
 	}
-}
-
-// Count 返回当前有效令牌数（运行状态用）。
-func (m *TokenManager) Count() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pruneLocked()
-	return len(m.tokens)
 }
 
 func (m *TokenManager) dropLocked(secret string) {

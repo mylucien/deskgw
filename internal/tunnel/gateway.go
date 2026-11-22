@@ -18,22 +18,28 @@ import (
 	"github.com/mylucien/deskgw/internal/host"
 )
 
-// liveSession 是一条正在转发的连接。closeFn 用于强制断开。
+// liveSession 是一条正在转发的连接。close 用于强制断开，可被多处并发调用。
 type liveSession struct {
-	id       int64
-	closeFn  func()
+	id      int64
+	once    sync.Once
+	closeFn func()
+}
+
+// close 幂等：正常断开与后台「强制下线」可能同时触发。
+func (s *liveSession) close() {
+	s.once.Do(s.closeFn)
 }
 
 // Gateway 管理 RDP 隧道。
 type Gateway struct {
-	db        *sql.DB
-	tickets   *TicketManager
-	maxFrame  int64
-	dialTime  time.Duration
-	auditFn   func(userID any, action, target, detail, ip string)
-	onEnd     func(sessionID int64) // 会话结束时回调（撤销文件令牌等），可为 nil
-	mu        sync.Mutex
-	live      map[int64]*liveSession
+	db       *sql.DB
+	tickets  *TicketManager
+	maxFrame int64
+	dialTime time.Duration
+	auditFn  func(userID any, action, target, detail, ip string)
+	onEnd    func(sessionID int64) // 会话结束时回调（撤销文件令牌等），可为 nil
+	mu       sync.Mutex
+	live     map[int64]*liveSession
 }
 
 // NewGateway 构造网关。auditFn / onEnd 均可为 nil。
@@ -48,21 +54,29 @@ func NewGateway(db *sql.DB, tickets *TicketManager, auditFn func(userID any, act
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 32 * 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return true
-		}
-		return sameOrigin(origin, r.Host)
-	},
+	CheckOrigin:     checkOrigin,
 }
 
-func sameOrigin(origin, hostValue string) bool {
+// checkOrigin 只接受同源的 http(s) 页面发起的 WebSocket。
+// 校验 scheme 可挡住 file://、chrome-extension:// 等非 Web 来源；
+// TLS 直连时还要求 Origin 必须是 https，避免从明文页面借道。
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
 	i := strings.Index(origin, "://")
 	if i < 0 {
 		return false
 	}
-	return strings.EqualFold(origin[i+3:], hostValue)
+	scheme := strings.ToLower(origin[:i])
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	if r.TLS != nil && scheme != "https" {
+		return false
+	}
+	return strings.EqualFold(origin[i+3:], r.Host)
 }
 
 // Serve 处理一次 WebSocket 升级与 RDP 隧道。调用方已完成登录态校验。
@@ -151,19 +165,17 @@ func (g *Gateway) Serve(w http.ResponseWriter, r *http.Request, sess *auth.Sessi
 		return
 	}
 
-	g.markActive(ticket.SessionID, ticket.ClientIP)
+	// 记录可能已在握手期间被后台强制下线或清理，此时不应继续建立会话。
+	if !g.markActive(ticket.SessionID, ticket.ClientIP) {
+		_ = tlsConn.Close()
+		_ = ws.Close()
+		return
+	}
 	g.audit(sess.UserID, "rdp.connect", h.Name, target+" via "+ticket.ClientIP, ticket.ClientIP)
 
 	done := make(chan struct{}, 2)
-	stop := make(chan struct{})
 	entry := &liveSession{id: ticket.SessionID}
 	entry.closeFn = func() {
-		select {
-		case <-stop:
-			return
-		default:
-		}
-		close(stop)
 		_ = tlsConn.Close()
 		_ = ws.Close()
 	}
@@ -201,7 +213,7 @@ func (g *Gateway) Serve(w http.ResponseWriter, r *http.Request, sess *auth.Sessi
 	}()
 
 	<-done
-	entry.closeFn()
+	entry.close()
 	g.removeLive(ticket.SessionID)
 	g.endSession(ticket.SessionID, "closed", "")
 	g.audit(sess.UserID, "rdp.disconnect", h.Name, target, ticket.ClientIP)
@@ -215,7 +227,7 @@ func (g *Gateway) CloseSession(id int64) bool {
 	if entry == nil {
 		return false
 	}
-	entry.closeFn()
+	entry.close()
 	return true
 }
 
@@ -242,8 +254,17 @@ func (g *Gateway) removeLive(id int64) {
 	g.mu.Unlock()
 }
 
-func (g *Gateway) markActive(sessionID int64, ip string) {
-	_, _ = g.db.Exec(`UPDATE sessions SET state='active', client_ip=? WHERE id=?`, ip, sessionID)
+// markActive 把会话标记为 active，返回是否仍然命中。
+// 只更新仍在进行中的记录：若清理任务已把它收尾，不能把 ended_at 已置的
+// 记录重新标记为 active。
+func (g *Gateway) markActive(sessionID int64, ip string) bool {
+	res, err := g.db.Exec(`UPDATE sessions SET state='active', client_ip=?
+		WHERE id=? AND ended_at IS NULL`, ip, sessionID)
+	if err != nil {
+		return false
+	}
+	n, err := res.RowsAffected()
+	return err == nil && n > 0
 }
 
 func (g *Gateway) endSession(sessionID int64, state, detail string) {

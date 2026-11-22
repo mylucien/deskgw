@@ -133,9 +133,6 @@ func splitModes(s string) []string {
 	return out
 }
 
-// ModesOf 返回规范化后的模式列表。
-func ModesOf(s string) []string { return splitModes(s) }
-
 // Create 新增主机。
 func Create(db *sql.DB, h Host) error {
 	if err := Validate(h); err != nil {

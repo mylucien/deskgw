@@ -26,10 +26,15 @@ func Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
 		if p != "" && p != "." {
+			// 只把真实文件交给 FileServer：目录（例如 /assets/）会触发目录列表，
+			// 泄露构建产物清单，这里统一回退到 SPA 首页。
 			if f, err := sub.Open(p); err == nil {
+				info, statErr := f.Stat()
 				f.Close()
-				fileServer.ServeHTTP(w, r)
-				return
+				if statErr == nil && !info.IsDir() {
+					fileServer.ServeHTTP(w, r)
+					return
+				}
 			}
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

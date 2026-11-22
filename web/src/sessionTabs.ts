@@ -38,9 +38,17 @@ export function closeTab(key: string) {
     workspace.tabs.splice(i, 1)
   }
   if (workspace.active === key) {
-    const next = workspace.tabs[Math.min(i, workspace.tabs.length - 1)]
+    const next = workspace.tabs[Math.min(Math.max(i, 0), workspace.tabs.length - 1)]
     workspace.active = next ? next.key : ''
   }
+}
+
+// closeAllTabs 在退出登录或切换账号时清空工作区：
+// 移除全部标签（触发 RdpCanvas 卸载并断开 WASM 会话）并擦除内存中的 Windows 凭据。
+export function closeAllTabs() {
+  for (const t of workspace.tabs) wipeCreds(t.creds)
+  workspace.tabs.splice(0, workspace.tabs.length)
+  workspace.active = ''
 }
 
 export function wipeCreds(c: Credentials) {

@@ -11,7 +11,7 @@
         </div>
         <button class="add-tab" @click="goHosts" :disabled="workspace.tabs.length >= MAX_TABS" title="新建连接">+</button>
       </div>
-      <button class="exit" @click="exitWorkspace">退出</button>
+      <button class="exit" @click="exitWorkspace" title="结束全部会话并返回主机列表">退出</button>
     </div>
     <div class="ws-body">
       <p v-if="!workspace.tabs.length" class="empty">没有打开的会话。<a @click="goHosts">前往主机列表</a></p>
@@ -29,7 +29,7 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import RdpCanvas from './RdpCanvas.vue'
-import { workspace, closeTab, MAX_TABS } from '../sessionTabs'
+import { workspace, closeTab, closeAllTabs, MAX_TABS } from '../sessionTabs'
 
 const router = useRouter()
 const notice = ref('')
@@ -42,7 +42,12 @@ function goHosts() {
   }
   router.push({ name: 'hosts' })
 }
-function exitWorkspace() { router.push({ name: 'hosts' }) }
+// 离开工作区会卸载全部 RdpCanvas，WASM 会话与票据随之失效。
+// 因此退出即结束所有会话，避免留下点开就报错的死标签。
+function exitWorkspace() {
+  closeAllTabs()
+  router.push({ name: 'hosts' })
+}
 
 onMounted(() => {
   if (workspace.tabs.length >= MAX_TABS) notice.value = `最多同时打开 ${MAX_TABS} 个会话`

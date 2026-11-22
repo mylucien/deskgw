@@ -28,6 +28,8 @@ arch=$(sed -n 's/^Architecture: //p' control)
 ver=$(sed -n 's/^Version: //p' control)
 echo "   arch=$arch version=$ver"
 [ -n "$arch" ] && [ -n "$ver" ] || fail "control 字段缺失"
+[ -f conffiles ] || fail "缺少 conffiles（升级会覆盖 UCI 配置）"
+grep -qx '/etc/config/deskgw' conffiles || fail "conffiles 未声明 /etc/config/deskgw"
 
 echo "== 2. 文件清单 =="
 for f in usr/bin/deskgw etc/config/deskgw etc/init.d/deskgw \
@@ -144,10 +146,54 @@ code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" \
 [ "$code" = "404" ] || fail "无效会话签发文件令牌应返回 404，实际 $code"
 ok
 
-echo "== 11. 审计 CSV 导出 =="
-csv=$(curl -ksS -b "$WORK/jar" 'https://127.0.0.1:18443/api/admin/audit/export')
-echo "$csv" | grep -q '动作' || fail "审计 CSV 缺少表头"
-echo "$csv" | grep -q 'host.create' || fail "审计 CSV 缺少事件"
+echo "== 11. 审计 CSV 导出（超过 100 条不截断）=="
+i=0
+while [ "$i" -lt 120 ]; do
+	api -X PUT https://127.0.0.1:18443/api/admin/settings \
+		-d '{"session_idle_min":"30"}' > /dev/null
+	i=$((i + 1))
+done
+curl -ksS -b "$WORK/jar" 'https://127.0.0.1:18443/api/admin/audit/export' > "$WORK/audit.csv"
+grep -q '动作' "$WORK/audit.csv" || fail "审计 CSV 缺少表头"
+grep -q 'host.create' "$WORK/audit.csv" || fail "审计 CSV 缺少事件"
+lines=$(wc -l < "$WORK/audit.csv")
+echo "   导出行数=$lines"
+[ "$lines" -gt 120 ] || fail "审计导出被截断，只有 $lines 行"
+ok
+
+echo "== 12. 重启后收尾僵尸会话 =="
+# 签发票据但不建立 WebSocket，制造一条 pending 记录
+r=$(api -X POST https://127.0.0.1:18443/api/admin/hosts -d \
+	'{"id":1002,"name":"stale-host","address":"192.168.1.11","enabled":true,"modes":"rdp"}')
+echo "$r" | grep -q '"ok":true' || fail "创建测试主机失败"
+r=$(api -X POST https://127.0.0.1:18443/api/sessions -d '{"host_id":1002}')
+echo "$r" | grep -q '"ok":true' || { echo "$r" >&2; fail "签发票据失败"; }
+SID=$(echo "$r" | sed -n 's/.*"session_id":\([0-9]*\).*/\1/p')
+[ -n "$SID" ] || fail "未解析到 session_id"
+
+# 重启网关：内存中的登录态与在线连接全部丢失，遗留记录必须被收尾
+kill "$PID" 2>/dev/null || true
+wait "$PID" 2>/dev/null || true
+"$WORK/pkg/usr/bin/deskgw" >> "$WORK/server.log" 2>&1 &
+PID=$!
+i=0
+until curl -ksS -m 2 -o /dev/null https://127.0.0.1:18443/api/health 2>/dev/null; do
+	i=$((i + 1)); [ "$i" -lt 40 ] || { cat "$WORK/server.log" >&2; fail "重启后服务未就绪"; }
+	sleep 0.5
+done
+
+rm -f "$WORK/jar2"
+curl -ksS -c "$WORK/jar2" -o /dev/null https://127.0.0.1:18443/api/health
+CSRF2=$(awk '$6=="deskgw_csrf" {print $7}' "$WORK/jar2")
+code=$(curl -ksS -o /dev/null -b "$WORK/jar2" -c "$WORK/jar2" \
+	-X POST https://127.0.0.1:18443/api/login \
+	-H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF2" \
+	-d '{"username":"admin","password":"smoke-test-pw"}')
+[ "$code" = "200" ] || fail "重启后重新登录失败: $code"
+r=$(curl -ksS -b "$WORK/jar2" https://127.0.0.1:18443/api/admin/sessions)
+echo "$r" | grep -q "\"id\":$SID" || fail "会话记录消失"
+echo "$r" | grep -o "\"id\":$SID[^}]*" | grep -q '"state":"stale"' \
+	|| { echo "$r" | head -c 800 >&2; fail "重启前的 pending 会话未被标记 stale"; }
 ok
 
 echo "全部通过"

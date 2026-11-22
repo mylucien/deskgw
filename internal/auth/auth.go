@@ -24,6 +24,10 @@ const (
 
 	maxFailures  = 5
 	lockDuration = 10 * time.Minute
+
+	// maxFailureKeys 限制失败计数表的条目数。键是「IP|用户名」，
+	// 攻击者可以用随机用户名制造无限增长，因此必须设上限并在后台清理。
+	maxFailureKeys = 4096
 )
 
 // HashPassword 生成 argon2id 编码串：$argon2id$v=19$m=...,t=...,p=1$<salt>$<hash>
@@ -73,8 +77,9 @@ type Session struct {
 }
 
 type failure struct {
-	count   int
+	count       int
 	lockedUntil time.Time
+	last        time.Time
 }
 
 // Manager 管理会话与失败计数，全部在内存中。
@@ -87,10 +92,32 @@ type Manager struct {
 
 // NewManager 创建会话管理器。
 func NewManager(idleMinutes int) *Manager {
-	return &Manager{
+	m := &Manager{
 		sessions: make(map[string]*Session),
 		failures: make(map[string]*failure),
 		idle:     time.Duration(idleMinutes) * time.Minute,
+	}
+	go m.janitor()
+	return m
+}
+
+// janitor 定期清理已解锁的失败计数，避免长期运行后表持续增长。
+func (m *Manager) janitor() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		m.mu.Lock()
+		m.pruneFailuresLocked()
+		m.mu.Unlock()
+	}
+}
+
+func (m *Manager) pruneFailuresLocked() {
+	now := time.Now()
+	for k, f := range m.failures {
+		if f.count == 0 && !f.lockedUntil.IsZero() && !now.Before(f.lockedUntil) {
+			delete(m.failures, k)
+		}
 	}
 }
 
@@ -167,6 +194,8 @@ func (m *Manager) Delete(token string) {
 }
 
 // Locked 判断某个键（IP+用户名）是否处于锁定状态。
+// 只有真正锁定过（lockedUntil 非零）且尚未到期才返回 true；
+// 计数阶段的记录必须保留，否则永远攒不满 5 次失败。
 func (m *Manager) Locked(key string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -174,26 +203,51 @@ func (m *Manager) Locked(key string) bool {
 	if f == nil {
 		return false
 	}
-	if time.Now().After(f.lockedUntil) {
-		delete(m.failures, key)
+	if f.lockedUntil.IsZero() {
 		return false
 	}
-	return true
+	if time.Now().Before(f.lockedUntil) {
+		return true
+	}
+	delete(m.failures, key)
+	return false
 }
 
 // Fail 记录一次失败，达到阈值后锁定。
 func (m *Manager) Fail(key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
 	f := m.failures[key]
 	if f == nil {
+		if len(m.failures) >= maxFailureKeys {
+			m.pruneFailuresLocked()
+			if len(m.failures) >= maxFailureKeys {
+				m.evictOldestLocked()
+			}
+		}
 		f = &failure{}
 		m.failures[key] = f
 	}
+	f.last = now
 	f.count++
 	if f.count >= maxFailures {
-		f.lockedUntil = time.Now().Add(lockDuration)
+		f.lockedUntil = now.Add(lockDuration)
 		f.count = 0
+	}
+}
+
+// evictOldestLocked 在计数表达到上限时淘汰最久未活动的条目。
+func (m *Manager) evictOldestLocked() {
+	var oldestKey string
+	var oldest time.Time
+	for k, f := range m.failures {
+		if oldestKey == "" || f.last.Before(oldest) {
+			oldestKey, oldest = k, f.last
+		}
+	}
+	if oldestKey != "" {
+		delete(m.failures, oldestKey)
 	}
 }
 

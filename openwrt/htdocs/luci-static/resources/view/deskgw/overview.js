@@ -23,7 +23,7 @@ return view.extend({
 		o.rmempty = false;
 
 		o = s.option(form.Value, 'cert_names', _('证书名称'),
-			_('自签证书中写入的域名或 IP，以逗号分隔。实际访问地址应包含在内，以避免名称不匹配告警。'));
+			_('自签证书中写入的域名或 IP，以逗号分隔。实际访问地址应包含在内，以避免名称不匹配告警。修改后重启服务会按新设置重签自签证书；自备证书不会被改动。'));
 		o.placeholder = '192.168.1.1,deskgw.lan';
 		o.rmempty = true;
 

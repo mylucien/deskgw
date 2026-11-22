@@ -42,7 +42,7 @@ apk add --allow-untrusted deskgw-*.apk      # 25.12 / snapshot
 安装完成后：
 
 1. 服务由 procd 托管并设为开机自启，默认监听 `0.0.0.0:8443`。
-2. 首次启动生成自签证书与初始管理员 `admin`，随机密码同时写入 syslog 和 `/etc/deskgw/initial-password.txt`。
+2. 首次启动生成自签证书与初始管理员 `admin`，随机密码写入 `/etc/deskgw/initial-password.txt`（权限 0600），日志只提示该文件位置，不打印明文。
 3. 浏览器访问 `https://<路由器地址>:8443`，登录后可在「管理」中修改密码、添加主机与用户。
 4. LuCI 菜单中提供「服务 → deskgw」，用于修改监听参数、查看证书指纹与重启服务。
 
@@ -88,11 +88,11 @@ docs/design.md            软件设计方案
 
 所有编译与测试均在 GitHub Actions 中完成：
 
-- `lint`：gofmt / go vet / shell / JSON / LuCI JS 静态检查
+- `lint`：gofmt 门禁 / go vet / 版本号一致性 / shell / JSON / LuCI JS 静态检查
 - `ui`：Node 22 构建前端
 - `binaries`：Go 静态交叉编译 `x86_64` 与 `aarch64_cortex-a53`，校验无 `INTERP`
-- `package`：打 ipk，并准备供 SDK 使用的预编译包
-- `smoke`：解包 ipk 后真实启动服务，验证证书指纹、401/200 认证、主机与用户 CRUD、审计、静态页面；RDP 隧道（无票据拒绝、票据一次性、浏览器 destination 被忽略并改连数据库地址）；文件网关鉴权（无令牌/伪造令牌拒绝、无效会话拒绝）；审计 CSV 导出
+- `package`：打 ipk（含 `conffiles`，升级保留 UCI 配置），并准备供 SDK 使用的预编译包
+- `smoke`：解包 ipk 后真实启动服务，验证证书指纹、401/200 认证、主机与用户 CRUD、审计、静态页面；RDP 隧道（无票据拒绝、票据一次性、浏览器 destination 被忽略并改连数据库地址）；文件网关鉴权（无令牌/伪造令牌拒绝、无效会话拒绝）；审计 CSV 导出全量不截断；重启后遗留会话被收尾
 - `sdk`：在 ImmortalWrt SDK 中编译本包，校验产物架构
 
 `weekly` 标签跟随每次定时构建；正式版本使用 `v*` 标签。

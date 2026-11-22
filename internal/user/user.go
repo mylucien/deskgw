@@ -4,7 +4,6 @@ package user
 import (
 	"database/sql"
 	"errors"
-	"fmt"
 	"regexp"
 	"time"
 
@@ -120,7 +119,8 @@ func Validate(username, role string) error {
 	return nil
 }
 
-// Create 创建用户。
+// Create 创建用户。用户记录与主机授权在同一事务内写入，
+// 避免授权失败时留下一个没有任何权限的半成品账号。
 func Create(db *sql.DB, u User, password string, hostIDs []int64) (int64, error) {
 	if err := Validate(u.Username, u.Role); err != nil {
 		return 0, err
@@ -132,7 +132,12 @@ func Create(db *sql.DB, u User, password string, hostIDs []int64) (int64, error)
 	if err != nil {
 		return 0, err
 	}
-	res, err := db.Exec(`INSERT INTO users
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO users
 		(username, pass_hash, role, enabled, allow_file, allow_clipboard, max_sessions, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		u.Username, hash, u.Role, b(u.Enabled), b(u.AllowFile), b(u.AllowClipboard),
@@ -144,10 +149,22 @@ func Create(db *sql.DB, u User, password string, hostIDs []int64) (int64, error)
 	if err != nil {
 		return 0, err
 	}
-	if err := SetGrants(db, id, hostIDs); err != nil {
+	for _, hid := range hostIDs {
+		if _, err := tx.Exec(`INSERT INTO user_hosts (user_id, host_id) VALUES (?, ?)`, id, hid); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return id, nil
+}
+
+// CountAdmins 返回处于启用状态的管理员数量，用于阻止把最后一个管理员降级或删除。
+func CountAdmins(db *sql.DB) (int, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM users WHERE role='admin' AND enabled=1`).Scan(&n)
+	return n, err
 }
 
 // Update 更新用户资料；password 为空表示不改密码。
@@ -201,24 +218,6 @@ func Update(db *sql.DB, id int64, u User, password string, hostIDs []int64) erro
 	return tx.Commit()
 }
 
-// SetGrants 重设用户可访问的主机列表。
-func SetGrants(db *sql.DB, userID int64, hostIDs []int64) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM user_hosts WHERE user_id = ?`, userID); err != nil {
-		return err
-	}
-	for _, hid := range hostIDs {
-		if _, err := tx.Exec(`INSERT INTO user_hosts (user_id, host_id) VALUES (?, ?)`, userID, hid); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
 // Delete 删除用户。
 func Delete(db *sql.DB, id int64) error {
 	res, err := db.Exec(`DELETE FROM users WHERE id = ?`, id)
@@ -247,15 +246,4 @@ func b(v bool) int {
 		return 1
 	}
 	return 0
-}
-
-// ErrNotFound 是通用不存在错误。
-var ErrNotFound = sql.ErrNoRows
-
-// FormatErr 把数据库错误转成用户可读信息。
-func FormatErr(err error) error {
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("对象不存在")
-	}
-	return err
 }

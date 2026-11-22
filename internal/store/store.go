@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 // Store 包装数据库连接。
 type Store struct {
@@ -62,6 +62,16 @@ func (s *Store) migrate() error {
 			}
 		}
 		if _, err := tx.Exec("PRAGMA user_version = 1"); err != nil {
+			return err
+		}
+	}
+	if v < 2 {
+		for _, stmt := range schemaV2 {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("执行 schema v2 失败: %w", err)
+			}
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
 			return err
 		}
 	}
@@ -138,4 +148,15 @@ var schemaV1 = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts)`,
 	`CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state)`,
+}
+
+// schemaV2 补齐高频查询的索引：
+//   - 并发配额检查按 (user_id, state) 计数；
+//   - 僵尸会话清理按 (state, ended_at) 扫描；
+//   - 审计页按用户或动作过滤。
+var schemaV2 = []string{
+	`CREATE INDEX IF NOT EXISTS idx_sessions_user_state ON sessions(user_id, state)`,
+	`CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions(state, ended_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)`,
 }

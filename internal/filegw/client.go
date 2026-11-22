@@ -21,9 +21,9 @@ type Entry struct {
 // Conn 是一次 SMB 连接的句柄。每次文件操作新建连接、用完即关，
 // 凭据不缓存、不复用，降低明文驻留时间。
 type Conn struct {
-	tcp    net.Conn
+	tcp     net.Conn
 	session *smb2.Session
-	share  *smb2.Share
+	share   *smb2.Share
 }
 
 // Connect 用给定凭据连接目标主机的共享。address 来自数据库，前端无法指定。

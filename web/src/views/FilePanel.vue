@@ -144,11 +144,8 @@ async function download(e: Entry) {
     a.download = name || e.name
     a.click()
     setTimeout(() => URL.revokeObjectURL(a.href), 4000)
-    writeFileAudit('download', e.name)
   } catch (err: any) { error.value = err.message || '下载失败' }
 }
-
-function writeFileAudit(_action: string, _name: string) { /* 审计由服务端记录 */ }
 
 async function newFolder() {
   const name = window.prompt('新文件夹名称')

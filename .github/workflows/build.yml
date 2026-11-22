@@ -79,6 +79,25 @@ jobs:
           go-version: stable
       - name: Go 静态检查
         run: go vet ./...
+      - name: gofmt
+        run: |
+          set -e
+          files=$(git ls-files '*.go')
+          out=$(gofmt -l $files)
+          if [ -n "$out" ]; then
+            echo "::error::以下 Go 文件未格式化（执行 gofmt -w 后提交）"
+            echo "$out"
+            gofmt -d $out | head -200
+            exit 1
+          fi
+      - name: 版本一致性
+        run: |
+          set -e
+          pkg=$(sed -n 's/^PKG_VERSION:=//p' openwrt/Makefile | head -1)
+          api=$(sed -n 's/^const serverVersion = "\(.*\)"/\1/p' internal/api/api.go | head -1)
+          echo "openwrt/Makefile=$pkg internal/api=$api"
+          [ -n "$pkg" ] && [ "$pkg" = "$api" ] || {
+            echo "::error::PKG_VERSION 与 serverVersion 不一致"; exit 1; }
       - name: shell 语法
         run: |
           set -e
@@ -337,7 +356,7 @@ jobs:
             dist/deskgw-*.sha256
           body: |
             版本：${{ needs.prepare.outputs.version }} @ ${{ needs.prepare.outputs.short }}
-            范围：M2（M1 全部功能 + RDP 隧道、RDCleanPath 网关、浏览器 NLA、会话管理）
+            范围：M4（M1 管理面 + M2 RDP 隧道与浏览器 NLA + M3 多标签会话与审计 + M4 SMB 文件网关）
 
             | 文件 | 用途 |
             |---|---|

@@ -43,7 +43,38 @@ export function resolveWsUrl(path: string): string {
   return scheme + '//' + location.host + path
 }
 
-// 浏览器 KeyboardEvent.key → PS/2 Set 1 通键扫描码（无扩展前缀）。
+// 浏览器 KeyboardEvent.code → PS/2 Set 1 扫描码。
+// 扩展键必须带 0xE0 前缀：IronRDP 以 `scancode & 0xE000 == 0xE000` 判定扩展键，
+// 传通键码（例如 0xCB）会被当作普通键，Delete / Home / 方向键在远端全部失效。
+const codeMap: Record<string, number> = {
+  KeyA: 0x1e, KeyB: 0x30, KeyC: 0x2e, KeyD: 0x20, KeyE: 0x12, KeyF: 0x21,
+  KeyG: 0x22, KeyH: 0x23, KeyI: 0x17, KeyJ: 0x24, KeyK: 0x25, KeyL: 0x26,
+  KeyM: 0x32, KeyN: 0x31, KeyO: 0x18, KeyP: 0x19, KeyQ: 0x10, KeyR: 0x13,
+  KeyS: 0x1f, KeyT: 0x14, KeyU: 0x16, KeyV: 0x2f, KeyW: 0x11, KeyX: 0x2d,
+  KeyY: 0x15, KeyZ: 0x2c,
+  Digit1: 0x02, Digit2: 0x03, Digit3: 0x04, Digit4: 0x05, Digit5: 0x06,
+  Digit6: 0x07, Digit7: 0x08, Digit8: 0x09, Digit9: 0x0a, Digit0: 0x0b,
+  Enter: 0x1c, NumpadEnter: 0xe01c,
+  Escape: 0x01, Backspace: 0x0e, Tab: 0x0f, Space: 0x39,
+  Minus: 0x0c, Equal: 0x0d, BracketLeft: 0x1a, BracketRight: 0x1b,
+  Backslash: 0x2b, Semicolon: 0x27, Quote: 0x28, Backquote: 0x29,
+  Comma: 0x33, Period: 0x34, Slash: 0x35,
+  CapsLock: 0x3a, ShiftLeft: 0x2a, ShiftRight: 0xe036,
+  ControlLeft: 0x1d, ControlRight: 0xe01d,
+  AltLeft: 0x38, AltRight: 0xe038,
+  MetaLeft: 0xe05b, MetaRight: 0xe05c, ContextMenu: 0xe05d,
+  PrintScreen: 0xe037, ScrollLock: 0x46,
+  Insert: 0xe052, Home: 0xe047, PageUp: 0xe049, Delete: 0xe053,
+  End: 0xe04f, PageDown: 0xe051,
+  ArrowLeft: 0xe04b, ArrowRight: 0xe04d, ArrowUp: 0xe048, ArrowDown: 0xe050,
+  NumpadDivide: 0xe035, NumpadMultiply: 0x37, NumpadSubtract: 0x4a, NumpadAdd: 0x4e,
+  NumpadDecimal: 0x53, Numpad0: 0x52, Numpad1: 0x4f, Numpad2: 0x50, Numpad3: 0x51,
+  Numpad4: 0x4b, Numpad5: 0x4c, Numpad6: 0x4d, Numpad7: 0x47, Numpad8: 0x48, Numpad9: 0x49,
+  F1: 0x3b, F2: 0x3c, F3: 0x3d, F4: 0x3e, F5: 0x3f, F6: 0x40,
+  F7: 0x41, F8: 0x42, F9: 0x43, F10: 0x44, F11: 0x57, F12: 0x58,
+}
+
+// code 缺失或为 "Unidentified" 时的兜底映射（按 KeyboardEvent.key）。
 const scancodeMap: Record<string, number> = {
   'a': 0x1e, 'b': 0x30, 'c': 0x2e, 'd': 0x20, 'e': 0x12, 'f': 0x21,
   'g': 0x22, 'h': 0x23, 'i': 0x17, 'j': 0x24, 'k': 0x25, 'l': 0x26,
@@ -56,17 +87,20 @@ const scancodeMap: Record<string, number> = {
   ' ': 0x39, '-': 0x0c, '=': 0x0d, '[': 0x1a, ']': 0x1b,
   '\\': 0x2b, ';': 0x27, "'": 0x28, '`': 0x29, ',': 0x33,
   '.': 0x34, '/': 0x35, 'CapsLock': 0x3a, 'Shift': 0x2a,
-  'Control': 0x1d, 'Alt': 0x38, 'ContextMenu': 0xdd,
+  'Control': 0x1d, 'Alt': 0x38,
 }
 const specialMap: Record<string, number> = {
   'F1': 0x3b, 'F2': 0x3c, 'F3': 0x3d, 'F4': 0x3e, 'F5': 0x3f,
   'F6': 0x40, 'F7': 0x41, 'F8': 0x42, 'F9': 0x43, 'F10': 0x44,
-  'F11': 0x57, 'F12': 0x58, 'Insert': 0xd2, 'Home': 0xc7,
-  'PageUp': 0xc9, 'Delete': 0xd3, 'End': 0xcf, 'PageDown': 0xd1,
-  'ArrowRight': 0xcd, 'ArrowLeft': 0xcb, 'ArrowDown': 0xd0, 'ArrowUp': 0xc8,
+  'F11': 0x57, 'F12': 0x58,
+  'Insert': 0xe052, 'Home': 0xe047, 'PageUp': 0xe049, 'Delete': 0xe053,
+  'End': 0xe04f, 'PageDown': 0xe051,
+  'ArrowRight': 0xe04d, 'ArrowLeft': 0xe04b, 'ArrowDown': 0xe050, 'ArrowUp': 0xe048,
+  'ContextMenu': 0xe05d, 'PrintScreen': 0xe037,
 }
 
 function scancodeOf(e: KeyboardEvent): number | null {
+  if (codeMap[e.code] !== undefined) return codeMap[e.code]
   if (specialMap[e.key] !== undefined) return specialMap[e.key]
   if (scancodeMap[e.key] !== undefined) return scancodeMap[e.key]
   const k = e.key.toLowerCase()
@@ -113,20 +147,41 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
 
   const canvas = opts.canvas
   canvas.tabIndex = 0
+  // 远端桌面尺寸随 resize 变化，鼠标映射必须用当前值而不是连接时的快照。
+  const viewport = { width: opts.width, height: opts.height }
   const onMouseMove = (e: MouseEvent) => {
     const rect = canvas.getBoundingClientRect()
-    const x = Math.max(0, Math.min(opts.width, Math.round((e.clientX - rect.left) * opts.width / rect.width)))
-    const y = Math.max(0, Math.min(opts.height, Math.round((e.clientY - rect.top) * opts.height / rect.height)))
+    if (rect.width <= 0 || rect.height <= 0) return
+    const x = Math.max(0, Math.min(viewport.width - 1, Math.round((e.clientX - rect.left) * viewport.width / rect.width)))
+    const y = Math.max(0, Math.min(viewport.height - 1, Math.round((e.clientY - rect.top) * viewport.height / rect.height)))
     send((t) => t.addEvent(DeviceEvent.mouseMove(x, y)))
   }
   const onMouseDown = (e: MouseEvent) => { send((t) => t.addEvent(DeviceEvent.mouseButtonPressed(e.button))) }
   const onMouseUp = (e: MouseEvent) => { send((t) => t.addEvent(DeviceEvent.mouseButtonReleased(e.button))) }
   const onWheel = (e: WheelEvent) => {
-    const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX)
-    const amount = vertical ? e.deltaY : e.deltaX
-    const unit = e.deltaMode === 1 ? RotationUnit.Line : e.deltaMode === 2 ? RotationUnit.Page : RotationUnit.Pixel
-    send((t) => t.addEvent(DeviceEvent.wheelRotations(vertical, Math.abs(amount), unit)))
     e.preventDefault()
+    const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX)
+    const raw = vertical ? e.deltaY : e.deltaX
+    if (!raw) return
+    // RDP 的滚轮量是有符号的：负值向用户方向滚动，正值远离用户。
+    // 浏览器 deltaY 正值为向下滚，因此取反；绝对值会丢失方向。
+    let amount: number
+    let unit: RotationUnit
+    if (e.deltaMode === 1) {
+      amount = Math.round(raw)
+      unit = RotationUnit.Line
+    } else if (e.deltaMode === 2) {
+      amount = Math.round(raw)
+      unit = RotationUnit.Page
+    } else {
+      // 像素模式：浏览器一格约 100px，直接按像素发送（mstsc 一格为 120 像素）。
+      amount = Math.round(raw)
+      unit = RotationUnit.Pixel
+    }
+    // 协议字段是 16 位有符号整数，超范围会被截断成反向滚动，这里先夹紧。
+    amount = Math.max(-32767, Math.min(32767, Math.round(-amount)))
+    if (amount === 0) return
+    send((t) => t.addEvent(DeviceEvent.wheelRotations(vertical, amount, unit)))
   }
   const onKeyDown = (e: KeyboardEvent) => {
     const code = scancodeOf(e)
@@ -165,14 +220,17 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
       finish('user-closed')
     },
     resize: (w: number, h: number) => {
+      if (w <= 0 || h <= 0) return
+      viewport.width = w
+      viewport.height = h
       try { session.resize(w, h) } catch { /* ignore */ }
     },
     sendCtrlAltDel: () => {
       send((t) => {
         t.addEvent(DeviceEvent.keyPressed(0x1d))   // Ctrl
         t.addEvent(DeviceEvent.keyPressed(0x38))   // Alt
-        t.addEvent(DeviceEvent.keyPressed(0xd3))   // Delete
-        t.addEvent(DeviceEvent.keyReleased(0xd3))
+        t.addEvent(DeviceEvent.keyPressed(0xe053)) // Delete（扩展键）
+        t.addEvent(DeviceEvent.keyReleased(0xe053))
         t.addEvent(DeviceEvent.keyReleased(0x38))
         t.addEvent(DeviceEvent.keyReleased(0x1d))
       })

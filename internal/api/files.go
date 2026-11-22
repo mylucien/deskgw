@@ -148,7 +148,9 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "badRequest", "分片偏移不合法")
 		return
 	}
-	limit := int64(s.settingInt("max_upload_mb", 2048)) << 20
+	// 默认值来自 UCI 的 max_upload_mb（经环境变量传入），
+	// 后台保存过设置后以数据库为准。
+	limit := int64(s.settingInt("max_upload_mb", s.cfg.MaxUploadMB)) << 20
 	// 总量上限按 offset 计算：分片可续传，但任何一片都不得让文件突破总上限。
 	if offset >= limit {
 		fail(w, http.StatusRequestEntityTooLarge, "tooLarge", "分片偏移超过单文件上限")

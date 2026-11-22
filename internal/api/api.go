@@ -29,6 +29,9 @@ import (
 const sessionCookie = "deskgw_session"
 const csrfCookie = "deskgw_csrf"
 
+// serverVersion 与 openwrt/Makefile 的 PKG_VERSION 保持一致，CI 会校验两者相同。
+const serverVersion = "0.3.0"
+
 // Server 保存 API 依赖。
 type Server struct {
 	db         *sql.DB
@@ -60,6 +63,8 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 		func(uid any, action, target, detail, ip string) {
 			writeAudit(s, uid, action, target, detail, ip)
 		}, s.fileTokens.RevokeSession)
+	// 收尾上一个进程遗留的会话，并周期清理未建立连接或已失联的僵尸记录。
+	s.startSessionSweeper()
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	// clientIP 直接取 r.RemoteAddr（真实 TCP 对端），不信任 X-Forwarded-For / X-Real-IP。
@@ -69,11 +74,13 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		ok(w, map[string]any{
-			"status": "ok", "version": "0.3.0",
+			"status": "ok", "version": serverVersion,
 			"uptime": int(time.Since(s.started).Seconds()),
 		})
 	})
-	r.Post("/api/login", s.login)
+	// 登录同样校验双提交 Cookie：登录页会先 GET 拿到 CSRF Cookie，
+	// 这样第三方站点无法在用户不知情时把浏览器登录成攻击者的账号。
+	r.With(s.requireCSRF).Post("/api/login", s.login)
 
 	// WebSocket 握手由浏览器发起，无法附加自定义 CSRF 头；
 	// 会话 Cookie 同源、Origin 校验与一次性票据共同提供保护。
@@ -170,12 +177,19 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 			fail(w, http.StatusUnauthorized, "unauthorized", "请先登录")
 			return
 		}
-		sess, ok := s.auth.Get(c.Value)
-		if !ok {
+		sess, valid := s.auth.Get(c.Value)
+		if !valid {
 			clearCookie(w, sessionCookie, s.cfg.CookieSecure)
 			fail(w, http.StatusUnauthorized, "unauthorized", "登录已过期")
 			return
 		}
+		// 滑动续期：服务端的空闲计时已在上一步刷新，Cookie 的 MaxAge 必须同步延长，
+		// 否则即使服务端会话仍有效，浏览器也会在原始 30 分钟后丢弃 Cookie。
+		http.SetCookie(w, &http.Cookie{
+			Name: sessionCookie, Value: c.Value, Path: "/",
+			HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode,
+			MaxAge: int(s.auth.Idle().Seconds()),
+		})
 		next.ServeHTTP(w, r.WithContext(withSession(r.Context(), sess)))
 	})
 }
@@ -294,12 +308,6 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	var active int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE user_id=? AND state IN ('pending','active')`,
-		sess.UserID).Scan(&active); err != nil {
-		serverError(w, err)
-		return
-	}
 	u, err := user.Get(s.db, sess.UserID)
 	if err != nil {
 		serverError(w, err)
@@ -309,12 +317,26 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 {
 		limit = 2
 	}
+
+	// 并发上限的检查与建记录必须原子：否则两个同时到达的请求都能读到
+	// 同一个未达上限的计数，各自建一条会话，突破 max_sessions。
+	tx, err := s.db.Begin()
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	defer tx.Rollback()
+	var active int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sessions WHERE user_id=? AND state IN ('pending','active')`,
+		sess.UserID).Scan(&active); err != nil {
+		serverError(w, err)
+		return
+	}
 	if active >= limit {
 		fail(w, http.StatusTooManyRequests, "limit", "已达到并发会话上限")
 		return
 	}
-
-	res, err := s.db.Exec(`INSERT INTO sessions (user_id, host_id, client_ip, started_at, state, mode)
+	res, err := tx.Exec(`INSERT INTO sessions (user_id, host_id, client_ip, started_at, state, mode)
 		VALUES (?, ?, ?, ?, 'pending', 'rdp')`,
 		sess.UserID, in.HostID, clientIP(r), time.Now().Unix())
 	if err != nil {
@@ -326,8 +348,14 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		serverError(w, err)
+		return
+	}
 	tok, err := s.tickets.Issue(sess.UserID, in.HostID, sid, clientIP(r))
 	if err != nil {
+		_, _ = s.db.Exec(`UPDATE sessions SET state='failed', ended_at=? WHERE id=?`,
+			time.Now().Unix(), sid)
 		serverError(w, err)
 		return
 	}
@@ -419,6 +447,23 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 	if in.MaxSessions <= 0 {
 		in.MaxSessions = 2
 	}
+	target, err := user.Get(s.db, id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	// 最后一个启用的管理员被降级或停用后，后台将无人可进，只能改数据库。
+	if target.Role == "admin" && target.Enabled && (in.Role != "admin" || !in.Enabled) {
+		n, err := user.CountAdmins(s.db)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		if n <= 1 {
+			fail(w, http.StatusBadRequest, "invalid", "至少保留一个启用的管理员")
+			return
+		}
+	}
 	if err := user.Update(s.db, id, inputToUser(in), in.Password, in.HostIDs); err != nil {
 		writeErr(w, err)
 		return
@@ -437,6 +482,22 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 	if sess != nil && sess.UserID == id {
 		fail(w, http.StatusBadRequest, "invalid", "不能删除当前登录的账号")
 		return
+	}
+	target, err := user.Get(s.db, id)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if target.Role == "admin" && target.Enabled {
+		n, err := user.CountAdmins(s.db)
+		if err != nil {
+			serverError(w, err)
+			return
+		}
+		if n <= 1 {
+			fail(w, http.StatusBadRequest, "invalid", "至少保留一个启用的管理员")
+			return
+		}
 	}
 	if err := user.Delete(s.db, id); err != nil {
 		writeErr(w, err)
@@ -539,35 +600,51 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 	ok(w, list)
 }
 
-// exportAudit 把审计事件导出为 CSV（最多 10000 条）。
+// exportAudit 把审计事件流式导出为 CSV。
+// 逐行写出而不是先读进内存，导出量只受时间范围限制，不再被分页上限截断。
 func (s *Server) exportAudit(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	uid, _ := strconv.ParseInt(q.Get("user_id"), 10, 64)
-	list, err := audit.List(s.db, uid, q.Get("action"), q.Get("q"), 10000, 0)
-	if err != nil {
-		serverError(w, err)
-		return
-	}
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="deskgw-audit.csv"`)
-	w.Write([]byte("\xef\xbb\xbf时间,用户,动作,目标,详情,来源IP\n"))
-	for _, e := range list {
+	_, _ = w.Write([]byte("\xef\xbb\xbf时间,用户,动作,目标,详情,来源IP\n"))
+	flusher, _ := w.(http.Flusher)
+	count := 0
+	err := audit.Each(s.db, uid, q.Get("action"), q.Get("q"), 200000, func(e audit.Event) error {
+		var b strings.Builder
 		row := []string{
 			time.Unix(e.TS, 0).Format("2006-01-02 15:04:05"),
 			e.Username, e.Action, e.Target, e.Detail, e.ClientIP,
 		}
 		for i, cell := range row {
 			if i > 0 {
-				w.Write([]byte(","))
+				b.WriteByte(',')
 			}
-			w.Write([]byte(csvCell(cell)))
+			b.WriteString(csvCell(cell))
 		}
-		w.Write([]byte("\n"))
+		b.WriteByte('\n')
+		if _, err := w.Write([]byte(b.String())); err != nil {
+			return err
+		}
+		count++
+		if flusher != nil && count%500 == 0 {
+			flusher.Flush()
+		}
+		return nil
+	})
+	if err != nil {
+		// 表头已经发出，无法再改状态码；中断响应让客户端得到不完整的文件。
+		return
 	}
-	writeAudit(s, idFromContext(r), "audit.export", "", strconv.Itoa(len(list)), clientIP(r))
+	writeAudit(s, idFromContext(r), "audit.export", "", strconv.Itoa(count), clientIP(r))
 }
 
 func csvCell(s string) string {
+	// CSV 公式注入防护：Excel 会把以 = + - @ 或控制字符开头的单元格当公式执行，
+	// 审计内容可能包含用户可控的用户名与文件名，导出前统一加前导单引号。
+	if s != "" && strings.ContainsRune("=+-@\t\r", rune(s[0])) {
+		s = "'" + s
+	}
 	if !strings.ContainsAny(s, ",\"\n\r") {
 		return s
 	}
@@ -585,6 +662,9 @@ type sessionView struct {
 	State     string `json:"state"`
 	Mode      string `json:"mode"`
 	Live      bool   `json:"live"`
+	// Closable 表示这条记录仍占用并发配额，后台可以对它执行「强制下线」；
+	// 包括网关重启后残留、内存里已无连接的僵尸记录。
+	Closable bool `json:"closable"`
 }
 
 func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
@@ -616,6 +696,7 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 			v.EndedAt = ended.Int64
 		}
 		v.Live = live[v.ID]
+		v.Closable = v.Live || v.State == "pending" || v.State == "active"
 		out = append(out, v)
 	}
 	if err := rows.Err(); err != nil {
@@ -636,20 +717,25 @@ func (s *Server) killSession(w http.ResponseWriter, r *http.Request) {
 	}
 	// 先落 killed 状态并撤销文件令牌，再触发网关关闭。
 	// 这样网关异步的 endSession 因 ended_at 已置而不会覆盖状态或重复撤销。
-	res, _ := s.db.Exec(`UPDATE sessions SET state='killed', ended_at=? WHERE id=? AND ended_at IS NULL`,
+	res, err := s.db.Exec(`UPDATE sessions SET state='killed', ended_at=? WHERE id=? AND ended_at IS NULL`,
 		time.Now().Unix(), id)
-	if n, _ := res.RowsAffected(); n > 0 {
+	if err != nil {
+		serverError(w, err)
+		return
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
 		s.fileTokens.RevokeSession(id)
 	}
+	// 记录可能早已结束（僵尸），此时 CloseSession 不命中，但仍应尝试关闭潜在连接。
 	s.gateway.CloseSession(id)
 	writeAudit(s, idFromContext(r), "rdp.kill", strconv.FormatInt(id, 10), "", clientIP(r))
 	ok(w, map[string]any{})
 }
 
 var allowedSettings = map[string]bool{
-	"session_idle_min": true,
-	"max_upload_mb":    true,
-	"perf.enabled":     false, // M8 启用
+	"session_idle_min":  true,
+	"max_upload_mb":     true,
+	"perf.enabled":      false, // M8 启用
 	"perf.max_sessions": false,
 	"perf.max_per_host": false,
 }
@@ -695,6 +781,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			n, e := strconv.Atoi(v)
 			if e != nil || n <= 0 {
 				fail(w, http.StatusBadRequest, "invalid", "会话空闲超时须为正整数")
+				return
+			}
+		}
+		if k == "max_upload_mb" {
+			n, e := strconv.Atoi(v)
+			if e != nil || n <= 0 || n > 102400 {
+				fail(w, http.StatusBadRequest, "invalid", "上传上限须为 1–102400 之间的整数（MB）")
 				return
 			}
 		}
