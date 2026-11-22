@@ -156,7 +156,9 @@ def session_cookie():
 def ws_connect(path, cookie, payload=None):
     hostport = BASE.split('://', 1)[1]
     key = base64.b64encode(os.urandom(16)).decode()
-    s = socket.create_connection(('127.0.0.1', int(hostport.rsplit(':', 1)[1])), timeout=10)
+    raw = socket.create_connection(('127.0.0.1', int(hostport.rsplit(':', 1)[1])), timeout=10)
+    sslctx = ssl._create_unverified_context()
+    s = sslctx.wrap_socket(raw, server_hostname='127.0.0.1')
     req = (f'GET {path} HTTP/1.1\r\nHost: {hostport}\r\n'
            f'Upgrade: websocket\r\nConnection: Upgrade\r\n'
            f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n'
@@ -171,6 +173,8 @@ def ws_connect(path, cookie, payload=None):
     header, _, rest = buf.partition(b'\r\n\r\n')
     status = int(header.split(b' ')[1])
     if status != 101 or payload is None:
+        if status != 101:
+            print('   ws 握手状态 %d: %s' % (status, (rest or header)[:160].decode('utf-8', 'replace')))
         s.close()
         return status, None, s
     mask = os.urandom(4)
