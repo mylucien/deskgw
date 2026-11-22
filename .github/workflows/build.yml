@@ -11,10 +11,6 @@ on:
     - cron: '23 3 * * 1'
   workflow_dispatch:
     inputs:
-      ref:
-        description: 'airhand 源码 ref（tag / 分支 / commit）'
-        required: false
-        default: main
       release:
         description: '手动触发时是否发布 Release'
         type: boolean
@@ -24,9 +20,7 @@ permissions:
   contents: write
 
 env:
-  AIRHAND_REPO: sqlpxc/airhand
-  CARGO_TERM_COLOR: always
-  ZIG_VERSION: '0.13.0'
+  GOFLAGS: -mod=readonly
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -34,44 +28,45 @@ concurrency:
 
 jobs:
   prepare:
-    name: 解析源码版本
+    name: 读取版本
     runs-on: ubuntu-24.04
     outputs:
-      ref: ${{ steps.src.outputs.ref }}
-      sha: ${{ steps.src.outputs.sha }}
-      short: ${{ steps.src.outputs.short }}
-      version: ${{ steps.src.outputs.version }}
+      version: ${{ steps.v.outputs.version }}
+      short: ${{ steps.v.outputs.short }}
     steps:
       - uses: actions/checkout@v4
-      - name: 拉取 airhand 源码
-        id: src
-        env:
-          INPUT_REF: ${{ github.event.inputs.ref }}
-        run: sh scripts/fetch-airhand.sh "${INPUT_REF:-main}" src
+      - name: 解析版本号
+        id: v
+        run: |
+          set -e
+          version=$(sed -n 's/^PKG_VERSION:=//p' openwrt/Makefile | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$version"
 
   lint:
-    name: 脚本与配置静态检查
+    name: 静态检查
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Go 静态检查
+        run: go vet ./...
       - name: shell 语法
         run: |
           set -e
-          for f in scripts/*.sh luci-app-airhand/root/etc/init.d/* \
-                   luci-app-airhand/root/usr/libexec/airhand/* \
-                   luci-app-airhand/root/etc/uci-defaults/*; do
-            [ -f "$f" ] || continue
-            echo "sh -n $f"
-            sh -n "$f"
+          for f in scripts/*.sh openwrt/files/etc/init.d/* \
+                   openwrt/files/etc/uci-defaults/* \
+                   openwrt/files/usr/libexec/deskgw/*; do
+            echo "sh -n $f"; sh -n "$f"
           done
       - name: JSON 语法
         run: |
           set -e
-          for f in $(git ls-files '*.json'); do
-            echo "jq $f"
-            jq empty "$f"
-          done
-      - name: LuCI 视图 JS 语法
+          for f in $(git ls-files '*.json'); do echo "jq $f"; jq empty "$f"; done
+      - name: LuCI 视图语法
         run: |
           set -e
           for f in $(git ls-files '*.js'); do
@@ -80,96 +75,84 @@ jobs:
           done
 
   ui:
-    name: 构建网页控制台前端
-    needs: prepare
+    name: 构建前端
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: 拉取 airhand 源码
-        run: sh scripts/fetch-airhand.sh "${{ needs.prepare.outputs.ref }}" src
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
-          cache-dependency-path: src/client/package-lock.json
+          cache-dependency-path: web/package-lock.json
       - name: npm ci
-        working-directory: src/client
+        working-directory: web
         run: npm ci --no-audit --no-fund
       - name: npm run build
-        working-directory: src/client
+        working-directory: web
         run: npm run build
       - name: 打包 dist
-        run: tar czf www.tar.gz -C src/client/dist .
+        run: tar czf web-dist.tar.gz -C web/dist .
       - uses: actions/upload-artifact@v4
         with:
-          name: www
-          path: www.tar.gz
+          name: web-dist
+          path: web-dist.tar.gz
           if-no-files-found: error
 
   binaries:
     name: 编译 ${{ matrix.arch }}
-    needs: prepare
+    needs: [ prepare, lint, ui ]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
-            rust: x86_64-unknown-linux-musl
-            note: 软路由 / 虚拟机
+            goarch: amd64
           - arch: aarch64_cortex-a53
-            rust: aarch64-unknown-linux-musl
-            note: airoha an7581
+            goarch: arm64
     steps:
       - uses: actions/checkout@v4
-      - name: 拉取 airhand 源码
-        run: sh scripts/fetch-airhand.sh "${{ needs.prepare.outputs.ref }}" src
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
         with:
-          targets: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@v2
+          go-version: stable
+          cache: true
+      - uses: actions/download-artifact@v4
         with:
-          workspaces: |
-            src -> target
-            src/web -> target
-          key: ${{ matrix.rust }}
-      - name: 安装 zig 与 cargo-zigbuild
-        run: |
-          set -e
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-          sudo tar -xJf /tmp/zig.tar.xz -C /opt
-          sudo ln -sf "/opt/zig-linux-x86_64-${ZIG_VERSION}/zig" /usr/local/bin/zig
-          zig version
-          cargo install cargo-zigbuild --locked
-      - name: 编译中继（airhand-server）
-        working-directory: src
-        run: cargo zigbuild --release --locked -p airhand-server --target ${{ matrix.rust }}
-      - name: 编译网页控制台（airhand-web）
-        working-directory: src/web
-        run: cargo zigbuild --release --locked --target ${{ matrix.rust }}
-      - name: 收集产物
+          name: web-dist
+          path: dl
+      - name: 放入前端产物
+        run: tar xzf dl/web-dist.tar.gz -C web/dist
+      - name: 静态交叉编译
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
         run: |
           set -e
           mkdir -p out
-          cp "src/target/${{ matrix.rust }}/release/airhand-server" out/
-          cp "src/web/target/${{ matrix.rust }}/release/airhand-web" out/
-          file out/* || true
-          for b in out/*; do
-            if readelf -l "$b" | grep -q INTERP; then
-              echo "::error::$b 是动态链接"
-              exit 1
-            fi
-          done
-          tar czf "airhand-${{ matrix.arch }}.tar.gz" -C out .
+          go build -trimpath -ldflags '-s -w' -o out/deskgw ./cmd/deskgw
+          file out/deskgw
+          if readelf -l out/deskgw 2>/dev/null | grep -q INTERP; then
+            echo "::error::deskgw 不是静态二进制"; exit 1
+          fi
+      - name: 打预编译包
+        run: |
+          set -e
+          rm -rf rel && mkdir -p rel
+          cp out/deskgw rel/
+          tar czf "deskgw-${{ matrix.arch }}.tar.gz" -C rel .
+          cd out && sha256sum deskgw > ../deskgw-${{ matrix.arch }}.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: bin-${{ matrix.arch }}
-          path: airhand-${{ matrix.arch }}.tar.gz
+          path: |
+            deskgw-${{ matrix.arch }}.tar.gz
+            deskgw-${{ matrix.arch }}.sha256
           if-no-files-found: error
 
   package:
     name: 打包 ipk ${{ matrix.arch }}
-    needs: [ prepare, ui, binaries ]
+    needs: [ prepare, binaries ]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -179,48 +162,40 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: www
-          path: dl
-      - name: 展开前端
-        run: mkdir -p www && tar xzf dl/www.tar.gz -C www
-      - uses: actions/download-artifact@v4
-        with:
           name: bin-${{ matrix.arch }}
-          path: dlbin
+          path: dl
       - name: 展开二进制
-        run: mkdir -p bin && tar xzf "dlbin/airhand-${{ matrix.arch }}.tar.gz" -C bin
-      - name: 打包 ipk
-        run: sh scripts/package-ipk.sh "${{ matrix.arch }}" bin www "${{ needs.prepare.outputs.version }}" dist
-      - name: 打预编译包（给 Makefile / SDK 用）
         run: |
           set -e
-          rm -rf rel
-          mkdir -p rel/www
-          cp bin/airhand-server bin/airhand-web rel/
-          cp -a www/. rel/www/
-          tar czf "dist/airhand-${{ matrix.arch }}.tar.gz" -C rel .
-          cd dist
-          sha256sum "airhand-${{ matrix.arch }}.tar.gz" > "airhand-${{ matrix.arch }}.tar.gz.sha256"
+          mkdir -p bin
+          tar xzf "dl/deskgw-${{ matrix.arch }}.tar.gz" -C bin
+          cp "dl/deskgw-${{ matrix.arch }}.tar.gz" dist-src.tar.gz
+      - name: 打包 ipk
+        run: |
+          set -e
+          mkdir -p dist
+          sh scripts/package-ipk.sh "${{ matrix.arch }}" bin \
+            "${{ needs.prepare.outputs.version }}" dist
       - uses: actions/upload-artifact@v4
         with:
           name: ipk-${{ matrix.arch }}
-          path: dist/*
+          path: |
+            dist/*.ipk
+            dist-src.tar.gz
           if-no-files-found: error
 
   smoke:
     name: 冒烟测试（x86_64 实机运行）
-    needs: [ prepare, package ]
+    needs: [ package ]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: ipk-x86_64
-          path: dist
-      - name: 列出产物
-        run: ls -l dist
-      - name: 运行冒烟测试
-        run: sh scripts/smoke-test.sh dist/*.ipk
+          path: dl
+      - run: mkdir -p dist && cp dl/*.ipk dist/
+      - run: sh scripts/smoke-test.sh dist/*.ipk
 
   sdk:
     name: SDK 编译验证 ${{ matrix.arch }}（${{ matrix.ver }}）
@@ -230,12 +205,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # x86 跟随最新稳定版（25.12 起是 apk 包）
           - arch: x86_64
             board: x86
             subtarget: '64'
             ver: 25.12.2
-          # airoha 只有 snapshot 有，且 an7581 的 arch 就是 aarch64_cortex-a53
           - arch: aarch64_cortex-a53
             board: airoha
             subtarget: an7581
@@ -251,27 +224,25 @@ jobs:
       - name: 放入预编译二进制
         run: |
           set -e
-          mkdir -p "luci-app-airhand/prebuilt/${{ matrix.arch }}"
-          cp "dl/airhand-${{ matrix.arch }}.tar.gz" "luci-app-airhand/prebuilt/${{ matrix.arch }}/"
-          ls -l "luci-app-airhand/prebuilt/${{ matrix.arch }}/"
+          mkdir -p "openwrt/prebuilt/${{ matrix.arch }}"
+          cp "dl/deskgw-${{ matrix.arch }}.tar.gz" "openwrt/prebuilt/${{ matrix.arch }}/"
       - name: 下载 ImmortalWrt SDK
         run: sh scripts/fetch-sdk.sh "${{ matrix.board }}" "${{ matrix.subtarget }}" sdk
       - name: 在 SDK 里编译这个包
         run: |
           set -eo pipefail
-          cp -r luci-app-airhand sdk/package/
+          cp -r openwrt sdk/package/deskgw
           cd sdk
           make defconfig
-          make package/luci-app-airhand/compile V=s \
+          make package/deskgw/compile V=s \
             PKG_VERSION="${{ needs.prepare.outputs.version }}" \
-            -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -60
+            -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -80
       - name: 检查产物
         run: |
           set -e
           mkdir -p sdkout
-          find sdk/bin -name 'luci-app-airhand*.apk' -exec cp {} sdkout/ \; || true
-          find sdk/bin -name 'luci-app-airhand*.ipk' -exec cp {} sdkout/ \; || true
-          # apk 的文件名里没有架构，两个架构会互相覆盖，这里补上
+          find sdk/bin -name 'deskgw*.apk' -exec cp {} sdkout/ \; || true
+          find sdk/bin -name 'deskgw*.ipk' -exec cp {} sdkout/ \; || true
           for f in sdkout/*.apk; do
             [ -e "$f" ] || continue
             mv "$f" "${f%.apk}_${{ matrix.arch }}.apk"
@@ -279,20 +250,15 @@ jobs:
           ls -l sdkout
           pkg=$(ls sdkout/* 2>/dev/null | head -1)
           [ -n "$pkg" ] || { echo "::error::SDK 没有产出包"; exit 1; }
-          echo "产物: $pkg"
           case "$pkg" in
             *.ipk)
-              arch=$(ar p "$pkg" control.tar.gz | tar xzO ./control | sed -n 's/^Architecture: //p')
-              ver=$(ar p "$pkg" control.tar.gz | tar xzO ./control | sed -n 's/^Version: //p')
-              ;;
+              arch=$(ar p "$pkg" control.tar.gz | tar xzO ./control | sed -n 's/^Architecture: //p') ;;
             *.apk)
-              arch=$(grep -ao 'info "arch:[^"]*' build.log | head -1 | sed 's/.*arch://')
-              ver=$(grep -ao 'info "version:[^"]*' build.log | head -1 | sed 's/.*version://')
-              ;;
+              arch=$(grep -ao 'info "arch:[^"]*' build.log | head -1 | sed 's/.*arch://') ;;
           esac
-          echo "包信息：arch=$arch version=$ver"
+          echo "产物: $pkg arch=$arch"
           [ "$arch" = "${{ matrix.arch }}" ] || {
-            echo "::error::Architecture 是 $arch，期望 ${{ matrix.arch }}"; exit 1; }
+            echo "::error::Architecture 是 $arch"; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: sdk-${{ matrix.arch }}
@@ -318,8 +284,14 @@ jobs:
           pattern: sdk-*
           merge-multiple: true
           path: dist
-      - name: 列出产物
-        run: ls -l dist
+      - name: 重命名预编译包
+        run: |
+          set -e
+          for f in dist/deskgw-*.tar.gz; do
+            [ -e "$f" ] || continue
+            mv "$f" "dist/prebuilt-$(basename "$f")"
+          done
+          ls -l dist
       - name: 决定 tag
         id: rel
         run: |
@@ -333,46 +305,33 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "pre=$pre" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag prerelease=$pre"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.rel.outputs.tag }}
-          name: Airhand for OpenWrt ${{ needs.prepare.outputs.version }} (${{ needs.prepare.outputs.short }})
+          name: deskgw ${{ needs.prepare.outputs.version }} (${{ needs.prepare.outputs.short }})
           prerelease: ${{ steps.rel.outputs.pre }}
           make_latest: false
           files: |
             dist/*.ipk
             dist/*.apk
-            dist/*.tar.gz
+            dist/prebuilt-*
           body: |
-            airhand 源码：`${{ needs.prepare.outputs.ref }}` @ `${{ needs.prepare.outputs.sha }}`
-            airhand 版本：${{ needs.prepare.outputs.version }}
-            构建时间：`${{ github.run_id }}`（${{ github.event_name }}）
+            版本：${{ needs.prepare.outputs.version }} @ ${{ needs.prepare.outputs.short }}
+            范围：M1（登录、用户与主机授权、SQLite、审计、基础前端）
 
-            架构：`x86_64`、`aarch64_cortex-a53`（airoha an7581）
-
-            | 文件 | 用在哪 |
+            | 文件 | 用途 |
             |---|---|
-            | `*.ipk` | OpenWrt / ImmortalWrt **24.10**（opkg） |
-            | `*.apk` | ImmortalWrt **25.12 / snapshot**（apk），an7581 只能用这个 |
-            | `airhand-<arch>.tar.gz` | 给 `luci-app-airhand/Makefile` 的预编译二进制 |
-
-            ```
-            opkg install luci-app-airhand_*_<arch>.ipk   # 24.10
-            apk add --allow-untrusted luci-app-airhand-*.apk   # 25.12 / snapshot
-            ```
-      - name: 更新 bin 标签（给 Makefile 下载预编译二进制）
-        uses: softprops/action-gh-release@v2
+            | `*.ipk` | OpenWrt / ImmortalWrt 24.10（opkg） |
+            | `*.apk` | ImmortalWrt 25.12 / snapshot（apk），an7581 只能用这个 |
+            | `prebuilt-*.tar.gz` | `openwrt/Makefile` 的二进制来源 |
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: bin
-          name: 预编译二进制（供 luci-app-airhand/Makefile 下载）
+          name: 预编译二进制（供 openwrt/Makefile 下载）
           prerelease: true
           make_latest: false
           files: |
-            dist/airhand-*.tar.gz
-            dist/airhand-*.tar.gz.sha256
+            dist/prebuilt-*
           body: |
-            这是滚动更新的预编译二进制，给 `luci-app-airhand/Makefile` 的 `Build/Prepare` 用。
-
-            来源：`${{ needs.prepare.outputs.ref }}` @ `${{ needs.prepare.outputs.sha }}`（airhand ${{ needs.prepare.outputs.version }}）
-            每次 CI 跑完会覆盖这里的文件，不保证长期稳定；要可复现请用上面那个版本化的 release。
+            滚动更新的预编译二进制，供 `openwrt/Makefile` 的 `Build/Prepare` 使用。
+            来源：${{ needs.prepare.outputs.version }} @ ${{ needs.prepare.outputs.short }}

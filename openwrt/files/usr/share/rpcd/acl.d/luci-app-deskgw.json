@@ -1,0 +1,18 @@
+{
+	"luci-app-deskgw": {
+		"description": "Grant access to deskgw remote desktop gateway",
+		"read": {
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"uci": [ "deskgw" ]
+		},
+		"write": {
+			"uci": [ "deskgw" ],
+			"file": {
+				"/etc/init.d/deskgw": [ "exec" ],
+				"/usr/libexec/deskgw/cert-fingerprint.sh": [ "exec" ]
+			}
+		}
+	}
+}

@@ -1,0 +1,13 @@
+{
+	"admin/services/deskgw": {
+		"title": "deskgw",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "deskgw/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-deskgw" ]
+		}
+	}
+}

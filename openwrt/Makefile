@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: MIT
+#
+# deskgw 的 OpenWrt 包定义。
+# Go 二进制由 CI 静态交叉编译后随 release 分发，本 Makefile 只负责取回二进制，
+# 与 UCI 配置、procd 服务、LuCI 视图一起装进 ipk / apk。
+
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=deskgw
+PKG_VERSION:=0.1.0
+PKG_RELEASE:=1
+PKG_LICENSE:=MIT
+PKG_MAINTAINER:=mylucien
+
+DESKGW_BIN_TAG?=bin
+DESKGW_BIN_BASE?=https://github.com/mylucien/deskgw/releases/download/$(DESKGW_BIN_TAG)
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/deskgw
+  SECTION:=luci
+  CATEGORY:=LuCI
+  SUBMENU:=3. Applications
+  TITLE:=deskgw Web 远程桌面网关
+  DEPENDS:=+luci-base
+  URL:=https://github.com/mylucien/deskgw
+endef
+
+define Package/deskgw/description
+ 在路由器上提供基于浏览器的 Windows 远程桌面网关。M1 包含 HTTPS 管理界面、
+ 多用户与主机授权、审计日志；远程桌面通道在后续里程碑接入。
+endef
+
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+	@case "$(ARCH_PACKAGES)" in x86_64|aarch64_cortex-a53) ;; *) \
+		echo "deskgw: 架构 $(ARCH_PACKAGES) 没有预编译二进制"; exit 1 ;; esac
+	if [ -f ./prebuilt/$(ARCH_PACKAGES)/deskgw-$(ARCH_PACKAGES).tar.gz ]; then \
+		cp ./prebuilt/$(ARCH_PACKAGES)/deskgw-$(ARCH_PACKAGES).tar.gz $(PKG_BUILD_DIR)/ ; \
+	else \
+		$(CURL) -fsSL "$(DESKGW_BIN_BASE)/deskgw-$(ARCH_PACKAGES).tar.gz" \
+			-o $(PKG_BUILD_DIR)/deskgw-$(ARCH_PACKAGES).tar.gz ; \
+	fi
+	$(TAR) -xzf $(PKG_BUILD_DIR)/deskgw-$(ARCH_PACKAGES).tar.gz -C $(PKG_BUILD_DIR)/
+endef
+
+define Build/Compile
+endef
+
+define Package/deskgw/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/deskgw $(1)/usr/bin/deskgw
+
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/etc/config/deskgw $(1)/etc/config/deskgw
+
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/etc/init.d/deskgw $(1)/etc/init.d/deskgw
+
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/etc/uci-defaults/95-deskgw $(1)/etc/uci-defaults/95-deskgw
+
+	$(INSTALL_DIR) $(1)/usr/libexec/deskgw
+	$(INSTALL_BIN) ./files/usr/libexec/deskgw/cert-fingerprint.sh $(1)/usr/libexec/deskgw/
+
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./files/usr/share/luci/menu.d/luci-app-deskgw.json $(1)/usr/share/luci/menu.d/
+	$(INSTALL_DATA) ./files/usr/share/rpcd/acl.d/luci-app-deskgw.json $(1)/usr/share/rpcd/acl.d/
+
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/deskgw
+	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/deskgw/overview.js \
+		$(1)/www/luci-static/resources/view/deskgw/overview.js
+endef
+
+$(eval $(call BuildPackage,deskgw))

@@ -1,0 +1,51 @@
+#!/bin/sh /etc/rc.common
+# deskgw 网关服务。前端与后端在同一个二进制中，默认仅监听 HTTPS 8443。
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/deskgw
+
+start_service() {
+	local enabled listen cert key cert_names data_dir idle upload cookie_secure redirect
+
+	config_load deskgw
+	config_get_bool enabled main enabled 1
+	[ "$enabled" -eq 1 ] || return 0
+
+	config_get listen main listen '0.0.0.0:8443'
+	config_get cert main cert '/etc/deskgw/server.crt'
+	config_get key main key '/etc/deskgw/server.key'
+	config_get cert_names main cert_names ''
+	config_get data_dir main data_dir '/etc/deskgw'
+	config_get idle main session_idle_min '30'
+	config_get upload main max_upload_mb '2048'
+	config_get_bool cookie_secure main cookie_secure 1
+	config_get redirect main redirect_listen ''
+
+	mkdir -p "$data_dir" || return 1
+	chmod 700 "$data_dir"
+
+	procd_open_instance 'main'
+	procd_set_param command "$PROG"
+	procd_set_param env \
+		DESKGW_LISTEN="$listen" \
+		DESKGW_REDIRECT_LISTEN="$redirect" \
+		DESKGW_CERT="$cert" \
+		DESKGW_KEY="$key" \
+		DESKGW_CERT_NAMES="$cert_names" \
+		DESKGW_DATA_DIR="$data_dir" \
+		DESKGW_SESSION_IDLE_MIN="$idle" \
+		DESKGW_MAX_UPLOAD_MB="$upload" \
+		DESKGW_COOKIE_SECURE="$cookie_secure"
+	procd_set_param file /etc/config/deskgw
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger 'deskgw'
+}

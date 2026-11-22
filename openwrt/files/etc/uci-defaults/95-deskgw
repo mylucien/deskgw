@@ -1,0 +1,16 @@
+#!/bin/sh
+# 首次安装后启用服务。已存在的配置不做覆盖。
+
+[ -e /etc/config/deskgw ] || {
+	uci -q batch <<-EOF
+		set deskgw.main=deskgw
+		set deskgw.main.enabled='1'
+		set deskgw.main.listen='0.0.0.0:8443'
+		set deskgw.main.data_dir='/etc/deskgw'
+		commit deskgw
+	EOF
+}
+
+/etc/init.d/deskgw enable >/dev/null 2>&1 || true
+rm -f /etc/uci-defaults/95-deskgw
+exit 0
