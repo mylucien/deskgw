@@ -109,8 +109,8 @@ func (s *Server) openShare(w http.ResponseWriter, fc *fileContext, shareName str
 
 // listFiles 列出目录。
 func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
-	fc, ok := s.resolveFile(w, r)
-	if !ok {
+	fc, valid := s.resolveFile(w, r)
+	if !valid {
 		return
 	}
 	dir, err := filegw.NormalizePath(r.URL.Query().Get("path"))
@@ -118,8 +118,8 @@ func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "badPath", err.Error())
 		return
 	}
-	conn, _, ok := s.openShare(w, fc, r.URL.Query().Get("share"))
-	if !ok {
+	conn, _, valid := s.openShare(w, fc, r.URL.Query().Get("share"))
+	if !valid {
 		return
 	}
 	defer conn.Close()
@@ -133,8 +133,8 @@ func (s *Server) listFiles(w http.ResponseWriter, r *http.Request) {
 
 // uploadFile 接收分片字节流，按 offset 写入（断点续传）。
 func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
-	fc, ok := s.resolveFile(w, r)
-	if !ok {
+	fc, valid := s.resolveFile(w, r)
+	if !valid {
 		return
 	}
 	q := r.URL.Query()
@@ -149,8 +149,8 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := int64(s.settingInt("max_upload_mb", 2048)) << 20
-	conn, share, ok := s.openShare(w, fc, q.Get("share"))
-	if !ok {
+	conn, share, valid := s.openShare(w, fc, q.Get("share"))
+	if !valid {
 		return
 	}
 	defer conn.Close()
@@ -180,8 +180,8 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 
 // downloadFile 流式下载，支持 HTTP Range。
 func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
-	fc, ok := s.resolveFile(w, r)
-	if !ok {
+	fc, valid := s.resolveFile(w, r)
+	if !valid {
 		return
 	}
 	q := r.URL.Query()
@@ -190,8 +190,8 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "badPath", "文件名不合法")
 		return
 	}
-	conn, share, ok := s.openShare(w, fc, q.Get("share"))
-	if !ok {
+	conn, share, valid := s.openShare(w, fc, q.Get("share"))
+	if !valid {
 		return
 	}
 	defer conn.Close()
@@ -244,8 +244,8 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 
 // fileMutation 处理 mkdir / rename / delete。
 func (s *Server) fileMutation(w http.ResponseWriter, r *http.Request, kind string) {
-	fc, ok := s.resolveFile(w, r)
-	if !ok {
+	fc, valid := s.resolveFile(w, r)
+	if !valid {
 		return
 	}
 	var in struct {
@@ -262,8 +262,8 @@ func (s *Server) fileMutation(w http.ResponseWriter, r *http.Request, kind strin
 		fail(w, http.StatusBadRequest, "badPath", "路径不合法")
 		return
 	}
-	conn, share, ok := s.openShare(w, fc, in.Share)
-	if !ok {
+	conn, share, valid := s.openShare(w, fc, in.Share)
+	if !valid {
 		return
 	}
 	defer conn.Close()
