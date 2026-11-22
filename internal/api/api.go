@@ -84,7 +84,9 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 		})
 	})
 
-	r.Handle("/*", web.Handler())
+	static := web.Handler()
+	r.Get("/", static)
+	r.Handle("/*", static)
 	return r
 }
 

@@ -110,7 +110,9 @@ echo "$r" | grep -q '"ok":true' || fail "删除主机失败"
 ok
 
 echo "== 8. 静态页面 =="
-curl -ksS https://127.0.0.1:18443/ | grep -q '<div id="app"' || fail "首页不是前端 HTML"
+body=$(curl -ksS -w '\n%{http_code}' https://127.0.0.1:18443/)
+echo "$body" | tail -1 | grep -q '^200$' || { echo "$body" | head -c 500 >&2; fail "首页 HTTP 状态异常"; }
+echo "$body" | grep -q '<div id="app"' || { echo "$body" | head -c 500 >&2; fail "首页不是前端 HTML"; }
 ok
 
 echo "全部通过"
