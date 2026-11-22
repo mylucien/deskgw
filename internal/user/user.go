@@ -31,7 +31,8 @@ type scanner interface{ Scan(dest ...any) error }
 
 func scanUser(s scanner) (User, error) {
 	var u User
-	var enabled, file, clip, totp int
+	var enabled, file, clip int
+	var totp string
 	err := s.Scan(&u.ID, &u.Username, &u.Role, &enabled, &file, &clip,
 		&u.MaxSessions, &totp, &u.CreatedAt)
 	u.Enabled = enabled != 0
