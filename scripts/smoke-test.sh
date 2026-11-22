@@ -4,6 +4,10 @@
 set -eu
 
 IPK=$1
+case "$IPK" in
+	/*) ;;
+	*) IPK=$(cd "$(dirname "$IPK")" && pwd)/$(basename "$IPK") ;;
+esac
 WORK=$(mktemp -d)
 trap 'kill ${PID:-} 2>/dev/null || true; rm -rf "$WORK"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
