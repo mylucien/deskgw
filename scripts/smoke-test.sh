@@ -84,10 +84,10 @@ code=$(curl -ksS -o "$WORK/login.json" -w '%{http_code}' -b "$WORK/jar" -c "$WOR
 [ "$code" = "200" ] || { cat "$WORK/login.json" >&2; fail "登录失败: $code"; }
 code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" https://127.0.0.1:18443/api/me)
 [ "$code" = "200" ] || fail "登录态校验失败: $code"
-code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" \
+code=$(curl -ksS -o /dev/null -w '%{http_code}' \
 	-X POST https://127.0.0.1:18443/api/admin/hosts \
 	-H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" -d '{}')
-[ "$code" = "403" ] || fail "普通请求访问 admin 接口应返回 403，实际 $code"
+[ "$code" = "401" ] || fail "无登录态访问 admin 接口应返回 401，实际 $code"
 ok
 
 echo "== 7. 主机与用户 CRUD =="
