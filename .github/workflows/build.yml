@@ -192,21 +192,19 @@ jobs:
       - name: 展开二进制
         run: |
           set -e
-          mkdir -p bin
+          mkdir -p bin dist
           tar xzf "dl/deskgw-${{ matrix.arch }}.tar.gz" -C bin
-          cp "dl/deskgw-${{ matrix.arch }}.tar.gz" dist-src.tar.gz
+          cp "dl/deskgw-${{ matrix.arch }}.tar.gz" dist/
+          cp "dl/deskgw-${{ matrix.arch }}.sha256" dist/
       - name: 打包 ipk
         run: |
           set -e
-          mkdir -p dist
           sh scripts/package-ipk.sh "${{ matrix.arch }}" bin \
             "${{ needs.prepare.outputs.version }}" dist
       - uses: actions/upload-artifact@v4
         with:
           name: ipk-${{ matrix.arch }}
-          path: |
-            dist/*.ipk
-            dist-src.tar.gz
+          path: dist/*
           if-no-files-found: error
 
   smoke:
