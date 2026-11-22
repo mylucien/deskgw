@@ -3,6 +3,9 @@
 #   用法: smoke-test.sh <ipk>
 set -eu
 
+# 在 cd 之前解析脚本目录为绝对路径（脚本中途会 cd 到解包目录）
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
 IPK=$1
 case "$IPK" in
 	/*) ;;
@@ -117,8 +120,7 @@ ok
 
 echo "== 9. RDP 隧道（票据 / WS / 地址隔离）=="
 command -v python3 >/dev/null || fail "缺少 python3"
-TUNNEL_TEST="$(cd "$(dirname "$0")" && pwd)/rdp-tunnel-test.py"
-python3 "$TUNNEL_TEST" https://127.0.0.1:18443 smoke-test-pw || fail "RDP 隧道测试失败"
+python3 "$SCRIPT_DIR/rdp-tunnel-test.py" https://127.0.0.1:18443 smoke-test-pw || fail "RDP 隧道测试失败"
 ok
 
 echo "全部通过"
