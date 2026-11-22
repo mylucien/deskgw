@@ -1,4 +1,4 @@
-// deskgw：OpenWrt Web 远程桌面网关。M1 提供登录、用户/主机管理与基础前端。
+// deskgw：OpenWrt Web 远程桌面网关。当前实现 RDP 隧道、多标签会话与 SMB 文件网关。
 package main
 
 import (

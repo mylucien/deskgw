@@ -31,14 +31,15 @@ type Gateway struct {
 	maxFrame  int64
 	dialTime  time.Duration
 	auditFn   func(userID any, action, target, detail, ip string)
+	onEnd     func(sessionID int64) // 会话结束时回调（撤销文件令牌等），可为 nil
 	mu        sync.Mutex
 	live      map[int64]*liveSession
 }
 
-// NewGateway 构造网关。审计回调可为 nil。
-func NewGateway(db *sql.DB, tickets *TicketManager, auditFn func(userID any, action, target, detail, ip string)) *Gateway {
+// NewGateway 构造网关。auditFn / onEnd 均可为 nil。
+func NewGateway(db *sql.DB, tickets *TicketManager, auditFn func(userID any, action, target, detail, ip string), onEnd func(sessionID int64)) *Gateway {
 	return &Gateway{
-		db: db, tickets: tickets, auditFn: auditFn,
+		db: db, tickets: tickets, auditFn: auditFn, onEnd: onEnd,
 		maxFrame: 1 << 20, dialTime: 10 * time.Second,
 		live: make(map[int64]*liveSession),
 	}
@@ -246,8 +247,15 @@ func (g *Gateway) markActive(sessionID int64, ip string) {
 }
 
 func (g *Gateway) endSession(sessionID int64, state, detail string) {
-	_, _ = g.db.Exec(`UPDATE sessions SET state=?, ended_at=? WHERE id=? AND ended_at IS NULL`,
+	res, err := g.db.Exec(`UPDATE sessions SET state=?, ended_at=? WHERE id=? AND ended_at IS NULL`,
 		state, time.Now().Unix(), sessionID)
+	if err != nil {
+		return
+	}
+	// 只有首次真正结束会话时才撤销该会话的文件令牌，保证回调幂等。
+	if n, _ := res.RowsAffected(); n > 0 && g.onEnd != nil {
+		g.onEnd(sessionID)
+	}
 }
 
 func (g *Gateway) audit(userID any, action, target, detail, ip string) {

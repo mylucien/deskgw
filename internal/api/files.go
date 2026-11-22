@@ -149,6 +149,17 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := int64(s.settingInt("max_upload_mb", 2048)) << 20
+	// 总量上限按 offset 计算：分片可续传，但任何一片都不得让文件突破总上限。
+	if offset >= limit {
+		fail(w, http.StatusRequestEntityTooLarge, "tooLarge", "分片偏移超过单文件上限")
+		return
+	}
+	allowed := limit - offset
+	// Content-Length 已知时提前拒绝，超限请求不建立 SMB 连接、不写盘。
+	if r.ContentLength > allowed {
+		fail(w, http.StatusRequestEntityTooLarge, "tooLarge", "文件超过单文件上限")
+		return
+	}
 	conn, share, valid := s.openShare(w, fc, q.Get("share"))
 	if !valid {
 		return
@@ -159,10 +170,12 @@ func (s *Server) uploadFile(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadGateway, "smb", err.Error())
 		return
 	}
-	written, err := io.Copy(f, io.LimitReader(r.Body, limit+1))
+	// LimitReader 多读 1 字节用于检测超限；写入量被 allowed 严格封顶。
+	written, err := io.Copy(f, io.LimitReader(r.Body, allowed+1))
 	cerr := f.Close()
-	if written > limit {
-		fail(w, http.StatusRequestEntityTooLarge, "tooLarge", "分片超过单文件上限")
+	if written > allowed {
+		// 已写入的 allowed 字节是合法前缀，超出部分未落盘；报错让客户端停止。
+		fail(w, http.StatusRequestEntityTooLarge, "tooLarge", "文件超过单文件上限")
 		return
 	}
 	if err != nil {

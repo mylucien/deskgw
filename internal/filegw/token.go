@@ -52,7 +52,24 @@ func NewTokenManager(ttl time.Duration) *TokenManager {
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
 	}
-	return &TokenManager{tokens: map[string]*fileToken{}, ttl: ttl}
+	m := &TokenManager{tokens: map[string]*fileToken{}, ttl: ttl}
+	go m.janitor()
+	return m
+}
+
+// janitor 定期清理过期令牌，确保其中的明文凭据不会因无人访问而长期驻留内存。
+func (m *TokenManager) janitor() {
+	interval := m.ttl / 2
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		m.mu.Lock()
+		m.pruneLocked()
+		m.mu.Unlock()
+	}
 }
 
 var (

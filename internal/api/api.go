@@ -47,15 +47,23 @@ const sessionKey ctxKey = 1
 // New 构造 HTTP handler。
 func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 	s := &Server{db: db, auth: mgr, cfg: cfg, started: time.Now()}
+	// 启动时以数据库中持久化的会话超时为准（后台可改），缺省沿用环境变量配置。
+	var savedIdle string
+	if err := db.QueryRow(`SELECT value FROM settings WHERE key='session_idle_min'`).Scan(&savedIdle); err == nil {
+		if n, e := strconv.Atoi(savedIdle); e == nil && n > 0 {
+			mgr.SetIdle(n)
+		}
+	}
 	s.tickets = tunnel.NewTicketManager(30 * time.Second)
 	s.fileTokens = filegw.NewTokenManager(30 * time.Minute)
 	s.gateway = tunnel.NewGateway(db, s.tickets,
 		func(uid any, action, target, detail, ip string) {
 			writeAudit(s, uid, action, target, detail, ip)
-		})
+		}, s.fileTokens.RevokeSession)
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.RealIP)
+	// clientIP 直接取 r.RemoteAddr（真实 TCP 对端），不信任 X-Forwarded-For / X-Real-IP。
+	// deskgw 部署在边缘、前面无反向代理；启用 RealIP 会让伪造头绕过登录限流与票据/令牌的 IP 绑定。
 	r.Use(s.securityHeaders)
 	r.Use(s.issueCSRF)
 
@@ -231,7 +239,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: tok, Path: "/",
 		HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode,
-		MaxAge: s.cfg.SessionIdleMin * 60,
+		MaxAge: int(s.auth.Idle().Minutes()) * 60,
 	})
 	writeAudit(s, u.ID, "login", u.Username, "", ip)
 	ok(w, map[string]any{"user": u})
@@ -626,10 +634,14 @@ func (s *Server) killSession(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "badRequest", "ID 不正确")
 		return
 	}
-	s.gateway.CloseSession(id)
-	s.fileTokens.RevokeSession(id)
-	_, _ = s.db.Exec(`UPDATE sessions SET state='killed', ended_at=? WHERE id=? AND ended_at IS NULL`,
+	// 先落 killed 状态并撤销文件令牌，再触发网关关闭。
+	// 这样网关异步的 endSession 因 ended_at 已置而不会覆盖状态或重复撤销。
+	res, _ := s.db.Exec(`UPDATE sessions SET state='killed', ended_at=? WHERE id=? AND ended_at IS NULL`,
 		time.Now().Unix(), id)
+	if n, _ := res.RowsAffected(); n > 0 {
+		s.fileTokens.RevokeSession(id)
+	}
+	s.gateway.CloseSession(id)
 	writeAudit(s, idFromContext(r), "rdp.kill", strconv.FormatInt(id, 10), "", clientIP(r))
 	ok(w, map[string]any{})
 }
@@ -679,6 +691,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusBadRequest, "invalid", "设置项 "+k+" 暂不可用")
 			return
 		}
+		if k == "session_idle_min" {
+			n, e := strconv.Atoi(v)
+			if e != nil || n <= 0 {
+				fail(w, http.StatusBadRequest, "invalid", "会话空闲超时须为正整数")
+				return
+			}
+		}
 		if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
 			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
 			serverError(w, err)
@@ -688,6 +707,12 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if err := tx.Commit(); err != nil {
 		serverError(w, err)
 		return
+	}
+	// 会话空闲超时需在运行时即时生效，而不只是写库。
+	if v, exists := in["session_idle_min"]; exists {
+		if n, e := strconv.Atoi(v); e == nil {
+			s.auth.SetIdle(n)
+		}
 	}
 	writeAudit(s, idFromContext(r), "settings.update", strings.Join(keysOf(in), ","), "", clientIP(r))
 	ok(w, map[string]any{})

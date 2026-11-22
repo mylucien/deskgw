@@ -94,6 +94,23 @@ func NewManager(idleMinutes int) *Manager {
 	}
 }
 
+// SetIdle 运行时更新会话空闲超时；非正值忽略。
+func (m *Manager) SetIdle(minutes int) {
+	if minutes <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.idle = time.Duration(minutes) * time.Minute
+	m.mu.Unlock()
+}
+
+// Idle 返回当前会话空闲超时。
+func (m *Manager) Idle() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.idle
+}
+
 // RandomToken 生成 URL 安全的随机串。
 func RandomToken(n int) string {
 	b := make([]byte, n)
