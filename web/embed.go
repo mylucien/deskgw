@@ -18,6 +18,10 @@ func Handler() http.Handler {
 	if err != nil {
 		panic(err)
 	}
+	index, err := fs.ReadFile(sub, "index.html")
+	if err != nil {
+		panic(err)
+	}
 	fileServer := http.FileServer(http.FS(sub))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
@@ -28,8 +32,8 @@ func Handler() http.Handler {
 				return
 			}
 		}
-		clone := r.Clone(r.Context())
-		clone.URL.Path = "/index.html"
-		fileServer.ServeHTTP(w, clone)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(index)
 	})
 }
