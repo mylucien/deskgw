@@ -132,6 +132,13 @@ async function submit() {
 }
 
 onMounted(async () => {
+  // ?depth=32 是临时的色深 A/B 开关。凭据不落 URL，会话页也就没有 query，
+  // 所以在这里把选择记进 sessionStorage，由连接时读取。
+  const depthQuery = new URLSearchParams(window.location.search).get('depth')
+  if (depthQuery === '32' || depthQuery === '16') {
+    try { sessionStorage.setItem('deskgw.depth', depthQuery) } catch { /* 隐私模式 */ }
+  }
+
   // 空闲时预热 WASM：4.4MB 的下载与编译压在点「连接」之后会白等半秒到一秒。
   // 用动态导入，主机列表页的首屏 bundle 不必为它多背一份胶水代码；延迟 1.2s
   // 是为了不和列表请求、首屏渲染抢带宽。失败留给真正连接时再报。

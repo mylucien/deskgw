@@ -195,10 +195,12 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   // 就绪后再补这一行日志。
   const healthDone = reportServerVersion(log)
 
-  // 临时 A/B 开关：?depth=32 让会话按 32bpp 协商。服务器只在 32bpp 会话里
-  // 真正下发 RemoteFX 帧，16bpp 下能力集里宣告的 RemoteFX 不会生效。
-  // 默认 16，保持既有行为直到实测确认。
-  const wideColor = new URLSearchParams(window.location.search).get('depth') === '32'
+  // 临时 A/B 开关：主机列表页带 ?depth=32 打开一次，选择会记在 sessionStorage
+  // 里供后续连接读取。服务器只在 32bpp 会话里真正下发 RemoteFX 帧，16bpp 下
+  // 能力集里宣告的 RemoteFX 不会生效。默认 16，保持既有行为直到实测确认。
+  let depth = '16'
+  try { depth = sessionStorage.getItem('deskgw.depth') || '16' } catch { /* 隐私模式 */ }
+  const wideColor = depth === '32'
 
   await ensureWasm()
   // 必须在 wasm 初始化之后调用：这些导出函数直接操作实例内存。
