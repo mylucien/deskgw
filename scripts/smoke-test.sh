@@ -185,11 +185,16 @@ done
 rm -f "$WORK/jar2"
 curl -ksS -c "$WORK/jar2" -o /dev/null https://127.0.0.1:18443/api/health
 CSRF2=$(awk '$6=="deskgw_csrf" {print $7}' "$WORK/jar2")
-code=$(curl -ksS -o /dev/null -b "$WORK/jar2" -c "$WORK/jar2" \
+echo "   csrf2=${CSRF2:-<empty>}"
+code=$(curl -ksS -o "$WORK/login2.json" -w '%{http_code}' -b "$WORK/jar2" -c "$WORK/jar2" \
 	-X POST https://127.0.0.1:18443/api/login \
 	-H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF2" \
-	-d '{"username":"admin","password":"smoke-test-pw"}')
-[ "$code" = "200" ] || fail "重启后重新登录失败: $code"
+	-d '{"username":"admin","password":"smoke-test-pw"}') || code="curl-error"
+echo "   login=$code body=$(head -c 200 "$WORK/login2.json" 2>/dev/null)"
+[ "$code" = "200" ] || {
+	tail -20 "$WORK/server.log" >&2
+	fail "重启后重新登录失败: $code"
+}
 r=$(curl -ksS -b "$WORK/jar2" https://127.0.0.1:18443/api/admin/sessions)
 echo "$r" | grep -q "\"id\":$SID" || fail "会话记录消失"
 echo "$r" | grep -o "\"id\":$SID[^}]*" | grep -q '"state":"stale"' \
