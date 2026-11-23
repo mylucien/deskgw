@@ -10,7 +10,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Store 包装数据库连接。
 type Store struct {
@@ -72,6 +72,16 @@ func (s *Store) migrate() error {
 			}
 		}
 		if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
+			return err
+		}
+	}
+	if v < 3 {
+		for _, stmt := range schemaV3 {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("执行 schema v3 失败: %w", err)
+			}
+		}
+		if _, err := tx.Exec("PRAGMA user_version = 3"); err != nil {
 			return err
 		}
 	}
@@ -159,4 +169,12 @@ var schemaV2 = []string{
 	`CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions(state, ended_at)`,
 	`CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)`,
+}
+
+// schemaV3 给会话补上结束原因。
+//
+// ALTER TABLE 不能重复执行，所以只能放在独立版本里靠 user_version 控制；
+// 新建的库同样会走这一步（V1 建表时不带该列）。
+var schemaV3 = []string{
+	`ALTER TABLE sessions ADD COLUMN detail TEXT NOT NULL DEFAULT ''`,
 }
