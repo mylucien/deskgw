@@ -30,7 +30,7 @@ use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
-use ironrdp::pdu::geometry::InclusiveRectangle;
+use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, fast_path};
 use ironrdp_core::WriteBuf;
@@ -1715,8 +1715,8 @@ fn present(
         return Ok(());
     }
 
-    for &region in regions {
-        let region = extract_partial_image(image, region, buffer);
+    for region in regions {
+        let region = extract_partial_image(image, region.clone(), buffer);
         gui.draw(buffer.filled_mut(), region)
             .context("draw updated region")?;
         buffer.clear();
