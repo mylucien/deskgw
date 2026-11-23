@@ -65,7 +65,21 @@ cat > "$CTRL/conffiles" <<EOF
 /etc/config/deskgw
 EOF
 
-( cd "$CTRL" && tar -czf "$STAGE/control.tar.gz" --owner=0 --group=0 --numeric-owner ./control ./conffiles )
+# postinst 在安装完成后立即执行 uci-defaults 并启动服务，
+# 避免要等到下次开机才初始化。
+cat > "$CTRL/postinst" <<'EOF'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] || {
+	/etc/uci-defaults/95-deskgw || true
+	/etc/init.d/deskgw enable
+	/etc/init.d/deskgw restart
+}
+exit 0
+EOF
+chmod 0755 "$CTRL/postinst"
+
+( cd "$CTRL" && tar -czf "$STAGE/control.tar.gz" --owner=0 --group=0 --numeric-owner \
+	./control ./conffiles ./postinst )
 ( cd "$ROOT" && tar -czf "$STAGE/data.tar.gz" --owner=0 --group=0 --numeric-owner ./ )
 
 IPK="$OUTDIR/${PKG}_${PKGVER}_${ARCH}.ipk"

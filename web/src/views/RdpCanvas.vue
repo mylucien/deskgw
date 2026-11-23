@@ -108,6 +108,8 @@ onMounted(async () => {
     if (!canvas.value) throw new Error('画布未就绪')
     session = await connectRdp({
       wsUrl: resolveWsUrl(props.tab.wsPath),
+      destination: props.tab.address,
+      fingerprintKey: 'host-' + props.tab.hostId,
       canvas: canvas.value,
       credentials: { username: creds.username, password: creds.password, domain: creds.domain },
       width: vpWidth.value,

@@ -84,8 +84,9 @@ func Get(db *sql.DB, id int64) (Host, error) {
 }
 
 // Validate 校验主机字段。地址必须是私网 IP，防止 SSRF。
+// ID 允许为 0，表示新增时由数据库自动分配。
 func Validate(h Host) error {
-	if h.ID < 1 || h.ID > 4294967295 {
+	if h.ID < 0 || h.ID > 4294967295 {
 		return errors.New("主机 ID 须在 1–4294967295 之间（用作被控端控制码）")
 	}
 	if h.Name == "" || len(h.Name) > 64 {
@@ -95,7 +96,13 @@ func Validate(h Host) error {
 	if ip == nil {
 		return errors.New("地址必须是 IP 字面量")
 	}
-	if !ip.IsPrivate() && !ip.IsLoopback() {
+	// 回环、未指定、组播与链路本地地址一律拒绝：网关自身也监听在局域网内，
+	// 允许这类地址会让隧道指向网关自己或本地服务，形成 SSRF 跳板。
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() {
+		return errors.New("地址不能是回环、未指定、组播或链路本地地址")
+	}
+	// 允许 RFC1918、IPv6 ULA 以及 100.64.0.0/10（CGNAT，Tailscale/ZeroTier 等常用）。
+	if !ip.IsPrivate() && !isCGNAT(ip) {
 		return errors.New("地址必须属于私网段，公网地址被拒绝")
 	}
 	if h.RDPPort < 1 || h.RDPPort > 65535 || h.SBMPort < 1 || h.SBMPort > 65535 {
@@ -110,6 +117,16 @@ func Validate(h Host) error {
 		}
 	}
 	return nil
+}
+
+// isCGNAT 判断 IPv4 100.64.0.0/10，即运营商级 NAT 段。
+// Tailscale 默认使用该段，Go 的 IsPrivate 不包含它。
+func isCGNAT(ip net.IP) bool {
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	return v4[0] == 100 && v4[1]&0xC0 == 64
 }
 
 func splitModes(s string) []string {
@@ -133,16 +150,40 @@ func splitModes(s string) []string {
 	return out
 }
 
-// Create 新增主机。
-func Create(db *sql.DB, h Host) error {
-	if err := Validate(h); err != nil {
+// Create 新增主机。ID 为 0 时自动分配（后续可用作被控端控制码）。
+func Create(db *sql.DB, h *Host) error {
+	if err := Validate(*h); err != nil {
 		return err
 	}
-	_, err := db.Exec(`INSERT INTO hosts
-		(id, name, address, rdp_port, smb_port, group_name, note, enabled, modes, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		h.ID, h.Name, h.Address, h.RDPPort, h.SBMPort, h.Group, h.Note, b(h.Enabled), h.Modes, time.Now().Unix())
-	return err
+	var (
+		res sql.Result
+		err error
+	)
+	if h.ID == 0 {
+		res, err = db.Exec(`INSERT INTO hosts
+			(name, address, rdp_port, smb_port, group_name, note, enabled, modes, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			h.Name, h.Address, h.RDPPort, h.SBMPort, h.Group, h.Note, b(h.Enabled), h.Modes, time.Now().Unix())
+	} else {
+		res, err = db.Exec(`INSERT INTO hosts
+			(id, name, address, rdp_port, smb_port, group_name, note, enabled, modes, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			h.ID, h.Name, h.Address, h.RDPPort, h.SBMPort, h.Group, h.Note, b(h.Enabled), h.Modes, time.Now().Unix())
+	}
+	if err != nil {
+		return err
+	}
+	if h.ID == 0 {
+		id, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		h.ID = id
+	}
+	if h.ID < 1 || h.ID > 4294967295 {
+		return errors.New("主机 ID 超出 1–4294967295 范围")
+	}
+	return nil
 }
 
 // Update 更新主机资料，保留性能模式字段。

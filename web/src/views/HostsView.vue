@@ -116,6 +116,7 @@ async function submit() {
     openTab({
       hostName: target.value.name,
       hostId: target.value.id,
+      address: target.value.address,
       sessionId: t.session_id,
       wsPath: t.ws_path,
       creds: { ...form },

@@ -30,10 +30,12 @@ echo "   arch=$arch version=$ver"
 [ -n "$arch" ] && [ -n "$ver" ] || fail "control 字段缺失"
 [ -f conffiles ] || fail "缺少 conffiles（升级会覆盖 UCI 配置）"
 grep -qx '/etc/config/deskgw' conffiles || fail "conffiles 未声明 /etc/config/deskgw"
+[ -x postinst ] || fail "缺少可执行的 postinst"
 
 echo "== 2. 文件清单 =="
 for f in usr/bin/deskgw etc/config/deskgw etc/init.d/deskgw \
 	etc/uci-defaults/95-deskgw usr/libexec/deskgw/cert-fingerprint.sh \
+	lib/upgrade/keep.d/deskgw \
 	www/luci-static/resources/view/deskgw/overview.js; do
 	[ -f "$f" ] || fail "缺少 $f"
 done
@@ -120,7 +122,7 @@ echo "$body" | tail -1 | grep -q '^200$' || { echo "$body" | head -c 500 >&2; fa
 echo "$body" | grep -q '<div id="app"' || { echo "$body" | head -c 500 >&2; fail "首页不是前端 HTML"; }
 ok
 
-echo "== 9. RDP 隧道（票据 / WS / 地址隔离）=="
+echo "== 9. RDP 隧道（票据 / 字节透传 / 地址隔离）=="
 command -v python3 >/dev/null || fail "缺少 python3"
 python3 "$SCRIPT_DIR/rdp-tunnel-test.py" https://127.0.0.1:18443 smoke-test-pw || {
   echo "--- 网关日志（隧道测试失败）---" >&2

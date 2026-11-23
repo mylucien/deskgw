@@ -8,6 +8,8 @@ export interface TabInfo {
   key: string
   hostName: string
   hostId: number
+  /** 主机 IP，仅用于 TLS SNI；真实连接目标由网关按数据库决定。 */
+  address: string
   sessionId: number
   wsPath: string
   creds: Credentials

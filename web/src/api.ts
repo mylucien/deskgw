@@ -60,19 +60,3 @@ export async function uploadChunk<T = any>(p: string, chunk: Blob, headers: Reco
   }
   return payload.data as T
 }
-
-// 下载文件为 Blob，返回建议文件名（从 Content-Disposition 解析）。
-export async function downloadBlob(p: string, headers: Record<string, string>): Promise<{ blob: Blob; name: string }> {
-  const h = new Headers(headers)
-  const res = await fetch('/api' + p, { headers: h, credentials: 'same-origin' })
-  if (!res.ok) {
-    redirectIfUnauthorized(res.status)
-    throw new Error(`下载失败 (${res.status})`)
-  }
-  const blob = await res.blob()
-  const cd = res.headers.get('Content-Disposition') || ''
-  const m = cd.match(/filename\*=UTF-8''([^;]+)/i)
-  let name = 'download'
-  if (m) { try { name = decodeURIComponent(m[1]) } catch { name = m[1] } }
-  return { blob, name: name.replace(/.*[\\/]/, '') }
-}

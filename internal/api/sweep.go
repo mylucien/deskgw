@@ -71,6 +71,7 @@ func (s *Server) finishSession(id int64, state string) {
 	}
 	if n, err := res.RowsAffected(); err == nil && n > 0 {
 		s.fileTokens.RevokeSession(id)
+		s.uploads.RevokeSession(id)
 	}
 }
 

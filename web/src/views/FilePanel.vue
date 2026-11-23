@@ -52,7 +52,7 @@
 
 <script setup lang="ts">
 import { onBeforeUnmount, ref } from 'vue'
-import { post, get, uploadChunk, downloadBlob } from '../api'
+import { post, get, uploadChunk } from '../api'
 import type { Credentials } from '../rdp'
 
 const props = defineProps<{ sessionId: number; creds: Credentials }>()
@@ -117,34 +117,47 @@ async function onFiles(ev: Event) {
   for (const file of files) {
     const tr: Transfer = { id: ++tid, name: file.name, state: '上传中', pct: 0 }
     transfers.value.push(tr)
+    let uploadId = ''
     try {
+      // 整条上传复用一条 SMB 连接：分片之间不再重复 NTLM 认证。
+      const b = await post<{ upload_id: string }>('/files/upload/begin', {
+        share: share.value, path: fullPath(file.name), size: file.size,
+      }, h())
+      uploadId = b.upload_id
+      // 零字节文件也要走一次 begin/finish，否则远端不会创建文件。
       for (let offset = 0; offset < file.size; offset += chunkSize) {
         const chunk = file.slice(offset, Math.min(offset + chunkSize, file.size))
-        const q = '/files/upload?share=' + encodeURIComponent(share.value) +
-          '&path=' + encodeURIComponent(fullPath(file.name)) + '&offset=' + offset
+        const q = '/files/upload/chunk?upload_id=' + encodeURIComponent(uploadId) + '&offset=' + offset
         const r = await uploadChunk<{ offset: number }>(q, chunk, h())
         tr.pct = Math.min(100, Math.round(r.offset * 100 / (file.size || 1)))
       }
+      await post('/files/upload/finish', {
+        upload_id: uploadId, share: share.value, path: fullPath(file.name),
+      }, h())
       tr.state = '完成'; tr.pct = 100
     } catch (e: any) {
       tr.state = '失败：' + (e.message || '上传错误')
+      if (uploadId) {
+        try { await post('/files/upload/abort', { upload_id: uploadId }, h()) } catch { /* ignore */ }
+      }
     }
     setTimeout(() => { transfers.value = transfers.value.filter(x => x.id !== tr.id) }, 8000)
   }
   reload()
 }
 
-async function download(e: Entry) {
-  try {
-    const q = '/files/download?share=' + encodeURIComponent(share.value) +
-      '&path=' + encodeURIComponent(fullPath(e.name))
-    const { blob, name } = await downloadBlob(q, h())
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = name || e.name
-    a.click()
-    setTimeout(() => URL.revokeObjectURL(a.href), 4000)
-  } catch (err: any) { error.value = err.message || '下载失败' }
+function download(e: Entry) {
+  // 交给浏览器原生下载：流式写盘，不把整个文件读进内存。
+  // 下载接口额外接受 ?ft= 令牌，因为 <a download> 无法附加请求头。
+  const q = '/api/files/download?share=' + encodeURIComponent(share.value) +
+    '&path=' + encodeURIComponent(fullPath(e.name)) +
+    '&ft=' + encodeURIComponent(token.value)
+  const a = document.createElement('a')
+  a.href = q
+  a.download = e.name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
 }
 
 async function newFolder() {

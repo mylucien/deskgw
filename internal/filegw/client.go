@@ -1,14 +1,25 @@
 package filegw
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	smb2 "github.com/hirochachacha/go-smb2"
 )
+
+// maxConns 限制同时存在的 SMB 连接数。每次文件操作都会新建连接，
+// 大文件分片上传会瞬时打满，必须设上限保护路由器与目标主机。
+const maxConns = 24
+
+var connSlots = make(chan struct{}, maxConns)
+
+// ErrTooManyConns 表示并发 SMB 连接已达上限。
+var ErrTooManyConns = errors.New("文件连接数已达上限，请稍后重试")
 
 // Entry 是文件列表中的一项。
 type Entry struct {
@@ -24,19 +35,35 @@ type Conn struct {
 	tcp     net.Conn
 	session *smb2.Session
 	share   *smb2.Share
+	once    sync.Once
+	release func()
 }
 
 // Connect 用给定凭据连接目标主机的共享。address 来自数据库，前端无法指定。
 func Connect(address string, port int, share string, creds Credentials) (*Conn, error) {
+	select {
+	case connSlots <- struct{}{}:
+	default:
+		return nil, ErrTooManyConns
+	}
+	release := true
+	defer func() {
+		if release {
+			<-connSlots
+		}
+	}()
+
 	target := net.JoinHostPort(address, strconv.Itoa(port))
 	tcp, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("连接 SMB 服务失败: %w", err)
 	}
+	// Dial 与 Mount 都可能因对端不响应而无限挂起，统一用总超时兜底。
+	_ = tcp.SetDeadline(time.Now().Add(20 * time.Second))
 	d := &smb2.Dialer{
 		Initiator: &smb2.NTLMInitiator{
 			User:     creds.Username,
-			Password: creds.Password,
+			Password: string(creds.Password),
 			Domain:   creds.Domain,
 		},
 	}
@@ -51,23 +78,35 @@ func Connect(address string, port int, share string, creds Credentials) (*Conn, 
 		tcp.Close()
 		return nil, fmt.Errorf("挂载共享失败: %w", err)
 	}
-	return &Conn{tcp: tcp, session: sess, share: sh}, nil
+	_ = tcp.SetDeadline(time.Time{})
+	release = false
+	return &Conn{
+		tcp: tcp, session: sess, share: sh,
+		release: func() { <-connSlots },
+	}, nil
 }
 
-// Close 释放共享、会话与 TCP 连接。
+// Close 释放共享、会话与 TCP 连接，并归还并发名额。
 func (c *Conn) Close() {
 	if c == nil {
 		return
 	}
-	if c.share != nil {
-		_ = c.share.Umount()
-	}
-	if c.session != nil {
-		_ = c.session.Logoff()
-	}
-	if c.tcp != nil {
-		_ = c.tcp.Close()
-	}
+	c.once.Do(func() {
+		// 关闭阶段同样不能无限等待：对端失联时 Umount 可能一直阻塞。
+		_ = c.tcp.SetDeadline(time.Now().Add(3 * time.Second))
+		if c.share != nil {
+			_ = c.share.Umount()
+		}
+		if c.session != nil {
+			_ = c.session.Logoff()
+		}
+		if c.tcp != nil {
+			_ = c.tcp.Close()
+		}
+		if c.release != nil {
+			c.release()
+		}
+	})
 }
 
 // List 返回目录下的条目。

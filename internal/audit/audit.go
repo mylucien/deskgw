@@ -18,10 +18,30 @@ type Event struct {
 	ClientIP string `json:"client_ip"`
 }
 
+// 字段长度上限。登录失败事件的目标字段是攻击者可控的用户名，
+// 不设上限会让未登录用户用超长用户名持续写库，耗尽闪存。
+const (
+	maxTarget = 256
+	maxDetail = 1024
+)
+
+// clip 截断到 max 字节，并回退到 UTF-8 字符边界。
+func clip(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && s[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return s[:cut]
+}
+
 // Write 写入一条事件。
 func Write(db *sql.DB, userID any, action, target, detail, clientIP string) error {
 	_, err := db.Exec(`INSERT INTO audit_logs (ts, user_id, action, target, detail, client_ip)
-		VALUES (?, ?, ?, ?, ?, ?)`, time.Now().Unix(), userID, action, target, detail, clientIP)
+		VALUES (?, ?, ?, ?, ?, ?)`, time.Now().Unix(), userID, action,
+		clip(target, maxTarget), clip(detail, maxDetail), clientIP)
 	return err
 }
 

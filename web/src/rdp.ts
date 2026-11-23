@@ -1,4 +1,5 @@
 // RDP WASM 会话封装：Windows 凭据仅存在于浏览器内，网关不可见。
+// 由 wasm-pack 从官方 IronRDP 源码构建，产物在 src/wasm/pkg（CI 生成）。
 import init, {
   SessionBuilder,
   DesktopSize,
@@ -6,8 +7,8 @@ import init, {
   DeviceEvent,
   InputTransaction,
   RotationUnit,
-} from 'ironrdp-wasm'
-import type { Session, SessionTerminationInfo } from 'ironrdp-wasm'
+} from './wasm/pkg/ironrdp_web.js'
+import type { Session, SessionTerminationInfo } from './wasm/pkg/ironrdp_web.js'
 
 let wasmReady: Promise<unknown> | null = null
 
@@ -24,6 +25,10 @@ export interface Credentials {
 
 export interface RdpOptions {
   wsUrl: string
+  /** 目标主机 IP（仅用于 TLS SNI 与证书名称，连接目标由网关按票据决定）。 */
+  destination: string
+  /** TOFU 指纹的存储键，通常用主机 ID。 */
+  fingerprintKey: string
   canvas: HTMLCanvasElement
   credentials: Credentials
   width: number
@@ -118,13 +123,24 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   builder.password(opts.credentials.password)
   if (opts.credentials.domain) builder.serverDomain(opts.credentials.domain)
   // destination 由网关强制替换为数据库中的主机地址，这里仅作协议占位。
-  builder.destination('deskgw.invalid:3389')
+  builder.destination(opts.destination)
   builder.proxyAddress(opts.wsUrl)
+  // 首次连接不传指纹（TOFU）；之后传入已记录的指纹，变化即阻断，
+  // 避免把 NLA 凭据交给被替换的主机。
+  const fpKey = 'deskgw.cert.' + opts.fingerprintKey
+  let expectedFp = ''
+  try { expectedFp = localStorage.getItem(fpKey) || '' } catch { /* 隐私模式 */ }
+  if (expectedFp) builder.expectedFingerprint(expectedFp)
   builder.desktopSize(new DesktopSize(opts.width, opts.height))
   builder.renderCanvas(opts.canvas)
   builder.extension(new Extension('enable_credssp', true))
 
   const session: Session = await builder.connect()
+  // 记录本次实际证书指纹，供下次连接比对。
+  try {
+    const fp = session.certificateFingerprint()
+    if (fp && fp !== expectedFp) localStorage.setItem(fpKey, fp)
+  } catch { /* 旧版本没有该方法时忽略 */ }
   log('info', 'NLA 认证通过，远程会话已建立')
 
   let stopped = false
@@ -192,6 +208,8 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     if (code !== null) { send((t) => t.addEvent(DeviceEvent.keyReleased(code))); e.preventDefault() }
   }
   const onContextMenu = (e: Event) => e.preventDefault()
+  // 焦点离开画布时释放所有按键，否则 Alt+Tab 切走时的修饰键会卡在远端。
+  const onBlur = () => { try { session.releaseAllInputs() } catch { /* ignore */ } }
 
   canvas.addEventListener('mousemove', onMouseMove)
   canvas.addEventListener('mousedown', onMouseDown)
@@ -200,6 +218,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   canvas.addEventListener('keydown', onKeyDown)
   canvas.addEventListener('keyup', onKeyUp)
   canvas.addEventListener('contextmenu', onContextMenu)
+  canvas.addEventListener('blur', onBlur)
 
   const detach = () => {
     canvas.removeEventListener('mousemove', onMouseMove)
@@ -209,6 +228,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     canvas.removeEventListener('keydown', onKeyDown)
     canvas.removeEventListener('keyup', onKeyUp)
     canvas.removeEventListener('contextmenu', onContextMenu)
+    canvas.removeEventListener('blur', onBlur)
   }
   terminated.finally(detach)
 

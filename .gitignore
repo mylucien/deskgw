@@ -12,6 +12,8 @@ node_modules/
 web/node_modules/
 web/dist/*
 !web/dist/index.html
+# WASM 客户端产物由 CI 用 wasm-pack 生成
+web/src/wasm/pkg/
 __pycache__/
 *.pyc
 .DS_Store

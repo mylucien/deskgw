@@ -64,6 +64,9 @@ define Package/deskgw/install
 	$(INSTALL_DIR) $(1)/usr/libexec/deskgw
 	$(INSTALL_BIN) ./files/usr/libexec/deskgw/cert-fingerprint.sh $(1)/usr/libexec/deskgw/
 
+	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/deskgw $(1)/lib/upgrade/keep.d/deskgw
+
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./files/usr/share/luci/menu.d/luci-app-deskgw.json $(1)/usr/share/luci/menu.d/
 	$(INSTALL_DATA) ./files/usr/share/rpcd/acl.d/luci-app-deskgw.json $(1)/usr/share/rpcd/acl.d/
@@ -71,6 +74,18 @@ define Package/deskgw/install
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/deskgw
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/deskgw/overview.js \
 		$(1)/www/luci-static/resources/view/deskgw/overview.js
+endef
+
+define Package/deskgw/postinst
+#!/bin/sh
+# uci-defaults 默认只在首次启动时由 /etc/init.d/boot 执行；
+# 安装完立即运行一次，保证「装完即自启」与 README 一致。
+[ -n "$${IPKG_INSTROOT}" ] || {
+	/etc/uci-defaults/95-deskgw || true
+	/etc/init.d/deskgw enable
+	/etc/init.d/deskgw restart
+}
+exit 0
 endef
 
 $(eval $(call BuildPackage,deskgw))

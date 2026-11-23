@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -29,6 +30,10 @@ import (
 const sessionCookie = "deskgw_session"
 const csrfCookie = "deskgw_csrf"
 
+// dummyHash 是格式合法的 argon2id 串（原始哈希全零），仅用于用户名不存在时
+// 消耗与真实校验相同的 CPU 时间，消除可枚举用户的时序差异。
+const dummyHash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 // serverVersion 与 openwrt/Makefile 的 PKG_VERSION 保持一致，CI 会校验两者相同。
 const serverVersion = "0.3.0"
 
@@ -40,6 +45,7 @@ type Server struct {
 	tickets    *tunnel.TicketManager
 	gateway    *tunnel.Gateway
 	fileTokens *filegw.TokenManager
+	uploads    *filegw.UploadManager
 	started    time.Time
 }
 
@@ -59,10 +65,15 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 	}
 	s.tickets = tunnel.NewTicketManager(30 * time.Second)
 	s.fileTokens = filegw.NewTokenManager(30 * time.Minute)
+	s.uploads = filegw.NewUploadManager(5 * time.Minute)
 	s.gateway = tunnel.NewGateway(db, s.tickets,
 		func(uid any, action, target, detail, ip string) {
 			writeAudit(s, uid, action, target, detail, ip)
-		}, s.fileTokens.RevokeSession)
+		}, func(sessionID int64) {
+			// 会话结束时同时撤销文件令牌与未完成的上传连接。
+			s.fileTokens.RevokeSession(sessionID)
+			s.uploads.RevokeSession(sessionID)
+		})
 	// 收尾上一个进程遗留的会话，并周期清理未建立连接或已失联的僵尸记录。
 	s.startSessionSweeper()
 	r := chi.NewRouter()
@@ -101,6 +112,10 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 			r.Post("/token", s.createFileToken)
 			r.Get("/list", s.listFiles)
 			r.Post("/upload", s.uploadFile)
+			r.Post("/upload/begin", s.beginUpload)
+			r.Post("/upload/chunk", s.uploadChunk)
+			r.Post("/upload/finish", s.finishUpload)
+			r.Post("/upload/abort", s.abortUpload)
 			r.Get("/download", s.downloadFile)
 			r.Post("/mkdir", func(w http.ResponseWriter, q *http.Request) { s.fileMutation(w, q, "mkdir") })
 			r.Post("/rename", func(w http.ResponseWriter, q *http.Request) { s.fileMutation(w, q, "rename") })
@@ -145,9 +160,11 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Content-Security-Policy",
-			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
-				"img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' wss: ws:; "+
-				"worker-src 'self'; frame-ancestors 'none'")
+			// wasm-unsafe-eval 是编译 WebAssembly 所需的最小授权（不允许 JS eval）；
+			// connect-src 只允许同源，WebSocket 与 REST 都走当前源。
+			"default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; "+
+				"img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; "+
+				"worker-src 'self' blob:; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -238,7 +255,14 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, hash, err := user.GetByUsername(s.db, in.Username)
-	if err != nil || !u.Enabled || !auth.VerifyPassword(hash, in.Password) {
+	// 用户不存在时也要执行一次同样代价的哈希校验，否则响应时间差可用来枚举用户名。
+	verified := false
+	if err == nil {
+		verified = auth.VerifyPassword(hash, in.Password)
+	} else {
+		auth.VerifyPassword(dummyHash, in.Password)
+	}
+	if err != nil || !u.Enabled || !verified {
 		s.auth.Fail(key)
 		writeAudit(s, nullableID(u.ID), "login_failed", in.Username, "", ip)
 		fail(w, http.StatusUnauthorized, "invalidCredentials", "用户名或密码错误")
@@ -320,6 +344,8 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 
 	// 并发上限的检查与建记录必须原子：否则两个同时到达的请求都能读到
 	// 同一个未达上限的计数，各自建一条会话，突破 max_sessions。
+	// 超过 90 秒仍未升级为 WebSocket 的 pending 记录视为废票（票据 30 秒过期），
+	// 不再占用名额，避免升级失败或客户端放弃后要等清理任务才释放。
 	tx, err := s.db.Begin()
 	if err != nil {
 		serverError(w, err)
@@ -327,8 +353,9 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 	var active int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM sessions WHERE user_id=? AND state IN ('pending','active')`,
-		sess.UserID).Scan(&active); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sessions
+		WHERE user_id=? AND (state='active' OR (state='pending' AND started_at > ?))`,
+		sess.UserID, time.Now().Unix()-90).Scan(&active); err != nil {
 		serverError(w, err)
 		return
 	}
@@ -468,6 +495,11 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// 角色、启用状态或密码变化后，旧登录态必须失效：
+	// 会话里缓存了角色，降权后旧 Cookie 仍能访问管理接口。
+	if !in.Enabled || in.Role != target.Role || in.Password != "" {
+		s.auth.RevokeUser(id)
+	}
 	writeAudit(s, idFromContext(r), "user.update", in.Username, "", clientIP(r))
 	ok(w, map[string]any{})
 }
@@ -503,6 +535,8 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	s.auth.RevokeUser(id)
+	s.gateway.CloseUser(id)
 	writeAudit(s, idFromContext(r), "user.delete", strconv.FormatInt(id, 10), "", clientIP(r))
 	ok(w, map[string]any{})
 }
@@ -524,7 +558,7 @@ func (s *Server) createHost(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "badRequest", err.Error())
 		return
 	}
-	if err := host.Create(s.db, h); err != nil {
+	if err := host.Create(s.db, &h); err != nil {
 		fail(w, http.StatusBadRequest, "invalid", err.Error())
 		return
 	}
@@ -547,6 +581,8 @@ func (s *Server) updateHost(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// 主机的地址或端口变化后，指向旧目标的隧道不应继续存在。
+	s.gateway.CloseHost(id)
 	writeAudit(s, idFromContext(r), "host.update", h.Name, h.Address, clientIP(r))
 	ok(w, map[string]any{})
 }
@@ -725,6 +761,7 @@ func (s *Server) killSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if n, err := res.RowsAffected(); err == nil && n > 0 {
 		s.fileTokens.RevokeSession(id)
+		s.uploads.RevokeSession(id)
 	}
 	// 记录可能早已结束（僵尸），此时 CloseSession 不命中，但仍应尝试关闭潜在连接。
 	s.gateway.CloseSession(id)
@@ -834,8 +871,11 @@ func writeErr(w http.ResponseWriter, err error) {
 	fail(w, http.StatusBadRequest, "invalid", err.Error())
 }
 
+// serverError 记录详细错误到日志，但只向客户端返回通用文案，
+// 避免 SQL、路径、内部地址等信息随 500 响应泄漏。
 func serverError(w http.ResponseWriter, err error) {
-	fail(w, http.StatusInternalServerError, "serverError", err.Error())
+	log.Printf("内部错误: %v", err)
+	fail(w, http.StatusInternalServerError, "serverError", "服务器内部错误")
 }
 
 func fail(w http.ResponseWriter, status int, code, msg string) {

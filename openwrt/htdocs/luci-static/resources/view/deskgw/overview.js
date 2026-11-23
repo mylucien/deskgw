@@ -72,7 +72,11 @@ return view.extend({
 		o = s.option(form.Button, '_open', _('打开管理界面'));
 		o.inputstyle = 'action';
 		o.onclick = function() {
-			var port = (document.querySelector('input[data-name="listen"]') || {}).value || '0.0.0.0:8443';
+			// LuCI 渲染出的输入框 id 形如 cbid.deskgw.main.listen，没有 data-name；
+			// 用 id 后缀匹配，取不到时回落到默认端口。
+			var el = document.querySelector('input[id$=".listen"]') ||
+				document.querySelector('input[data-name="listen"]');
+			var port = (el && el.value) || '0.0.0.0:8443';
 			var p = port.split(':').pop() || '8443';
 			window.open('https://' + window.location.hostname + ':' + p + '/', '_blank');
 		};

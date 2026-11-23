@@ -10,21 +10,33 @@ import (
 )
 
 // Credentials 是一次文件会话使用的 Windows 凭据，仅驻留内存。
+// 密码用字节切片保存，Wipe 时可以就地清零，避免留下不可回收的明文副本。
 type Credentials struct {
 	Username string
-	Password string
+	Password []byte
 	Domain   string
 }
 
-// Wipe 清除内存中的凭据引用。Go 的 string 不可变，逐字节覆写只会不断复制，
-// 并不能保证擦除底层内存；真正的防护是凭据只驻留内存、不落盘、不写日志。
+// Wipe 就地清零密码字节，并清空用户名与域。
 func (c *Credentials) Wipe() {
 	if c == nil {
 		return
 	}
-	c.Password = ""
+	for i := range c.Password {
+		c.Password[i] = 0
+	}
+	c.Password = nil
 	c.Username = ""
 	c.Domain = ""
+}
+
+// Clone 返回凭据副本；密码单独复制一份，避免调用方修改影响令牌内的原件。
+func (c Credentials) Clone() Credentials {
+	out := Credentials{Username: c.Username, Domain: c.Domain}
+	if c.Password != nil {
+		out.Password = append([]byte(nil), c.Password...)
+	}
+	return out
 }
 
 // fileToken 保存一条文件会话的状态。
@@ -86,7 +98,7 @@ func (m *TokenManager) Issue(userID, hostID, sessionID int64, ip string, creds C
 	defer m.mu.Unlock()
 	m.tokens[secret] = &fileToken{
 		secret: secret, userID: userID, hostID: hostID, sessionID: sessionID,
-		clientIP: ip, creds: creds, expires: time.Now().Add(m.ttl),
+		clientIP: ip, creds: creds.Clone(), expires: time.Now().Add(m.ttl),
 	}
 	return secret, nil
 }
@@ -105,7 +117,7 @@ func (m *TokenManager) Resolve(secret, ip string) (userID, hostID, sessionID int
 		return 0, 0, 0, Credentials{}, ErrInvalidToken
 	}
 	t.expires = time.Now().Add(m.ttl)
-	return t.userID, t.hostID, t.sessionID, t.creds, nil
+	return t.userID, t.hostID, t.sessionID, t.creds.Clone(), nil
 }
 
 // Revoke 撤销令牌并清除明文凭据。

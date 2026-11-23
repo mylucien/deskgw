@@ -95,10 +95,19 @@ func run(cfg config.Config) error {
 			redir := &http.Server{
 				Addr: cfg.RedirectListen,
 				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					// 保留请求 Host；HTTP 跳转监听 80 时浏览器不会带端口，
+					// 必须补上 HTTPS 的实际端口（默认 8443），否则会跳到 443。
 					host := r.Host
-					if h, _, err := net.SplitHostPort(host); err == nil {
+					if h, p, err := net.SplitHostPort(host); err == nil {
+						host = h
+						if p != "" && p != "443" {
+							host = net.JoinHostPort(h, p)
+						}
+					} else {
 						_, port, _ := net.SplitHostPort(cfg.Listen)
-						host = net.JoinHostPort(h, port)
+						if port != "" && port != "443" {
+							host = net.JoinHostPort(host, port)
+						}
 					}
 					http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
 				}),

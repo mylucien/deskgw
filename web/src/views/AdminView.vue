@@ -43,7 +43,7 @@
     <section v-else-if="tab === 'hosts'" class="panel">
       <div class="panel-head"><h3>主机管理</h3><button class="primary" @click="newHost">新增主机</button></div>
       <form v-if="hostForm" class="form-grid card" @submit.prevent="saveHost">
-        <label>主机 ID（1–4294967295）<input v-model.number="hostForm.id" type="number" required /></label>
+        <label>主机 ID（留空自动分配）<input v-model.number="hostForm.id" type="number" min="1" max="4294967295" :disabled="hostEditing" /></label>
         <label>名称<input v-model="hostForm.name" required /></label>
         <label>私网 IP<input v-model="hostForm.address" required placeholder="192.168.1.10" /></label>
         <label>RDP 端口<input v-model.number="hostForm.rdp_port" type="number" /></label>
@@ -143,6 +143,9 @@ const status = ref('')
 const settings = reactive({ session_idle_min: 30, max_upload_mb: 2048 })
 const userForm = ref<any>(null)
 const hostForm = ref<any>(null)
+// 新增与编辑分开判断：不能再用 id 是否存在来判断，
+// 否则填入 ID 的新增请求会被当成 PUT 打到不存在的记录上。
+const hostEditing = ref(false)
 
 const SESSION_STATES: Record<string, string> = {
   pending: '等待连接', active: '进行中', closed: '已结束', killed: '已强制下线',
@@ -161,8 +164,8 @@ function resetHost() {
 }
 function newUser() { userForm.value = resetUser() }
 function editUser(u: any) { userForm.value = { ...resetUser(), ...u, password: '' } }
-function newHost() { hostForm.value = resetHost() }
-function editHost(h: any) { hostForm.value = { ...resetHost(), ...h } }
+function newHost() { hostEditing.value = false; hostForm.value = resetHost() }
+function editHost(h: any) { hostEditing.value = true; hostForm.value = { ...resetHost(), ...h } }
 
 async function load() {
   try {
@@ -196,9 +199,14 @@ async function removeUser(u: any) {
 }
 async function saveHost() {
   try {
-    const f = hostForm.value
-    if (f.id) await put(`/admin/hosts/${f.id}`, f)
-    else await post('/admin/hosts', f)
+    const f = { ...hostForm.value }
+    if (hostEditing.value) {
+      await put(`/admin/hosts/${f.id}`, f)
+    } else {
+      // 新增时由服务端分配 ID；显式传 0 表示自动分配。
+      f.id = Number(f.id) || 0
+      await post('/admin/hosts', f)
+    }
     hostForm.value = null; error.value = ''; await load()
   } catch (e: any) { error.value = e.message }
 }

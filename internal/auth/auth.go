@@ -19,8 +19,10 @@ const (
 	argonMemory  = 19 * 1024 // KiB，约 19MB，适配路由器
 	argonThreads = 1
 	argonKeyLen  = 32
-	saltLen      = 16
-	tokenLen     = 32
+	// argonParallel 是并发 argon2 计算的上限，见 argonSlots。
+	argonParallel = 2
+	saltLen       = 16
+	tokenLen      = 32
 
 	maxFailures  = 5
 	lockDuration = 10 * time.Minute
@@ -30,8 +32,21 @@ const (
 	maxFailureKeys = 4096
 )
 
+// argonSlots 限制同时进行的 argon2 计算数量。每次校验要占约 19MB 内存，
+// 路由器可用内存有限：不设上限时，几十个并发登录请求就能把进程打到 OOM。
+// 排队比 OOM 好——请求方只是变慢，服务不会整体崩掉。
+var argonSlots = make(chan struct{}, argonParallel)
+
+// acquire 占用一个 argon2 计算名额，返回释放函数。
+func acquire() func() {
+	argonSlots <- struct{}{}
+	return func() { <-argonSlots }
+}
+
 // HashPassword 生成 argon2id 编码串：$argon2id$v=19$m=...,t=...,p=1$<salt>$<hash>
 func HashPassword(password string) (string, error) {
+	defer acquire()()
+
 	salt := make([]byte, saltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
@@ -49,6 +64,7 @@ func VerifyPassword(encoded, password string) bool {
 	if len(parts) != 6 || parts[1] != "argon2id" || parts[2] != "v=19" {
 		return false
 	}
+	defer acquire()()
 	var m, t uint32
 	var p uint8
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &m, &t, &p); err != nil {
@@ -101,14 +117,25 @@ func NewManager(idleMinutes int) *Manager {
 	return m
 }
 
-// janitor 定期清理已解锁的失败计数，避免长期运行后表持续增长。
+// janitor 定期清理已解锁的失败计数和已过期的登录会话。
+// 只依赖 Get() 的惰性删除不够：从不再次访问的会话会一直留在内存里。
 func (m *Manager) janitor() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
 		m.mu.Lock()
 		m.pruneFailuresLocked()
+		m.pruneSessionsLocked()
 		m.mu.Unlock()
+	}
+}
+
+func (m *Manager) pruneSessionsLocked() {
+	now := time.Now()
+	for tok, s := range m.sessions {
+		if now.Sub(s.LastSeen) > m.idle {
+			delete(m.sessions, tok)
+		}
 	}
 }
 
@@ -191,6 +218,21 @@ func (m *Manager) Delete(token string) {
 	m.mu.Lock()
 	delete(m.sessions, token)
 	m.mu.Unlock()
+}
+
+// RevokeUser 注销某个用户的全部登录会话，返回注销数量。
+// 用户被停用、删除或降权时调用，避免旧会话继续以缓存角色访问接口。
+func (m *Manager) RevokeUser(userID int64) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for tok, s := range m.sessions {
+		if s.UserID == userID {
+			delete(m.sessions, tok)
+			n++
+		}
+	}
+	return n
 }
 
 // Locked 判断某个键（IP+用户名）是否处于锁定状态。

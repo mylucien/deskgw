@@ -79,6 +79,8 @@ jobs:
           go-version: stable
       - name: Go 静态检查
         run: go vet ./...
+      - name: Go 单元测试
+        run: go test ./...
       - name: gofmt
         run: |
           set -e
@@ -120,11 +122,45 @@ jobs:
       - name: Python 语法
         run: python3 -m py_compile scripts/rdp-tunnel-test.py
 
-  ui:
-    name: 构建前端
+  wasm:
+    name: 构建 WASM（IronRDP 0.17.0）
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wasm
+      - name: 安装 wasm-pack
+        run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+      - name: 从 vendored 官方源码构建
+        working-directory: wasm
+        run: |
+          wasm-pack build ironrdp-web --release --target web \
+            --out-dir ../../web/src/wasm/pkg --out-name ironrdp_web
+      - name: 校验产物
+        run: |
+          set -e
+          ls -l web/src/wasm/pkg
+          [ -f web/src/wasm/pkg/ironrdp_web_bg.wasm ] || { echo "::error::缺少 wasm 产物"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg
+          path: web/src/wasm/pkg
+          if-no-files-found: error
+
+  ui:
+    name: 构建前端
+    needs: [ wasm ]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg
+          path: web/src/wasm/pkg
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -356,7 +392,7 @@ jobs:
             dist/deskgw-*.sha256
           body: |
             版本：${{ needs.prepare.outputs.version }} @ ${{ needs.prepare.outputs.short }}
-            范围：M4（M1 管理面 + M2 RDP 隧道与浏览器 NLA + M3 多标签会话与审计 + M4 SMB 文件网关）
+            范围：M4 + WASM 重构（IronRDP 0.17.0 官方源码构建，浏览器直连 TLS，网关只转发字节）
 
             | 文件 | 用途 |
             |---|---|

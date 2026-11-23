@@ -1,4 +1,4 @@
-// Package tunnel 实现 RDP 连接票据、RDCleanPath 网关与 WS↔TLS 字节转发。
+// Package tunnel 实现 RDP 连接票据与 WS↔TCP 字节转发。
 package tunnel
 
 import (
