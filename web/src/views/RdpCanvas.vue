@@ -13,7 +13,7 @@
     </div>
     <div class="rc-main">
       <div class="rc-stage" ref="wrap">
-        <canvas ref="canvas" :width="vpWidth" :height="vpHeight" tabindex="0"></canvas>
+        <canvas ref="canvas" :width="vpWidth" :height="vpHeight"></canvas>
         <div v-if="!connected" class="overlay">
           <div class="overlay-card">
             <h3>{{ statusText }}</h3>
@@ -24,7 +24,7 @@
           </div>
         </div>
       </div>
-      <FilePanel v-if="showFiles && canFile" :session-id="tab.sessionId" :creds="tab.creds" @close="showFiles = false" />
+      <FilePanel v-if="showFiles && canFile" :session-id="tab.sessionId" :creds="tab.creds" @close="closeFiles" />
     </div>
   </div>
 </template>
@@ -69,10 +69,11 @@ function fitViewport() {
   if (session && resolution.value === '0') session.resize(w, h)
 }
 function applyResolution() {
-  if (resolution.value === '0') { fitViewport(); return }
+  if (resolution.value === '0') { fitViewport(); session?.focus(); return }
   const [w, h] = resolution.value.split('x').map(Number)
   vpWidth.value = w; vpHeight.value = h
   session?.resize(w, h)
+  session?.focus()
 }
 function toggleFullscreen() {
   const el = wrap.value
@@ -80,7 +81,10 @@ function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen()
   else el.requestFullscreen?.()
 }
-function sendCtrlAltDel() { session?.sendCtrlAltDel() }
+// 全屏切换后键盘焦点会回到文档，需要重新交给远程桌面。
+function onFullscreenChange() { session?.focus() }
+function sendCtrlAltDel() { session?.sendCtrlAltDel(); session?.focus() }
+function closeFiles() { showFiles.value = false; session?.focus() }
 function close() {
   session?.shutdown()
   session = null
@@ -90,11 +94,12 @@ function close() {
 }
 
 watch(() => props.active, async (v) => {
-  if (v) { await nextTick(); fitViewport() }
+  if (v) { await nextTick(); fitViewport(); session?.focus() }
 })
 
 onMounted(async () => {
   window.addEventListener('resize', fitViewport)
+  document.addEventListener('fullscreenchange', onFullscreenChange)
   await nextTick()
   fitViewport()
   const creds = props.tab.creds
@@ -114,12 +119,13 @@ onMounted(async () => {
       credentials: { username: creds.username, password: creds.password, domain: creds.domain },
       width: vpWidth.value,
       height: vpHeight.value,
+      allowClipboard: state.user?.allow_clipboard !== false,
       onLog: addLog,
     })
     connected.value = true
     props.tab.status = 'connected'
     detail.value = '远程会话已建立'
-    canvas.value?.focus()
+    session.focus()
     session.terminated.then((reason) => {
       connected.value = false
       if (props.tab.status !== 'disconnected') {
@@ -137,6 +143,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', fitViewport)
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
   session?.shutdown()
   session = null
   wipeCreds(props.tab.creds)

@@ -2,6 +2,7 @@
 // 由 wasm-pack 从官方 IronRDP 源码构建，产物在 src/wasm/pkg（CI 生成）。
 import init, {
   SessionBuilder,
+  ClipboardData,
   DesktopSize,
   Extension,
   DeviceEvent,
@@ -33,6 +34,8 @@ export interface RdpOptions {
   credentials: Credentials
   width: number
   height: number
+  /** 是否启用剪贴板同步，跟随用户权限 allow_clipboard。 */
+  allowClipboard?: boolean
   onLog?: (level: string, message: string) => void
 }
 
@@ -40,6 +43,8 @@ export interface RdpSession {
   shutdown: () => void
   resize: (width: number, height: number) => void
   sendCtrlAltDel: () => void
+  /** 把键盘焦点交还远程桌面（点击工具栏后需要重新聚焦）。 */
+  focus: () => void
   terminated: Promise<string>
 }
 
@@ -118,6 +123,9 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   const log = opts.onLog || (() => {})
   log('info', '正在初始化 RDP 协议栈')
 
+  // 剪贴板回调在 connect 时才被读取，先声明会话占位供回调引用。
+  let session: Session | null = null
+
   const builder = new SessionBuilder()
   builder.username(opts.credentials.username)
   builder.password(opts.credentials.password)
@@ -135,10 +143,56 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   builder.renderCanvas(opts.canvas)
   builder.extension(new Extension('enable_credssp', true))
 
-  const session: Session = await builder.connect()
+  const writeClipboard = async (text: string) => {
+    try { await navigator.clipboard.writeText(text) }
+    catch (e: any) { log('warn', '写入本地剪贴板失败：' + (e?.message || e)) }
+  }
+
+  // 把浏览器剪贴板的当前内容交给远端。readText 只在用户手势内可用，
+  // 所以由按下粘贴键时触发，而不是轮询。
+  const pushLocalClipboard = async (trigger: string, quiet = false) => {
+    const s = session
+    if (!s) return
+    let text = ''
+    try { text = await navigator.clipboard.readText() }
+    catch (e: any) {
+      // 远端按下粘贴时浏览器没有用户手势，读取被拒是常态，不打扰用户；
+      // 本地按 Ctrl+V 时才是真的权限问题，需要提示。
+      if (!quiet) log('warn', '读取本地剪贴板失败（' + trigger + '）：' + (e?.message || e))
+      return
+    }
+    if (!text) return
+    try {
+      const data = new ClipboardData()
+      data.addText('text/plain', text)
+      await s.onClipboardPaste(data)
+    } catch (e: any) {
+      log('warn', '同步剪贴板到远端失败：' + (e?.message || e))
+    }
+  }
+
+  if (opts.allowClipboard !== false) {
+    // 远端复制后把内容写进浏览器剪贴板。
+    builder.remoteClipboardChangedCallback((data: ClipboardData) => {
+      try {
+        const item = data.items().find((i) => i.mimeType() === 'text/plain')
+        const value = item?.value()
+        if (typeof value === 'string' && value) void writeClipboard(value)
+      } catch (e: any) {
+        log('warn', '处理远端剪贴板失败：' + (e?.message || e))
+      }
+    })
+    // 远端按下粘贴时会要求本地内容；拿不到就保持远端原有内容。
+    builder.forceClipboardUpdateCallback(() => {
+      void pushLocalClipboard('远端请求', true)
+    })
+  }
+
+  session = await builder.connect()
+  const active: Session = session
   // 记录本次实际证书指纹，供下次连接比对。
   try {
-    const fp = session.certificateFingerprint()
+    const fp = active.certificateFingerprint()
     if (fp && fp !== expectedFp) localStorage.setItem(fpKey, fp)
   } catch { /* 旧版本没有该方法时忽略 */ }
   log('info', 'NLA 认证通过，远程会话已建立')
@@ -147,7 +201,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   let finish!: (reason: string) => void
   const terminated = new Promise<string>((resolve) => { finish = resolve })
 
-  const runPromise: Promise<SessionTerminationInfo> = session.run()
+  const runPromise: Promise<SessionTerminationInfo> = active.run()
   runPromise.then((info) => {
     if (!stopped) finish(info.reason() || 'remote-closed')
   }).catch((e: any) => {
@@ -158,11 +212,43 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     if (stopped) return
     const t = new InputTransaction()
     fn(t)
-    try { session.applyInputs(t) } catch { /* 会话可能已结束 */ }
+    try { active.applyInputs(t) } catch { /* 会话可能已结束 */ }
+  }
+
+  // 输入法提交的文本走 Unicode 通道：扫描码只能表达物理按键，
+  // 拼音、日文、手写都不在键位表里。
+  const sendText = (text: string) => {
+    const chars = Array.from(text)
+    if (!chars.length) return
+    send((t) => {
+      for (const ch of chars) {
+        t.addEvent(DeviceEvent.unicodePressed(ch))
+        t.addEvent(DeviceEvent.unicodeReleased(ch))
+      }
+    })
   }
 
   const canvas = opts.canvas
-  canvas.tabIndex = 0
+  // 浏览器只在可编辑元素上启动输入法，canvas 永远收不到 composition 事件。
+  // 叠一个 1×1 的透明 textarea 承担键盘与输入法：鼠标仍落在 canvas 上，
+  // 点击画布时把焦点交给它。pointer-events:none 让它不拦截鼠标，
+  // 但 focus() 不受该属性影响。
+  const parent = canvas.parentElement
+  if (parent && getComputedStyle(parent).position === 'static') parent.style.position = 'relative'
+  const sink = document.createElement('textarea')
+  sink.setAttribute('aria-hidden', 'true')
+  sink.setAttribute('autocomplete', 'off')
+  sink.setAttribute('autocapitalize', 'off')
+  sink.setAttribute('autocorrect', 'off')
+  sink.spellcheck = false
+  sink.tabIndex = -1
+  sink.style.cssText = 'position:absolute;left:0;top:0;width:1px;height:1px;padding:0;border:0;' +
+    'margin:0;opacity:0;pointer-events:none;resize:none;overflow:hidden;'
+  parent?.appendChild(sink)
+  // 焦点归 textarea，canvas 不再参与 Tab 序列。
+  canvas.tabIndex = -1
+  const focus = () => { try { sink.focus({ preventScroll: true }) } catch { /* ignore */ } }
+
   // 远端桌面尺寸随 resize 变化，鼠标映射必须用当前值而不是连接时的快照。
   const viewport = { width: opts.width, height: opts.height }
   const onMouseMove = (e: MouseEvent) => {
@@ -172,7 +258,17 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     const y = Math.max(0, Math.min(viewport.height - 1, Math.round((e.clientY - rect.top) * viewport.height / rect.height)))
     send((t) => t.addEvent(DeviceEvent.mouseMove(x, y)))
   }
-  const onMouseDown = (e: MouseEvent) => { send((t) => t.addEvent(DeviceEvent.mouseButtonPressed(e.button))) }
+  const onMouseDown = (e: MouseEvent) => {
+    // 阻止浏览器把焦点交给 canvas，否则键盘事件不会再进 textarea。
+    e.preventDefault()
+    // 输入法候选框出现在 caret 处，把 1×1 的 textarea 挪到点击位置，
+    // 候选框才会跟着用户的视线而不是钉在左上角。
+    const rect = canvas.getBoundingClientRect()
+    sink.style.left = Math.max(0, Math.min(rect.width - 1, e.clientX - rect.left)) + 'px'
+    sink.style.top = Math.max(0, Math.min(rect.height - 1, e.clientY - rect.top)) + 'px'
+    focus()
+    send((t) => t.addEvent(DeviceEvent.mouseButtonPressed(e.button)))
+  }
   const onMouseUp = (e: MouseEvent) => { send((t) => t.addEvent(DeviceEvent.mouseButtonReleased(e.button))) }
   const onWheel = (e: WheelEvent) => {
     e.preventDefault()
@@ -199,36 +295,82 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     if (amount === 0) return
     send((t) => t.addEvent(DeviceEvent.wheelRotations(vertical, amount, unit)))
   }
+  // 输入法组合期间的按键属于拼音编码，不能当扫描码发给远端，
+  // 否则“nihao”会先打出一串字母再补上“你好”。
+  let composing = false
+  const isIme = (e: KeyboardEvent) => composing || e.isComposing || e.keyCode === 229
+
+  // 本地粘贴：先把内容交给远端，再发 Ctrl+V。顺序反了远端会读到上一次的剪贴板。
+  const forwardPaste = async () => {
+    await pushLocalClipboard('用户粘贴')
+    send((t) => {
+      t.addEvent(DeviceEvent.keyPressed(0x1d))
+      t.addEvent(DeviceEvent.keyPressed(0x2f))
+      t.addEvent(DeviceEvent.keyReleased(0x2f))
+      t.addEvent(DeviceEvent.keyReleased(0x1d))
+    })
+    sink.value = ''
+  }
+
   const onKeyDown = (e: KeyboardEvent) => {
+    if (isIme(e)) return
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.code === 'KeyV') {
+      e.preventDefault()
+      void forwardPaste()
+      return
+    }
     const code = scancodeOf(e)
     if (code !== null) { send((t) => t.addEvent(DeviceEvent.keyPressed(code))); e.preventDefault() }
   }
   const onKeyUp = (e: KeyboardEvent) => {
+    if (isIme(e)) return
     const code = scancodeOf(e)
     if (code !== null) { send((t) => t.addEvent(DeviceEvent.keyReleased(code))); e.preventDefault() }
   }
+  const onCompositionStart = () => { composing = true }
+  const onCompositionEnd = (e: CompositionEvent) => {
+    composing = false
+    const text = e.data || ''
+    sink.value = ''
+    if (text) sendText(text)
+  }
+  // 兜底：个别输入法不派发 compositionend，只给 input。
+  const onInput = () => {
+    if (composing) return
+    const text = sink.value
+    if (!text) return
+    sink.value = ''
+    sendText(text)
+  }
   const onContextMenu = (e: Event) => e.preventDefault()
-  // 焦点离开画布时释放所有按键，否则 Alt+Tab 切走时的修饰键会卡在远端。
-  const onBlur = () => { try { session.releaseAllInputs() } catch { /* ignore */ } }
+  // 焦点离开时释放所有按键，否则 Alt+Tab 切走时的修饰键会卡在远端。
+  const onBlur = () => { try { active.releaseAllInputs() } catch { /* ignore */ } }
 
   canvas.addEventListener('mousemove', onMouseMove)
   canvas.addEventListener('mousedown', onMouseDown)
   canvas.addEventListener('mouseup', onMouseUp)
   canvas.addEventListener('wheel', onWheel, { passive: false })
-  canvas.addEventListener('keydown', onKeyDown)
-  canvas.addEventListener('keyup', onKeyUp)
   canvas.addEventListener('contextmenu', onContextMenu)
-  canvas.addEventListener('blur', onBlur)
+  sink.addEventListener('keydown', onKeyDown)
+  sink.addEventListener('keyup', onKeyUp)
+  sink.addEventListener('compositionstart', onCompositionStart)
+  sink.addEventListener('compositionend', onCompositionEnd)
+  sink.addEventListener('input', onInput)
+  sink.addEventListener('blur', onBlur)
 
   const detach = () => {
     canvas.removeEventListener('mousemove', onMouseMove)
     canvas.removeEventListener('mousedown', onMouseDown)
     canvas.removeEventListener('mouseup', onMouseUp)
     canvas.removeEventListener('wheel', onWheel)
-    canvas.removeEventListener('keydown', onKeyDown)
-    canvas.removeEventListener('keyup', onKeyUp)
     canvas.removeEventListener('contextmenu', onContextMenu)
-    canvas.removeEventListener('blur', onBlur)
+    sink.removeEventListener('keydown', onKeyDown)
+    sink.removeEventListener('keyup', onKeyUp)
+    sink.removeEventListener('compositionstart', onCompositionStart)
+    sink.removeEventListener('compositionend', onCompositionEnd)
+    sink.removeEventListener('input', onInput)
+    sink.removeEventListener('blur', onBlur)
+    sink.remove()
   }
   terminated.finally(detach)
 
@@ -236,14 +378,15 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     shutdown: () => {
       if (stopped) return
       stopped = true
-      try { session.shutdown() } catch { /* ignore */ }
+      try { active.shutdown() } catch { /* ignore */ }
       finish('user-closed')
     },
+    focus,
     resize: (w: number, h: number) => {
       if (w <= 0 || h <= 0) return
       viewport.width = w
       viewport.height = h
-      try { session.resize(w, h) } catch { /* ignore */ }
+      try { active.resize(w, h) } catch { /* ignore */ }
     },
     sendCtrlAltDel: () => {
       send((t) => {
