@@ -1,6 +1,11 @@
 <template>
   <div class="rdp-canvas">
     <div class="rc-tools">
+      <template v-if="touch">
+        <button :class="{ active: inputMode === 'pointer' }" @click="setMode('pointer')" :disabled="!session">指针</button>
+        <button :class="{ active: inputMode === 'touch' }" @click="setMode('touch')" :disabled="!session">触摸</button>
+        <button :class="{ active: keyboardOpen }" @click="toggleKeyboard" :disabled="!session">键盘</button>
+      </template>
       <button @click="sendCtrlAltDel" :disabled="!session">Ctrl+Alt+Del</button>
       <select v-model="resolution" @change="applyResolution" :disabled="!session" title="分辨率">
         <option value="0">自适应</option>
@@ -34,7 +39,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { connectRdp, describeError, pickDesktopSize, resolveWsUrl } from '../rdp'
-import type { RdpSession } from '../rdp'
+import type { InputMode, RdpSession } from '../rdp'
 import { closeTab, wipeCreds } from '../sessionTabs'
 import type { TabInfo } from '../sessionTabs'
 import { state } from '../state'
@@ -56,6 +61,31 @@ const showFiles = ref(false)
 const immersive = ref(false)
 let session: RdpSession | null = null
 
+// 触摸设备才显示指针/触摸切换与键盘按钮。触屏笔记本也满足条件。
+const touch = window.matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0
+const MODE_KEY = 'deskgw.inputMode'
+function readMode(): InputMode {
+  try {
+    const v = localStorage.getItem(MODE_KEY)
+    if (v === 'touch' || v === 'pointer') return v
+  } catch { /* 隐私模式 */ }
+  return 'pointer'
+}
+// 指针模式：手指当触控板，适合点小按钮和拖窗口边框。
+const inputMode = ref<InputMode>(readMode())
+const keyboardOpen = ref(false)
+function setMode(mode: InputMode) {
+  if (inputMode.value === mode) return
+  inputMode.value = mode
+  try { localStorage.setItem(MODE_KEY, mode) } catch { /* 隐私模式 */ }
+  session?.setInputMode(mode)
+}
+function toggleKeyboard() {
+  if (!session) return
+  if (keyboardOpen.value) session.hideKeyboard()
+  else session.showKeyboard()
+}
+
 const statusText = computed(() => ({
   connecting: '正在连接', connected: '已连接', disconnected: '已断开', error: '连接失败',
 }[props.tab.status]))
@@ -69,6 +99,8 @@ function fitViewport() {
   if (!el) return
   // 固定分辨率模式下不跟随容器。
   if (resolution.value !== '0') return
+  // 软键盘弹出会把可视高度压掉一半，此时按剩余空间算分辨率会让远端画面缩水。
+  if (keyboardOpen.value) return
   // 按物理像素取基准（DPR 封顶 2）；手机再压一道长边上限，避免 wasm 解码跟不上。
   const dpr = Math.min(window.devicePixelRatio || 1, 2)
   const coarse = window.matchMedia('(pointer: coarse)').matches
@@ -155,7 +187,13 @@ onMounted(async () => {
       width: vpWidth.value,
       height: vpHeight.value,
       allowClipboard: state.user?.allow_clipboard !== false,
+      inputMode: touch ? inputMode.value : undefined,
       onLog: addLog,
+      onKeyboard: (open) => {
+        keyboardOpen.value = open
+        // 键盘收起后可视高度恢复，再补算一次分辨率（弹出期间是跳过的）。
+        if (!open) scheduleFit()
+      },
     })
     connected.value = true
     props.tab.status = 'connected'
@@ -205,10 +243,11 @@ onBeforeUnmount(() => {
   display: flex; align-items: center; justify-content: center; }
 .rc-stage.immersive { position: fixed; inset: 0; z-index: 9999; background: #000; }
 canvas { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto;
-  outline: none; background: #000; touch-action: none; }
-.rc-exit { position: absolute; top: 10px; right: 10px; z-index: 2; background: rgba(38,42,51,.82);
+  outline: none; background: #000; touch-action: none; user-select: none;
+  -webkit-user-select: none; -webkit-touch-callout: none; }
+.rc-exit { position: absolute; top: 10px; right: 10px; z-index: 4; background: rgba(38,42,51,.82);
   color: #e5e7eb; border: 1px solid #3a3f4b; border-radius: 6px; padding: 6px 12px; font-size: 12px; }
-.overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(15,17,21,.85); }
+.overlay { position: absolute; inset: 0; z-index: 3; display: grid; place-items: center; background: rgba(15,17,21,.85); }
 .overlay-card { width: 420px; max-width: 90%; background: #1b1e24; color: #e5e7eb;
   border: 1px solid #343945; border-radius: 12px; padding: 22px; text-align: center; }
 .overlay-card h3 { margin: 0 0 8px; font-size: 17px; }
