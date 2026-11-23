@@ -53,6 +53,9 @@ iron-remote-desktop.path = "../iron-remote-desktop"
 # 需要 UnixTime::now()，所以这里显式把 rustls 的 std 打开（同一个 crate，特性合并）。
 futures-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+# wasm32-unknown-unknown 上 pki-types 不会用 std 提供 UnixTime::now()，
+# 必须开 web 特性（改走 JS 时钟），否则 rustls 的 Ticketer 编译不过。
+rustls-pki-types = { version = "1", features = ["web"] }
 # wasm32-unknown-unknown 上 ring 必须启用 JS 随机源，否则 SystemRandom
 # 不实现 SecureRandom，rustls 的签名路径直接编译失败。
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
