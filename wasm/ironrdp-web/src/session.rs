@@ -381,14 +381,13 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
             render_canvas = inner.render_canvas.clone().context("render_canvas missing")?;
 
-            set_cursor_style_callback = inner
-                .set_cursor_style_callback
-                .clone()
-                .context("set_cursor_style_callback missing")?;
+            // 光标样式只是装饰：前端没注册回调时按默认光标处理，
+            // 不能因为缺一个可选 UI 回调就让整条连接失败。
+            set_cursor_style_callback = inner.set_cursor_style_callback.clone();
             set_cursor_style_callback_context = inner
                 .set_cursor_style_callback_context
                 .clone()
-                .context("set_cursor_style_callback_context missing")?;
+                .unwrap_or(JsValue::UNDEFINED);
             remote_clipboard_changed_callback = inner.remote_clipboard_changed_callback.clone();
             force_clipboard_update_callback = inner.force_clipboard_update_callback.clone();
             files_available_callback = inner.files_available_callback.clone();
@@ -565,7 +564,7 @@ pub(crate) struct Session {
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
 
     render_canvas: HtmlCanvasElement,
-    set_cursor_style_callback: js_sys::Function,
+    set_cursor_style_callback: Option<js_sys::Function>,
     set_cursor_style_callback_context: JsValue,
 
     // Consumed when `run` is called
@@ -613,8 +612,12 @@ impl Session {
             JsValue::from_f64(hotspot_y.unwrap_or_default().into()),
         ]);
 
-        let _ret = self
-            .set_cursor_style_callback
+        let Some(callback) = self.set_cursor_style_callback.as_ref() else {
+            // 未注册回调时保持浏览器默认光标。
+            return Ok(());
+        };
+
+        let _ret = callback
             .apply(&self.set_cursor_style_callback_context, &args)
             .map_err(|e| anyhow::Error::msg(format!("set cursor style callback failed: {e:?}")))?;
 

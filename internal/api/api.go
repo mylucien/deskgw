@@ -35,7 +35,7 @@ const csrfCookie = "deskgw_csrf"
 const dummyHash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 // serverVersion 与 openwrt/Makefile 的 PKG_VERSION 保持一致，CI 会校验两者相同。
-const serverVersion = "0.3.2"
+const serverVersion = "0.3.3"
 
 // Server 保存 API 依赖。
 type Server struct {
@@ -159,6 +159,8 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
+		// 便于从浏览器或 curl 直接判断当前进程的版本，排查「升级了但没重启」。
+		h.Set("X-Deskgw-Version", serverVersion)
 		h.Set("Content-Security-Policy",
 			// wasm-unsafe-eval 是编译 WebAssembly 所需的最小授权（不允许 JS eval）；
 			// connect-src 只允许同源，WebSocket 与 REST 都走当前源。

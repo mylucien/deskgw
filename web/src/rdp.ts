@@ -140,8 +140,18 @@ export function describeError(e: unknown): string {
 
 // 建立 RDP 会话并绑定画布输入。该函数返回后不再持有凭据。
 export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
-  await ensureWasm()
   const log = opts.onLog || (() => {})
+
+  // 前端资源内嵌在服务端二进制里，打印版本可以直接区分「升级失败」与「协议问题」。
+  try {
+    const resp = await fetch('/api/health', { cache: 'no-store' })
+    if (resp.ok) {
+      const info = await resp.json()
+      if (info && info.version) log('info', '服务端版本 ' + info.version)
+    }
+  } catch { /* 健康检查失败不影响连接 */ }
+
+  await ensureWasm()
   log('info', '正在初始化 RDP 协议栈')
 
   // 剪贴板回调在 connect 时才被读取，先声明会话占位供回调引用。

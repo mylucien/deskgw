@@ -32,11 +32,19 @@ func Handler() http.Handler {
 				info, statErr := f.Stat()
 				f.Close()
 				if statErr == nil && !info.IsDir() {
+					// assets 下的文件名带内容哈希，可长期缓存；index.html 必须每次回源校验，
+					// 否则升级后浏览器会拿旧页面去引用已经不存在的构建产物。
+					if strings.HasPrefix(p, "assets/") {
+						w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+					} else {
+						w.Header().Set("Cache-Control", "no-cache")
+					}
 					fileServer.ServeHTTP(w, r)
 					return
 				}
 			}
 		}
+		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(index)
