@@ -233,6 +233,7 @@ def fingerprint(cert_path):
 def fake_rdp(listener, sslctx, seen):
     """接受一次连接：校验 X.224 原文，再做 TLS 并回显。"""
     conn, _ = listener.accept()
+    seen['connected'].set()
     conn.settimeout(20)
     try:
         seen['x224'] = exact(conn, len(X224_CR))
@@ -280,7 +281,7 @@ with tempfile.TemporaryDirectory() as tmp:
     listener.bind(('0.0.0.0', 0))
     listener.listen(1)
     rdp_port = listener.getsockname()[1]
-    seen = {'done': threading.Event()}
+    seen = {'connected': threading.Event(), 'done': threading.Event()}
     threading.Thread(target=fake_rdp, args=(listener, sslctx, seen), daemon=True).start()
 
     # 主机地址来自数据库，ID 由服务端分配
@@ -307,7 +308,7 @@ with tempfile.TemporaryDirectory() as tmp:
     got = rw.read(len(X224_CC))
     if got != X224_CC:
         fail('回程字节被改写: 期望 %r，实际 %r' % (X224_CC, got))
-    if not seen['done'].wait(5):
+    if not seen['connected'].wait(5):
         fail('假 RDP 服务未被连接——网关可能连错地址')
     if seen.get('error'):
         fail('假 RDP 服务异常: %s' % seen['error'])
