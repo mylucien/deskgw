@@ -164,6 +164,22 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   builder.renderCanvas(opts.canvas)
   builder.extension(new Extension('enable_credssp', true))
 
+  // 远端下发光标样式时改画布的光标。data 是 data:image/png;base64,... 的完整 URI，
+  // 热点坐标按图片原始像素给出，直接交给 CSS 即可。
+  builder.setCursorStyleCallbackContext(opts.canvas)
+  builder.setCursorStyleCallback((kind: string, data: unknown, hotspotX: number, hotspotY: number) => {
+    const style = opts.canvas.style
+    if (kind === 'hidden') {
+      style.cursor = 'none'
+      return
+    }
+    if (kind === 'url' && typeof data === 'string' && data) {
+      style.cursor = 'url("' + data + '") ' + (hotspotX | 0) + ' ' + (hotspotY | 0) + ', default'
+      return
+    }
+    style.cursor = 'default'
+  })
+
   // 只打印 host 与路径，查询串里是票据，不写进日志。
   try {
     const u = new URL(opts.wsUrl)
