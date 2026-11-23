@@ -81,7 +81,9 @@ define Package/deskgw/postinst
 # uci-defaults 默认只在首次启动时由 /etc/init.d/boot 执行；
 # 安装完立即运行一次，保证「装完即自启」与 README 一致。
 [ -n "$${IPKG_INSTROOT}" ] || {
-	/etc/uci-defaults/95-deskgw || true
+	# apk 集成会在安装阶段先执行并删除 uci-defaults（脚本末尾自删），
+	# 这里只在文件仍存在时补跑，避免每次安装都打印 not found。
+	[ -x /etc/uci-defaults/95-deskgw ] && /etc/uci-defaults/95-deskgw || true
 	/etc/init.d/deskgw enable
 	/etc/init.d/deskgw restart
 }
