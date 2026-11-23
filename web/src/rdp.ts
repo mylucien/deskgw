@@ -143,28 +143,91 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   builder.renderCanvas(opts.canvas)
   builder.extension(new Extension('enable_credssp', true))
 
-  const writeClipboard = async (text: string) => {
-    try { await navigator.clipboard.writeText(text) }
-    catch (e: any) { log('warn', '写入本地剪贴板失败：' + (e?.message || e)) }
+  // 一张 4K 截图约 1–3 MiB。wasm 侧还要把 PNG 转成 CF_DIBV5（未压缩位图，
+  // 体积会再涨几倍），所以上限压在 4 MiB，超过就跳过并提示。
+  const MAX_CLIPBOARD_IMAGE = 4 * 1024 * 1024
+
+  const toBlob = (value: unknown): Blob | null => {
+    if (value instanceof Uint8Array) return new Blob([value], { type: 'image/png' })
+    if (Array.isArray(value)) return new Blob([new Uint8Array(value)], { type: 'image/png' })
+    return null
   }
 
-  // 把浏览器剪贴板的当前内容交给远端。readText 只在用户手势内可用，
+  // 把远端剪贴板写进浏览器。图片优先，写不进去时退回文本，
+  // Firefox 不支持脚本写图片剪贴板，这条降级路径是常态而非异常。
+  const writeRemoteClipboard = async (data: ClipboardData) => {
+    let text = ''
+    let png: Blob | null = null
+    try {
+      for (const item of data.items()) {
+        const mime = item.mimeType()
+        if (!text && mime === 'text/plain') {
+          const value = item.value()
+          if (typeof value === 'string') text = value
+        } else if (!png && mime === 'image/png') {
+          const blob = toBlob(item.value())
+          const size = blob?.size ?? 0
+          if (size > MAX_CLIPBOARD_IMAGE) {
+            log('warn', '远端剪贴板图片过大，已跳过（' + Math.round(size / 1024) + ' KiB）')
+          } else {
+            png = blob
+          }
+        }
+      }
+    } catch (e: any) {
+      log('warn', '解析远端剪贴板失败：' + (e?.message || e))
+      return
+    }
+    if (png) {
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })])
+        return
+      } catch (e: any) {
+        log('warn', '写入图片到本地剪贴板失败（' + (e?.message || e) + '），改为写文本')
+      }
+    }
+    if (text) {
+      try { await navigator.clipboard.writeText(text) }
+      catch (e: any) { log('warn', '写入本地剪贴板失败：' + (e?.message || e)) }
+    }
+  }
+
+  // 把浏览器剪贴板的当前内容交给远端。读取只在用户手势内可用，
   // 所以由按下粘贴键时触发，而不是轮询。
   const pushLocalClipboard = async (trigger: string, quiet = false) => {
     const s = session
     if (!s) return
     let text = ''
-    try { text = await navigator.clipboard.readText() }
-    catch (e: any) {
-      // 远端按下粘贴时浏览器没有用户手势，读取被拒是常态，不打扰用户；
-      // 本地按 Ctrl+V 时才是真的权限问题，需要提示。
-      if (!quiet) log('warn', '读取本地剪贴板失败（' + trigger + '）：' + (e?.message || e))
-      return
+    let png: Uint8Array | null = null
+    try {
+      for (const item of await navigator.clipboard.read()) {
+        if (!text && item.types.includes('text/plain')) {
+          text = await (await item.getType('text/plain')).text()
+        }
+        if (!png && item.types.includes('image/png')) {
+          const blob = await item.getType('image/png')
+          if (blob.size > MAX_CLIPBOARD_IMAGE) {
+            log('warn', '本地剪贴板图片过大，已跳过（' + Math.round(blob.size / 1024) + ' KiB）')
+          } else {
+            png = new Uint8Array(await blob.arrayBuffer())
+          }
+        }
+      }
+    } catch {
+      // 浏览器不支持 read() 或权限被拒时退回只读文本。
+      try { text = await navigator.clipboard.readText() }
+      catch (e: any) {
+        // 远端按下粘贴时浏览器没有用户手势，读取被拒是常态，不打扰用户；
+        // 本地按 Ctrl+V 时才是真的权限问题，需要提示。
+        if (!quiet) log('warn', '读取本地剪贴板失败（' + trigger + '）：' + (e?.message || e))
+        return
+      }
     }
-    if (!text) return
+    if (!text && !png) return
     try {
       const data = new ClipboardData()
-      data.addText('text/plain', text)
+      if (text) data.addText('text/plain', text)
+      if (png) data.addBinary('image/png', png)
       await s.onClipboardPaste(data)
     } catch (e: any) {
       log('warn', '同步剪贴板到远端失败：' + (e?.message || e))
@@ -172,15 +235,9 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   }
 
   if (opts.allowClipboard !== false) {
-    // 远端复制后把内容写进浏览器剪贴板。
+    // 远端复制后把内容写进浏览器剪贴板（文本与图片）。
     builder.remoteClipboardChangedCallback((data: ClipboardData) => {
-      try {
-        const item = data.items().find((i) => i.mimeType() === 'text/plain')
-        const value = item?.value()
-        if (typeof value === 'string' && value) void writeClipboard(value)
-      } catch (e: any) {
-        log('warn', '处理远端剪贴板失败：' + (e?.message || e))
-      }
+      void writeRemoteClipboard(data)
     })
     // 远端按下粘贴时会要求本地内容；拿不到就保持远端原有内容。
     builder.forceClipboardUpdateCallback(() => {
