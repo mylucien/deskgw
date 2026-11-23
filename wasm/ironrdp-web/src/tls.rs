@@ -10,14 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use futures_rustls::client::TlsStream;
-use futures_rustls::rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
-use futures_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use futures_rustls::rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use futures_rustls::TlsConnector;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::ring as rustls_ring;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use futures_util::io::{AsyncRead, AsyncWrite};
 use ring::digest;
+use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
 /// TlsInfo 是握手后拿到的服务器证书信息。
 pub(crate) struct TlsInfo {
@@ -34,7 +33,7 @@ where
 {
     let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 
-    let provider = futures_rustls::rustls::crypto::ring::default_provider();
+    let provider = rustls_ring::default_provider();
     let config = ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
         .map_err(|e| anyhow!("TLS 配置失败: {e}"))?
@@ -133,7 +132,7 @@ impl ServerCertVerifier for AcceptAnyCert {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        futures_rustls::rustls::crypto::ring::default_provider()
+        rustls_ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
