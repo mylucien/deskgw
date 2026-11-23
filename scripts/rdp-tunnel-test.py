@@ -15,6 +15,7 @@
 import base64
 import hashlib
 import http.cookiejar
+import ipaddress
 import json
 import os
 import socket
@@ -199,6 +200,20 @@ class WsTls:
 
 
 # ---- 假 RDP 服务端 --------------------------------------------------------
+def local_private_ip():
+    """本机在默认路由上使用的地址。
+
+    host.Validate 拒绝回环地址（防止隧道指向网关自己），所以假 RDP 服务
+    不能挂在 127.0.0.1 上；这里取运行器的私网 IPv4 并绑定到 0.0.0.0。
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(('8.8.8.8', 80))
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
+
+
 def make_cert(tmpdir):
     cert = os.path.join(tmpdir, 'rdp.crt')
     key = os.path.join(tmpdir, 'rdp.key')
@@ -257,17 +272,20 @@ with tempfile.TemporaryDirectory() as tmp:
     expect_fp = fingerprint(cert)
     sslctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     sslctx.load_cert_chain(cert, key)
+    rdp_ip = local_private_ip()
+    if not ipaddress.ip_address(rdp_ip).is_private:
+        fail('测试环境没有私网 IPv4 地址（当前 %s），无法创建主机' % rdp_ip)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(('127.0.0.1', 0))
+    listener.bind(('0.0.0.0', 0))
     listener.listen(1)
     rdp_port = listener.getsockname()[1]
     seen = {'done': threading.Event()}
     threading.Thread(target=fake_rdp, args=(listener, sslctx, seen), daemon=True).start()
 
-    # 主机地址来自数据库（127.0.0.1:随机端口），ID 由服务端分配
+    # 主机地址来自数据库，ID 由服务端分配
     st, r = api('/admin/hosts', 'POST', {
-        'name': 'tunnel-test', 'address': '127.0.0.1',
+        'name': 'tunnel-test', 'address': rdp_ip,
         'rdp_port': rdp_port, 'smb_port': 445, 'enabled': True, 'modes': 'rdp'})
     if st != 200 or not r.get('ok'):
         fail('创建测试主机失败: %s' % r)
@@ -295,7 +313,7 @@ with tempfile.TemporaryDirectory() as tmp:
         fail('假 RDP 服务异常: %s' % seen['error'])
     if seen.get('x224') != X224_CR:
         fail('去程字节被改写: 期望 %r，实际 %r' % (X224_CR, seen.get('x224')))
-    print('   ok  双向字节原样透传，destination 被忽略（连到 127.0.0.1:%d）' % rdp_port)
+    print('   ok  双向字节原样透传，destination 被忽略（连到 %s:%d）' % (rdp_ip, rdp_port))
 
     # 测试 3：TLS 由两端完成，网关只转发记录
     tls = WsTls(s, rw, 'deskgw-fake-rdp')
