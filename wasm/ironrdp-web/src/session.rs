@@ -1500,7 +1500,11 @@ fn build_config(
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
         platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
         compression_type: None,
-        enable_server_pointer: false,
+        // 让服务器把光标作为独立的 Pointer PDU 下发，由浏览器用 CSS cursor 绘制。
+        // 关闭时服务器把光标合成进桌面位图：每次移动都要等一次位图更新，指针
+        // 明显滞后，拖窗口边框这类 1–2 像素的目标基本点不中；光标移动还会持续
+        // 产生整块脏区，白白吃掉带宽。
+        enable_server_pointer: true,
         autologon: false,
         enable_audio_playback: false,
         request_data: None,

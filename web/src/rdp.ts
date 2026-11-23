@@ -232,8 +232,16 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   // 窗口尺寸变化后远端桌面仍然停在连接时的分辨率。
   builder.extension(new Extension('display_control', true))
 
+  // 远端光标热点按当前 CSS 缩放比换算。cursor 的坐标单位是 CSS 像素，而热点
+  // 来自远端桌面像素：画面被缩小时不换算，箭头尖端会与实际点击点错开几像素，
+  // 拖窗口边缘这种 1–2 像素的目标就点不中。
+  const cursorScale = () => {
+    const rect = opts.canvas.getBoundingClientRect()
+    return rect.width > 0 && opts.canvas.width > 0 ? rect.width / opts.canvas.width : 1
+  }
+
   // 远端下发光标样式时改画布的光标。data 是 data:image/png;base64,... 的完整 URI，
-  // 热点坐标按图片原始像素给出，直接交给 CSS 即可。
+  // 热点坐标按图片原始像素给出，需要换算到 CSS 像素后交给浏览器。
   builder.setCursorStyleCallbackContext(opts.canvas)
   builder.setCursorStyleCallback((kind: string, data: unknown, hotspotX: number, hotspotY: number) => {
     const style = opts.canvas.style
@@ -242,7 +250,10 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
       return
     }
     if (kind === 'url' && typeof data === 'string' && data) {
-      style.cursor = 'url("' + data + '") ' + (hotspotX | 0) + ' ' + (hotspotY | 0) + ', default'
+      const k = cursorScale()
+      const hx = Math.round((hotspotX | 0) * k)
+      const hy = Math.round((hotspotY | 0) * k)
+      style.cursor = 'url("' + data + '") ' + hx + ' ' + hy + ', default'
       return
     }
     style.cursor = 'default'
@@ -458,7 +469,37 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     flushMove()
   }
 
-  const onMouseMove = (e: MouseEvent) => { queueMove(e.clientX, e.clientY) }
+  // 按下后由 window 接管移动与抬起：拖窗口边缘时指针几十毫秒内就会移出画布，
+  // 只监听 canvas 会丢掉后续事件，远端表现为「拖一下就断」，按钮状态还会卡住。
+  let draggingButton: number | null = null
+
+  const onMouseMove = (e: MouseEvent) => {
+    if (draggingButton !== null) return
+    queueMove(e.clientX, e.clientY)
+  }
+  const onWindowMove = (e: MouseEvent) => {
+    if (draggingButton === null) return
+    queueMove(e.clientX, e.clientY)
+  }
+  const onWindowUp = (e: MouseEvent) => {
+    if (draggingButton === null) return
+    draggingButton = null
+    flushMoveNow()
+    const p = pointAt(e.clientX, e.clientY)
+    send((t) => {
+      if (p) t.addEvent(DeviceEvent.mouseMove(p.x, p.y))
+      t.addEvent(DeviceEvent.mouseButtonReleased(e.button))
+    })
+  }
+  // 指针移出浏览器窗口后收不到 mouseup，窗口失焦时补一次释放，
+  // 避免远端一直认为左键是按下的。
+  const onWindowBlur = () => {
+    if (draggingButton === null) return
+    const button = draggingButton
+    draggingButton = null
+    send((t) => t.addEvent(DeviceEvent.mouseButtonReleased(button)))
+  }
+
   const onMouseDown = (e: MouseEvent) => {
     // 阻止浏览器把焦点交给 canvas，否则键盘事件不会再进 textarea。
     e.preventDefault()
@@ -469,9 +510,15 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     sink.style.left = Math.max(0, Math.min(rect.width - 1, e.clientX - rect.left)) + 'px'
     sink.style.top = Math.max(0, Math.min(rect.height - 1, e.clientY - rect.top)) + 'px'
     focus()
-    send((t) => t.addEvent(DeviceEvent.mouseButtonPressed(e.button)))
+    // 按下点必须单独发一次：用户可能先停住再按下，那时挂起的移动早被 rAF
+    // 消费掉了，只发按键会让远端在旧位置按下。
+    const p = pointAt(e.clientX, e.clientY)
+    send((t) => {
+      if (p) t.addEvent(DeviceEvent.mouseMove(p.x, p.y))
+      t.addEvent(DeviceEvent.mouseButtonPressed(e.button))
+    })
+    draggingButton = e.button
   }
-  const onMouseUp = (e: MouseEvent) => { send((t) => t.addEvent(DeviceEvent.mouseButtonReleased(e.button))) }
 
   // 触摸设备上浏览器不派发 mousemove，单靠鼠标事件无法移动远端指针。
   // 这里把手指按下的位置直接映射成「移动 + 左键按下」，松开时抬起，拖动即为拖拽。
@@ -581,7 +628,9 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
 
   canvas.addEventListener('mousemove', onMouseMove)
   canvas.addEventListener('mousedown', onMouseDown)
-  canvas.addEventListener('mouseup', onMouseUp)
+  window.addEventListener('mousemove', onWindowMove)
+  window.addEventListener('mouseup', onWindowUp)
+  window.addEventListener('blur', onWindowBlur)
   canvas.addEventListener('pointerdown', onPointerDown)
   canvas.addEventListener('pointermove', onPointerMove)
   canvas.addEventListener('pointerup', onPointerUp)
@@ -600,7 +649,9 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     pendingMove = null
     canvas.removeEventListener('mousemove', onMouseMove)
     canvas.removeEventListener('mousedown', onMouseDown)
-    canvas.removeEventListener('mouseup', onMouseUp)
+    window.removeEventListener('mousemove', onWindowMove)
+    window.removeEventListener('mouseup', onWindowUp)
+    window.removeEventListener('blur', onWindowBlur)
     canvas.removeEventListener('pointerdown', onPointerDown)
     canvas.removeEventListener('pointermove', onPointerMove)
     canvas.removeEventListener('pointerup', onPointerUp)

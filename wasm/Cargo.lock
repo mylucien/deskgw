@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "ironrdp-web"
-version = "0.17.0-deskgw.7"
+version = "0.17.0-deskgw.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
