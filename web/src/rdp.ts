@@ -14,7 +14,17 @@ import type { Session, SessionTerminationInfo } from './wasm/pkg/ironrdp_web.js'
 let wasmReady: Promise<unknown> | null = null
 
 export function ensureWasm(): Promise<unknown> {
-  if (!wasmReady) wasmReady = init()
+  if (!wasmReady) {
+    wasmReady = init().catch((e: unknown) => {
+      // 失败时清掉缓存：换浏览器或恢复网络后不必整页刷新。
+      wasmReady = null
+      throw new Error(
+        '加载 RDP 协议组件失败。若浏览器较旧（iOS 16.4 / Chrome 91 / Firefox 89 之前），'
+        + '可能不支持 WebAssembly SIMD；否则请确认本站静态资源可以正常下载。'
+        + '原因：' + describeError(e),
+      )
+    })
+  }
   return wasmReady
 }
 
@@ -398,16 +408,43 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
 
   // 远端桌面尺寸随 resize 变化，鼠标映射必须用当前值而不是连接时的快照。
   const viewport = { width: opts.width, height: opts.height }
-  const onMouseMove = (e: MouseEvent) => {
+  const pointAt = (clientX: number, clientY: number) => {
     const rect = canvas.getBoundingClientRect()
-    if (rect.width <= 0 || rect.height <= 0) return
-    const x = Math.max(0, Math.min(viewport.width - 1, Math.round((e.clientX - rect.left) * viewport.width / rect.width)))
-    const y = Math.max(0, Math.min(viewport.height - 1, Math.round((e.clientY - rect.top) * viewport.height / rect.height)))
-    send((t) => t.addEvent(DeviceEvent.mouseMove(x, y)))
+    if (rect.width <= 0 || rect.height <= 0) return null
+    const x = Math.max(0, Math.min(viewport.width - 1, Math.round((clientX - rect.left) * viewport.width / rect.width)))
+    const y = Math.max(0, Math.min(viewport.height - 1, Math.round((clientY - rect.top) * viewport.height / rect.height)))
+    return { x, y }
   }
+
+  // 指针移动按帧合并：一次移动风暴里只有最后一个位置真正有意义。
+  // 原来每条事件都要重排一次布局、新建 InputTransaction 再跨一次 wasm 边界，
+  // 高刷鼠标下这些调用会和画面渲染抢同一个主线程。
+  let pendingMove: { clientX: number; clientY: number } | null = null
+  let moveRaf = 0
+  const flushMove = () => {
+    moveRaf = 0
+    const pending = pendingMove
+    pendingMove = null
+    if (!pending) return
+    const p = pointAt(pending.clientX, pending.clientY)
+    if (!p) return
+    send((t) => t.addEvent(DeviceEvent.mouseMove(p.x, p.y)))
+  }
+  const queueMove = (clientX: number, clientY: number) => {
+    pendingMove = { clientX, clientY }
+    if (!moveRaf) moveRaf = requestAnimationFrame(flushMove)
+  }
+  // 按键前先把待发的移动落地，否则远端会先收到点击、再收到旧坐标。
+  const flushMoveNow = () => {
+    if (moveRaf) { cancelAnimationFrame(moveRaf); moveRaf = 0 }
+    flushMove()
+  }
+
+  const onMouseMove = (e: MouseEvent) => { queueMove(e.clientX, e.clientY) }
   const onMouseDown = (e: MouseEvent) => {
     // 阻止浏览器把焦点交给 canvas，否则键盘事件不会再进 textarea。
     e.preventDefault()
+    flushMoveNow()
     // 输入法候选框出现在 caret 处，把 1×1 的 textarea 挪到点击位置，
     // 候选框才会跟着用户的视线而不是钉在左上角。
     const rect = canvas.getBoundingClientRect()
@@ -420,16 +457,10 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
 
   // 触摸设备上浏览器不派发 mousemove，单靠鼠标事件无法移动远端指针。
   // 这里把手指按下的位置直接映射成「移动 + 左键按下」，松开时抬起，拖动即为拖拽。
-  const pointAt = (clientX: number, clientY: number) => {
-    const rect = canvas.getBoundingClientRect()
-    if (rect.width <= 0 || rect.height <= 0) return null
-    const x = Math.max(0, Math.min(viewport.width - 1, Math.round((clientX - rect.left) * viewport.width / rect.width)))
-    const y = Math.max(0, Math.min(viewport.height - 1, Math.round((clientY - rect.top) * viewport.height / rect.height)))
-    return { x, y }
-  }
   const onPointerDown = (e: PointerEvent) => {
     if (e.pointerType === 'mouse') return
     e.preventDefault()
+    flushMoveNow()
     const p = pointAt(e.clientX, e.clientY)
     if (!p) return
     const rect = canvas.getBoundingClientRect()
@@ -444,9 +475,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   }
   const onPointerMove = (e: PointerEvent) => {
     if (e.pointerType === 'mouse' || !e.buttons) return
-    const p = pointAt(e.clientX, e.clientY)
-    if (!p) return
-    send((t) => t.addEvent(DeviceEvent.mouseMove(p.x, p.y)))
+    queueMove(e.clientX, e.clientY)
   }
   const onPointerUp = (e: PointerEvent) => {
     if (e.pointerType === 'mouse') return
@@ -549,6 +578,8 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   sink.addEventListener('blur', onBlur)
 
   const detach = () => {
+    if (moveRaf) { cancelAnimationFrame(moveRaf); moveRaf = 0 }
+    pendingMove = null
     canvas.removeEventListener('mousemove', onMouseMove)
     canvas.removeEventListener('mousedown', onMouseDown)
     canvas.removeEventListener('mouseup', onMouseUp)

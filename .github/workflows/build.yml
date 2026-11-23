@@ -133,18 +133,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: wasm
+          key: simd128
       - name: 安装 wasm-pack
         run: curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
       - name: 从 vendored 官方源码构建
         working-directory: wasm
+        env:
+          # 解码（RemoteFX / 位图 RLE）是浏览器里最重的一段，全靠标量代码会明显拖慢帧率。
+          RUSTFLAGS: -C target-feature=+simd128
         run: |
           wasm-pack build ironrdp-web --release --target web \
             --out-dir ../../web/src/wasm/pkg --out-name ironrdp_web
-      - name: 校验产物
+      - name: 校验产物（含 SIMD）
         run: |
           set -e
           ls -l web/src/wasm/pkg
           [ -f web/src/wasm/pkg/ironrdp_web_bg.wasm ] || { echo "::error::缺少 wasm 产物"; exit 1; }
+          # simd128 会把目标特性写进 wasm 的 target_features 段，用它确认标志生效。
+          python3 -c '
+          data = open("web/src/wasm/pkg/ironrdp_web_bg.wasm", "rb").read()
+          print("wasm size:", len(data))
+          print("target_feature simd128:", b"simd128" in data)
+          '
       - uses: actions/upload-artifact@v4
         with:
           name: wasm-pkg

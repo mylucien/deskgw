@@ -30,6 +30,7 @@ use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp::rdpdr::Rdpdr;
 use ironrdp::rdpdr::pdu::efs::{DEFAULT_PRINTER_DRIVER_NAME, MICROSOFT_PRINT_TO_PDF_DRIVER_NAME};
 use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
+use ironrdp::pdu::geometry::InclusiveRectangle;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, fast_path};
 use ironrdp_core::WriteBuf;
@@ -679,6 +680,8 @@ impl iron_remote_desktop::Session for Session {
 
         // Reused across frames so per-region extraction doesn't allocate on every draw.
         let mut draw_buffer = WriteBuf::new();
+        // 一帧内的脏区先攒到一起，循环结束后一次提交（见 `present`）。
+        let mut dirty: Vec<InclusiveRectangle> = Vec::new();
 
         // We retain the factory to drive the Deactivation-Reactivation Sequence locally.
         let activation_factory = connection_result.activation_factory;
@@ -915,10 +918,7 @@ impl iron_remote_desktop::Session for Session {
                             .context("Send frame to writer task")?;
                     }
                     ActiveStageOutput::GraphicsUpdate(region) => {
-                        let region = extract_partial_image(&image, region, &mut draw_buffer);
-                        gui.draw(draw_buffer.filled_mut(), region)
-                            .context("draw updated region")?;
-                        draw_buffer.clear();
+                        dirty.push(region);
                     }
                     ActiveStageOutput::PointerDefault => {
                         self.set_cursor_style(CursorStyle::Default)?;
@@ -1025,6 +1025,13 @@ impl iron_remote_desktop::Session for Session {
                         // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                         debug!("Received Server Deactivate All PDU, executing Deactivation-Reactivation Sequence");
 
+                        // 尺寸即将变化：先把手上的脏区按旧尺寸画掉，否则下面重建
+                        // `image` 后再提取旧矩形会越界。
+                        if !dirty.is_empty() {
+                            present(&gui, &image, &dirty, &mut draw_buffer)?;
+                            dirty.clear();
+                        }
+
                         // We need to perform resize after receiving the Deactivate All PDU, because there may be frames
                         // with the previous dimensions arriving between the resize request and this message.
                         if let Some((width, height)) = requested_resize {
@@ -1084,6 +1091,13 @@ impl iron_remote_desktop::Session for Session {
                     }
                     ActiveStageOutput::Terminate(reason) => break 'outer reason,
                 }
+            }
+
+            // 本轮所有输出处理完，把累积的脏区一次提交。放在循环末尾而不是每个
+            // GraphicsUpdate 里，是为了让同一次网络读取带来的多个矩形合并成一块。
+            if !dirty.is_empty() {
+                present(&gui, &image, &dirty, &mut draw_buffer)?;
+                dirty.clear();
             }
         };
 
@@ -1680,6 +1694,73 @@ fn strip_port(destination: &str) -> &str {
 #[expect(clippy::as_conversions, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn f64_to_u16_saturating_cast(value: f64) -> u16 {
     value as u16
+}
+
+/// 把一次网络读取带来的脏区提交到画布。
+///
+/// 合并成一块能显著减少 `putImageData` 的次数（拖动窗口时一次更新常被拆成几十个
+/// 小矩形）。`DecodedImage` 是整帧常驻缓冲，所以提取并集只会多带一点未变化的
+/// 像素，画面不会出错。
+fn present(
+    gui: &Canvas,
+    image: &DecodedImage,
+    regions: &[InclusiveRectangle],
+    buffer: &mut WriteBuf,
+) -> anyhow::Result<()> {
+    if let Some(merged) = coalesce(regions, image.width().into(), image.height().into()) {
+        let region = extract_partial_image(image, merged, buffer);
+        gui.draw(buffer.filled_mut(), region)
+            .context("draw updated region")?;
+        buffer.clear();
+        return Ok(());
+    }
+
+    for &region in regions {
+        let region = extract_partial_image(image, region, buffer);
+        gui.draw(buffer.filled_mut(), region)
+            .context("draw updated region")?;
+        buffer.clear();
+    }
+
+    Ok(())
+}
+
+/// 判断这一批脏区是否值得合成一个并集。
+///
+/// 两个上限避免把合并做得过头：并集不能比各脏区之和膨胀一倍以上，也不能吃掉
+/// 超过 3/4 的屏幕——那种情况分开提交更省带宽。
+fn coalesce(regions: &[InclusiveRectangle], width: u32, height: u32) -> Option<InclusiveRectangle> {
+    if regions.is_empty() {
+        return None;
+    }
+
+    let mut left = u16::MAX;
+    let mut top = u16::MAX;
+    let mut right = 0u16;
+    let mut bottom = 0u16;
+    let mut sum = 0u64;
+
+    for region in regions {
+        left = left.min(region.left);
+        top = top.min(region.top);
+        right = right.max(region.right);
+        bottom = bottom.max(region.bottom);
+        sum += u64::from(region.width()) * u64::from(region.height());
+    }
+
+    let union = (u64::from(right) - u64::from(left) + 1) * (u64::from(bottom) - u64::from(top) + 1);
+    let screen = u64::from(width) * u64::from(height);
+
+    if union <= sum.saturating_mul(2) && union.saturating_mul(4) <= screen.saturating_mul(3) {
+        Some(InclusiveRectangle {
+            left,
+            top,
+            right,
+            bottom,
+        })
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

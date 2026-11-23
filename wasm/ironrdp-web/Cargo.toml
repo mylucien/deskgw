@@ -1,6 +1,6 @@
 [package]
 name = "ironrdp-web"
-version = "0.17.0-deskgw.4"
+version = "0.17.0-deskgw.5"
 readme = "README.md"
 description = "WebAssembly high-level bindings targeting web browsers (patched for direct TLS)"
 publish = false
@@ -65,9 +65,11 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "CanvasRenderingContext2d",
+    "Document",
     "HtmlCanvasElement",
     "ImageData",
     "Navigator",
+    "Node",
     "Performance",
     "Window",
 ] }
@@ -102,3 +104,8 @@ tap = "1"
 semver = "1"
 url = "2.5"
 base64 = "0.22"
+
+# SIMD 由 CI 通过 RUSTFLAGS="-C target-feature=+simd128" 打开，
+# 这里显式允许 wasm-opt 处理 SIMD 指令，否则优化阶段会报 "SIMD is not enabled"。
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-simd"]

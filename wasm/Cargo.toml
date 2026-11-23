@@ -4,3 +4,10 @@ resolver = "2"
 
 # Vendored from https://github.com/Devolutions/IronRDP tag ironrdp-v0.17.0.
 # 只改动传输层（RDCleanPath 网关 → 浏览器直连 TLS），见 README.md。
+
+# 这份代码在浏览器里做实时解码与渲染，默认的 release 配置（lto=false、
+# codegen-units=16）会让位解压明显变慢，因此收敛 codegen 单元并打开全局 LTO。
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
