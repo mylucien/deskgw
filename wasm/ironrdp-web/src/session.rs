@@ -1,6 +1,7 @@
 use core::cell::RefCell;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicU16, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -409,7 +410,14 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
 
         info!("Connect to RDP host");
 
-        let mut config = build_config(username, password, server_domain, client_name.clone(), desktop_size);
+        let mut config = build_config(
+            username,
+            password,
+            server_domain,
+            client_name.clone(),
+            desktop_size,
+            COLOR_DEPTH.load(Ordering::Relaxed),
+        );
 
         let enable_credssp = self.0.borrow().enable_credssp;
         config.enable_credssp = enable_credssp;
@@ -1437,12 +1445,25 @@ fn parse_file_metadata_array(files: JsValue) -> Result<Vec<FileMetadata>, IronEr
     Ok(file_list)
 }
 
+/// 桌面协商色深，由前端在连接前通过 `setColorDepth` 设定。
+///
+/// 服务器只有在 32bpp 会话里才会下发 RemoteFX 帧。16bpp 下能力集里虽然
+/// 宣告了 RemoteFX，服务器仍会退回位图 RLE，压缩率差一个数量级。
+static COLOR_DEPTH: AtomicU16 = AtomicU16::new(16);
+
+/// 设置后续连接的协商色深。只接受 32，其余值一律按 16 处理。
+#[wasm_bindgen::prelude::wasm_bindgen(js_name = setColorDepth)]
+pub fn set_color_depth(depth: u16) {
+    COLOR_DEPTH.store(if depth == 32 { 32 } else { 16 }, Ordering::Relaxed);
+}
+
 fn build_config(
     username: String,
     password: String,
     domain: Option<String>,
     client_name: String,
     desktop_size: DesktopSize,
+    color_depth: u16,
 ) -> connector::Config {
     connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
@@ -1461,7 +1482,7 @@ fn build_config(
             height: desktop_size.height,
         },
         bitmap: Some(connector::BitmapConfig {
-            color_depth: 16,
+            color_depth: u32::from(color_depth),
             lossy_compression: true,
             codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
         }),
@@ -1485,7 +1506,15 @@ fn build_config(
         request_data: None,
         pointer_software_rendering: false,
         multitransport_flags: None,
-        performance_flags: PerformanceFlags::default(),
+        // 显式给出性能标志，不依赖上游默认值。默认只关了全窗拖动与菜单动画，
+        // 壁纸、主题和光标阴影仍会持续产生位图更新；局域网里这些是带宽和
+        // 解码 CPU 的主要来源。字体平滑保留，否则中文小字会明显变糊。
+        performance_flags: PerformanceFlags::DISABLE_WALLPAPER
+            | PerformanceFlags::DISABLE_FULLWINDOWDRAG
+            | PerformanceFlags::DISABLE_MENUANIMATIONS
+            | PerformanceFlags::DISABLE_THEMING
+            | PerformanceFlags::DISABLE_CURSOR_SHADOW
+            | PerformanceFlags::ENABLE_FONT_SMOOTHING,
         desktop_scale_factor: 0,
         hardware_id: None,
         license_cache: None,

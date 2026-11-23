@@ -132,6 +132,14 @@ async function submit() {
 }
 
 onMounted(async () => {
+  // 空闲时预热 WASM：4.4MB 的下载与编译压在点「连接」之后会白等半秒到一秒。
+  // 用动态导入，主机列表页的首屏 bundle 不必为它多背一份胶水代码；延迟 1.2s
+  // 是为了不和列表请求、首屏渲染抢带宽。失败留给真正连接时再报。
+  window.setTimeout(() => {
+    // 省流量模式下不预热：WASM 有 4.4MB，对手机流量不是小数目。
+    if ((navigator as any).connection?.saveData) return
+    void import('../rdp').then((m) => m.ensureWasm()).catch(() => {})
+  }, 1200)
   try { hosts.value = await get<Host[]>('/hosts') }
   catch (e: any) { error.value = e.message }
   finally { loading.value = false }

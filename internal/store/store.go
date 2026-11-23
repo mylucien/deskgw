@@ -24,7 +24,11 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("创建数据目录失败: %w", err)
 		}
 	}
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	// synchronous(NORMAL)：WAL 模式下进程崩溃不会损坏数据库，只有掉电可能丢
+	// 最后几条已提交的事务。默认 FULL 每次提交都 fsync 一次 WAL，而连接池只有
+	// 一个连接，登录、建会话、写审计会排在同一队列里等闪存。
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

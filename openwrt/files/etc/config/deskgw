@@ -8,3 +8,5 @@ config deskgw 'main'
 	option session_idle_min '30'
 	option max_upload_mb '2048'
 	option cookie_secure '1'
+	# Go 运行时内存软上限，例如 '160MiB'；留空则按物理内存的 40% 自动计算。
+	option gomemlimit ''

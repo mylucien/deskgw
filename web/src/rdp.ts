@@ -8,6 +8,7 @@ import init, {
   DeviceEvent,
   InputTransaction,
   RotationUnit,
+  setColorDepth,
 } from './wasm/pkg/ironrdp_web.js'
 import type { Session, SessionTerminationInfo } from './wasm/pkg/ironrdp_web.js'
 
@@ -175,11 +176,8 @@ export function pickDesktopSize(
   return { width: align(w), height: align(h) }
 }
 
-// 建立 RDP 会话并绑定画布输入。该函数返回后不再持有凭据。
-export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
-  const log = opts.onLog || (() => {})
-
-  // 前端资源内嵌在服务端二进制里，打印版本可以直接区分「升级失败」与「协议问题」。
+// 打印服务端版本，用于区分「升级没生效」与「协议问题」。失败不影响连接。
+async function reportServerVersion(log: (level: string, message: string) => void): Promise<void> {
   try {
     const resp = await fetch('/api/health', { cache: 'no-store' })
     if (resp.ok) {
@@ -187,8 +185,26 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
       if (info && info.version) log('info', '服务端版本 ' + info.version)
     }
   } catch { /* 健康检查失败不影响连接 */ }
+}
+
+// 建立 RDP 会话并绑定画布输入。该函数返回后不再持有凭据。
+export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
+  const log = opts.onLog || (() => {})
+
+  // 版本自证只用于日志，不能挡在 WASM 下载前面：两者并行发起，等 WASM
+  // 就绪后再补这一行日志。
+  const healthDone = reportServerVersion(log)
+
+  // 临时 A/B 开关：?depth=32 让会话按 32bpp 协商。服务器只在 32bpp 会话里
+  // 真正下发 RemoteFX 帧，16bpp 下能力集里宣告的 RemoteFX 不会生效。
+  // 默认 16，保持既有行为直到实测确认。
+  const wideColor = new URLSearchParams(window.location.search).get('depth') === '32'
 
   await ensureWasm()
+  // 必须在 wasm 初始化之后调用：这些导出函数直接操作实例内存。
+  setColorDepth(wideColor ? 32 : 16)
+  if (wideColor) log('info', '色深 32 位（RemoteFX 实验），文字边缘轻微变软表示编码器已生效')
+  await healthDone
   log('info', '正在初始化 RDP 协议栈')
 
   // 剪贴板回调在 connect 时才被读取，先声明会话占位供回调引用。

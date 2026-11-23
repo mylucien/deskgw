@@ -8,7 +8,7 @@ USE_PROCD=1
 PROG=/usr/bin/deskgw
 
 start_service() {
-	local enabled listen cert key cert_names data_dir idle upload cookie_secure redirect
+	local enabled listen cert key cert_names data_dir idle upload cookie_secure redirect mem_limit
 
 	config_load deskgw
 	config_get_bool enabled main enabled 1
@@ -23,6 +23,20 @@ start_service() {
 	config_get upload main max_upload_mb '2048'
 	config_get_bool cookie_secure main cookie_secure 1
 	config_get redirect main redirect_listen ''
+	config_get mem_limit main gomemlimit ''
+
+	if [ -z "$mem_limit" ]; then
+		# Go 默认把 GC 目标定在「堆的两倍」，而单次 Argon2 就要约 19MB。
+		# 小内存路由器上不设上限时，几次并发登录就能把常驻内存顶到 OOM。
+		# 按物理内存的 40% 估算，下限 96MiB、上限 256MiB。这是软限制，
+		# 不会预先占用，只在堆增长时提前触发回收。
+		total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+		case "$total_kb" in ''|*[!0-9]*) total_kb=262144 ;; esac
+		limit_kb=$((total_kb * 40 / 100))
+		if [ "$limit_kb" -lt 98304 ]; then limit_kb=98304; fi
+		if [ "$limit_kb" -gt 262144 ]; then limit_kb=262144; fi
+		mem_limit="${limit_kb}KiB"
+	fi
 
 	mkdir -p "$data_dir" || return 1
 	chmod 700 "$data_dir"
@@ -38,7 +52,8 @@ start_service() {
 		DESKGW_DATA_DIR="$data_dir" \
 		DESKGW_SESSION_IDLE_MIN="$idle" \
 		DESKGW_MAX_UPLOAD_MB="$upload" \
-		DESKGW_COOKIE_SECURE="$cookie_secure"
+		DESKGW_COOKIE_SECURE="$cookie_secure" \
+		GOMEMLIMIT="$mem_limit"
 	procd_set_param file /etc/config/deskgw
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1

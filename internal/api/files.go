@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/mylucien/deskgw/internal/filegw"
 	"github.com/mylucien/deskgw/internal/host"
@@ -14,6 +15,23 @@ import (
 )
 
 const fileTokenHeader = "X-File-Token"
+
+// copyBufPool 提供下载用的 1MiB 缓冲。
+//
+// 一次 SMB2 READ 能取回的数据量受协商的 MaxReadSize 限制（Windows 通常
+// 1MiB）。net/http 的 ResponseWriter 实现了 ReaderFrom，内部只用 32KiB
+// 缓冲循环读取；对 SMB 这种「一次 Read 一次网络往返」的后端，等于每 32KiB
+// 就多一个 RTT。自己给缓冲后往返次数降到 1/32。
+//
+// 并发下载数受 filegw 的连接名额约束（24），池中同时存活的缓冲不会超过
+// 24MiB，对路由器内存是可控的。
+var copyBufPool = sync.Pool{
+	New: func() any { return make([]byte, 1<<20) },
+}
+
+// writerOnly 只暴露 Write，把 http.ResponseWriter 的 ReadFrom 藏起来：
+// io.CopyBuffer 遇到实现了 ReaderFrom 的目标会忽略传入的缓冲区。
+type writerOnly struct{ io.Writer }
 
 // fileContext 是一次文件请求的已校验上下文。
 type fileContext struct {
@@ -426,7 +444,9 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 	}
 	w.WriteHeader(status)
-	_, _ = io.Copy(w, io.LimitReader(f, length))
+	buf := copyBufPool.Get().([]byte)
+	_, _ = io.CopyBuffer(writerOnly{w}, io.LimitReader(f, length), buf)
+	copyBufPool.Put(buf)
 	writeAudit(s, fc.userID, "file.download", fmt.Sprintf(`\%s\%s\%s`, fc.host.Address, share, name),
 		fmt.Sprintf("range=%d-%d", start, end), clientIP(r))
 }
