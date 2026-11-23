@@ -174,10 +174,18 @@ SID=$(echo "$r" | sed -n 's/.*"session_id":\([0-9]*\).*/\1/p')
 # 重启网关：内存中的登录态与在线连接全部丢失，遗留记录必须被收尾
 kill "$PID" 2>/dev/null || true
 wait "$PID" 2>/dev/null || true
+# 等端口真正释放：旧进程处于 shutdown 时仍可能短暂响应，健康检查会误判
+i=0
+while curl -ksS -m 1 -o /dev/null https://127.0.0.1:18443/api/health 2>/dev/null; do
+	i=$((i + 1)); [ "$i" -lt 40 ] || fail "旧进程未在 8 秒内释放端口"
+	sleep 0.2
+done
 "$WORK/pkg/usr/bin/deskgw" >> "$WORK/server.log" 2>&1 &
 PID=$!
+sleep 0.2
+kill -0 "$PID" 2>/dev/null || { tail -20 "$WORK/server.log" >&2; fail "重启后进程立即退出"; }
 i=0
-until curl -ksS -m 2 -o /dev/null https://127.0.0.1:18443/api/health 2>/dev/null; do
+until curl -ksS -m 2 https://127.0.0.1:18443/api/health 2>/dev/null | grep -q '"status":"ok"'; do
 	i=$((i + 1)); [ "$i" -lt 40 ] || { cat "$WORK/server.log" >&2; fail "重启后服务未就绪"; }
 	sleep 0.5
 done
