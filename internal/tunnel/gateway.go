@@ -308,8 +308,8 @@ func (g *Gateway) markActive(sessionID int64, ip string) bool {
 }
 
 func (g *Gateway) endSession(sessionID int64, state, detail string) {
-	res, err := g.db.Exec(`UPDATE sessions SET state=?, ended_at=? WHERE id=? AND ended_at IS NULL`,
-		state, time.Now().Unix(), sessionID)
+	res, err := g.db.Exec(`UPDATE sessions SET state=?, ended_at=?, detail=? WHERE id=? AND ended_at IS NULL`,
+		state, time.Now().Unix(), clipDetail(detail), sessionID)
 	if err != nil {
 		return
 	}
@@ -333,6 +333,22 @@ func (g *Gateway) closeWithReason(ws *websocket.Conn, sessionID int64, state, re
 		time.Now().Add(5*time.Second))
 	_ = ws.Close()
 	g.endSession(sessionID, state, reason)
+}
+
+// maxDetail 限制落库的失败原因长度。原因里可能带对端返回的字符串，
+// 不截断会给数据库留一个可以反复写入的放大点。
+const maxDetail = 512
+
+// clipDetail 截断失败原因，并避免把 UTF-8 字符切一半。
+func clipDetail(s string) string {
+	if len(s) <= maxDetail {
+		return s
+	}
+	cut := maxDetail
+	for cut > 0 && s[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return s[:cut]
 }
 
 // trimReason 把原因截断到 close 帧允许的长度（123 字节）；

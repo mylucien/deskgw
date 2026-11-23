@@ -117,6 +117,27 @@ function scancodeOf(e: KeyboardEvent): number | null {
   return scancodeMap[k] !== undefined ? scancodeMap[k] : null
 }
 
+// 把任意抛出物转成一句话。
+//
+// wasm 侧早先把错误包装成不透明对象，前端 `String(e)` 只能得到
+// “[object Object]”，故障原因完全丢失。这里把能拿到的字段都摊开，
+// 依次尝试 Error.message、对象的 message、JSON，最后才退回 String。
+export function describeError(e: unknown): string {
+  if (e instanceof Error) return e.message || e.name || String(e)
+  if (typeof e === 'string') return e
+  if (e && typeof e === 'object') {
+    const anyErr = e as any
+    if (typeof anyErr.message === 'string' && anyErr.message) return anyErr.message
+    try {
+      const json = JSON.stringify(e)
+      if (json && json !== '{}') return json
+    } catch { /* 循环引用或含不可序列化字段 */ }
+    const str = Object.prototype.toString.call(e)
+    if (str !== '[object Object]') return str
+  }
+  return String(e)
+}
+
 // 建立 RDP 会话并绑定画布输入。该函数返回后不再持有凭据。
 export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   await ensureWasm()
@@ -142,6 +163,12 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   builder.desktopSize(new DesktopSize(opts.width, opts.height))
   builder.renderCanvas(opts.canvas)
   builder.extension(new Extension('enable_credssp', true))
+
+  // 只打印 host 与路径，查询串里是票据，不写进日志。
+  try {
+    const u = new URL(opts.wsUrl)
+    log('info', '正在连接网关 ' + u.host + u.pathname)
+  } catch { /* 地址异常时留给 connect 报错 */ }
 
   // 一张 4K 截图约 1–3 MiB。wasm 侧还要把 PNG 转成 CF_DIBV5（未压缩位图，
   // 体积会再涨几倍），所以上限压在 4 MiB，超过就跳过并提示。
@@ -245,8 +272,15 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     })
   }
 
-  session = await builder.connect()
-  const active: Session = session
+  // 连接阶段失败时把原因摊平再抛出：调用方只负责展示，不再判断类型。
+  let opened: Session
+  try {
+    opened = await builder.connect()
+  } catch (e) {
+    throw new Error(describeError(e))
+  }
+  session = opened
+  const active: Session = opened
   // 记录本次实际证书指纹，供下次连接比对。
   try {
     const fp = active.certificateFingerprint()
@@ -261,8 +295,8 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   const runPromise: Promise<SessionTerminationInfo> = active.run()
   runPromise.then((info) => {
     if (!stopped) finish(info.reason() || 'remote-closed')
-  }).catch((e: any) => {
-    if (!stopped) finish(String(e?.message || e || 'session-error'))
+  }).catch((e: unknown) => {
+    if (!stopped) finish(describeError(e) || 'session-error')
   })
 
   const send = (fn: (t: InputTransaction) => void) => {

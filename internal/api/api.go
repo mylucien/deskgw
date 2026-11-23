@@ -697,7 +697,9 @@ type sessionView struct {
 	EndedAt   any    `json:"ended_at"`
 	State     string `json:"state"`
 	Mode      string `json:"mode"`
-	Live      bool   `json:"live"`
+	// Detail 记录会话结束原因（如“无法连接目标主机”），排障时后台直接可见。
+	Detail string `json:"detail"`
+	Live   bool   `json:"live"`
 	// Closable 表示这条记录仍占用并发配额，后台可以对它执行「强制下线」；
 	// 包括网关重启后残留、内存里已无连接的僵尸记录。
 	Closable bool `json:"closable"`
@@ -709,7 +711,7 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 	rows, err := s.db.Query(`SELECT se.id, COALESCE(u.username,''), se.host_id,
-		COALESCE(h.name,''), se.client_ip, se.started_at, se.ended_at, se.state, se.mode
+		COALESCE(h.name,''), se.client_ip, se.started_at, se.ended_at, se.state, se.mode, se.detail
 		FROM sessions se LEFT JOIN users u ON u.id=se.user_id
 		LEFT JOIN hosts h ON h.id=se.host_id
 		ORDER BY se.id DESC LIMIT ?`, limit)
@@ -724,7 +726,7 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		var v sessionView
 		var ended sql.NullInt64
 		if err := rows.Scan(&v.ID, &v.Username, &v.HostID, &v.HostName, &v.ClientIP,
-			&v.StartedAt, &ended, &v.State, &v.Mode); err != nil {
+			&v.StartedAt, &ended, &v.State, &v.Mode, &v.Detail); err != nil {
 			serverError(w, err)
 			return
 		}

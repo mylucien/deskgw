@@ -31,7 +31,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { connectRdp, resolveWsUrl } from '../rdp'
+import { connectRdp, describeError, resolveWsUrl } from '../rdp'
 import type { RdpSession } from '../rdp'
 import { closeTab, wipeCreds } from '../sessionTabs'
 import type { TabInfo } from '../sessionTabs'
@@ -134,9 +134,9 @@ onMounted(async () => {
       }
       session = null
     })
-  } catch (e: any) {
+  } catch (e: unknown) {
     props.tab.status = 'error'
-    detail.value = '连接失败：' + (e?.message || e || '未知错误')
+    detail.value = '连接失败：' + (describeError(e) || '未知错误')
     addLog('error', detail.value)
   }
 })

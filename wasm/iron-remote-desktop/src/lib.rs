@@ -34,6 +34,16 @@ pub trait RemoteDesktopApi {
     fn post_setup() {}
 }
 
+/// 把内部错误转成带 message 的 JS `Error`。
+///
+/// wasm-bindgen 对自定义错误类型只生成一个不透明对象，前端 catch 到的是
+/// `[object Object]`，既看不到原因也没法上报。这里显式构造 Error，
+/// message 形如 `NegotiationFailure: ...（source 链）`。
+pub fn error_to_js<E: IronError + ?Sized>(err: &E) -> wasm_bindgen::JsValue {
+    let msg = format!("{:?}: {}", err.kind(), err.backtrace());
+    js_sys::Error::new(&msg).into()
+}
+
 #[macro_export]
 macro_rules! make_bridge {
     ($api:ty) => {
@@ -120,11 +130,11 @@ macro_rules! make_bridge {
         #[$crate::internal::wasm_bindgen::prelude::wasm_bindgen]
         #[doc(hidden)]
         impl Session {
-            pub async fn run(&self) -> Result<SessionTerminationInfo, IronError> {
+            pub async fn run(&self) -> Result<SessionTerminationInfo, $crate::internal::wasm_bindgen::JsValue> {
                 $crate::Session::run(&self.0)
                     .await
                     .map(SessionTerminationInfo)
-                    .map_err(IronError)
+                    .map_err(|e| $crate::error_to_js(&e))
             }
 
             #[wasm_bindgen(js_name = desktopSize)]
@@ -133,13 +143,13 @@ macro_rules! make_bridge {
             }
 
             #[wasm_bindgen(js_name = applyInputs)]
-            pub fn apply_inputs(&self, transaction: InputTransaction) -> Result<(), IronError> {
-                $crate::Session::apply_inputs(&self.0, transaction.0).map_err(IronError)
+            pub fn apply_inputs(&self, transaction: InputTransaction) -> Result<(), $crate::internal::wasm_bindgen::JsValue> {
+                $crate::Session::apply_inputs(&self.0, transaction.0).map_err(|e| $crate::error_to_js(&e))
             }
 
             #[wasm_bindgen(js_name = releaseAllInputs)]
-            pub fn release_all_inputs(&self) -> Result<(), IronError> {
-                $crate::Session::release_all_inputs(&self.0).map_err(IronError)
+            pub fn release_all_inputs(&self) -> Result<(), $crate::internal::wasm_bindgen::JsValue> {
+                $crate::Session::release_all_inputs(&self.0).map_err(|e| $crate::error_to_js(&e))
             }
 
             #[wasm_bindgen(js_name = synchronizeLockKeys)]
@@ -149,20 +159,20 @@ macro_rules! make_bridge {
                 num_lock: bool,
                 caps_lock: bool,
                 kana_lock: bool,
-            ) -> Result<(), IronError> {
+            ) -> Result<(), $crate::internal::wasm_bindgen::JsValue> {
                 $crate::Session::synchronize_lock_keys(&self.0, scroll_lock, num_lock, caps_lock, kana_lock)
-                    .map_err(IronError)
+                    .map_err(|e| $crate::error_to_js(&e))
             }
 
-            pub fn shutdown(&self) -> Result<(), IronError> {
-                $crate::Session::shutdown(&self.0).map_err(IronError)
+            pub fn shutdown(&self) -> Result<(), $crate::internal::wasm_bindgen::JsValue> {
+                $crate::Session::shutdown(&self.0).map_err(|e| $crate::error_to_js(&e))
             }
 
             #[wasm_bindgen(js_name = onClipboardPaste)]
-            pub async fn on_clipboard_paste(&self, content: &ClipboardData) -> Result<(), IronError> {
+            pub async fn on_clipboard_paste(&self, content: &ClipboardData) -> Result<(), $crate::internal::wasm_bindgen::JsValue> {
                 $crate::Session::on_clipboard_paste(&self.0, &content.0)
                     .await
-                    .map_err(IronError)
+                    .map_err(|e| $crate::error_to_js(&e))
             }
 
             pub fn resize(
@@ -192,9 +202,9 @@ macro_rules! make_bridge {
             pub fn invoke_extension(
                 &self,
                 ext: $crate::Extension,
-            ) -> Result<$crate::internal::wasm_bindgen::JsValue, IronError> {
+            ) -> Result<$crate::internal::wasm_bindgen::JsValue, $crate::internal::wasm_bindgen::JsValue> {
                 <<$api as $crate::RemoteDesktopApi>::Session as $crate::Session>::invoke_extension(&self.0, ext)
-                    .map_err(IronError)
+                    .map_err(|e| $crate::error_to_js(&e))
             }
         }
 
@@ -294,11 +304,11 @@ macro_rules! make_bridge {
                 Self($crate::SessionBuilder::extension(&self.0, ext))
             }
 
-            pub async fn connect(&self) -> Result<Session, IronError> {
+            pub async fn connect(&self) -> Result<Session, $crate::internal::wasm_bindgen::JsValue> {
                 $crate::SessionBuilder::connect(&self.0)
                     .await
                     .map(Session)
-                    .map_err(IronError)
+                    .map_err(|e| $crate::error_to_js(&e))
             }
         }
 

@@ -33,7 +33,7 @@ pub trait IronError {
     fn rdcleanpath_details(&self) -> Option<RDCleanPathDetails>;
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[wasm_bindgen]
 pub enum IronErrorKind {
     /// Catch-all error kind

@@ -73,13 +73,14 @@
       <div class="panel-head"><h3>在线会话</h3><button @click="load">刷新</button></div>
       <p class="muted small">Web 登录会话 {{ sessions.web_sessions }} 个；下方为远程桌面会话记录。</p>
       <table>
-        <thead><tr><th>ID</th><th>用户</th><th>主机</th><th>来源 IP</th><th>开始</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>用户</th><th>主机</th><th>来源 IP</th><th>开始</th><th>状态</th><th>详情</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="s in sessions.sessions" :key="s.id">
             <td>{{ s.id }}</td><td>{{ s.username || '—' }}</td>
             <td>{{ s.host_name || s.host_id }}</td><td>{{ s.client_ip }}</td>
             <td>{{ new Date(s.started_at * 1000).toLocaleString() }}</td>
             <td><span class="tag" :class="s.live ? 'ok' : 'off'">{{ s.live ? '在线' : stateName(s.state) }}</span></td>
+            <td class="muted small">{{ s.detail || '—' }}</td>
             <td><button v-if="s.closable" class="danger" @click="kill(s.id)">强制下线</button><span v-else>—</span></td>
           </tr>
         </tbody>
@@ -151,6 +152,7 @@ const SESSION_STATES: Record<string, string> = {
   pending: '等待连接', active: '进行中', closed: '已结束', killed: '已强制下线',
   timeout: '超时回收', stale: '重启前遗留', failed: '建立失败',
   handshake_failed: '握手失败', upgrade_failed: '升级失败',
+  connect_failed: '连接失败',
 }
 function stateName(state: string) { return SESSION_STATES[state] || state }
 
