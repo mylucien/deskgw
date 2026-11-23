@@ -113,22 +113,38 @@ impl ServerCertVerifier for AcceptAnyCert {
         Ok(ServerCertVerified::assertion())
     }
 
+    // 不校验证书链（RDP 主机普遍自签），但**必须**校验握手签名。
+    //
+    // 只比对指纹而不验签时，中间人可以在 Certificate 消息里转发真主机的
+    // 证书（指纹与 TOFU 记录一致），再用自己的私钥完成 ServerKeyExchange
+    // 与 Finished —— rustls 照单全收，NLA 凭据就被交到了中间人手里。
+    // 指纹只能证明「对方出示了这张公开证书」，签名才能证明「对方持有私钥」。
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls_ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls_ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {

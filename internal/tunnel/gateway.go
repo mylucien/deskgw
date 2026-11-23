@@ -156,8 +156,14 @@ func (g *Gateway) Serve(w http.ResponseWriter, r *http.Request, sess *auth.Sessi
 
 	// 浏览器 → 目标主机。
 	go func() {
+		// 半开连接检测：只有 pong 才能真正说明浏览器还活着。
+		//
+		// gorilla 的默认 pong handler 什么也不做，读超时是绝对时间；RDP 空闲时
+		// 客户端没有上行数据，只靠读循环里重设 deadline 会在 90 秒后误判断线。
+		ws.SetPongHandler(func(string) error {
+			return ws.SetReadDeadline(time.Now().Add(pongWait))
+		})
 		for {
-			// 半开连接检测：任何消息（含 pong）都会重置读超时。
 			_ = ws.SetReadDeadline(time.Now().Add(pongWait))
 			mt, data, err := ws.ReadMessage()
 			if err != nil {

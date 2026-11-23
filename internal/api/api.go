@@ -35,7 +35,11 @@ const csrfCookie = "deskgw_csrf"
 const dummyHash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 // serverVersion 与 openwrt/Makefile 的 PKG_VERSION 保持一致，CI 会校验两者相同。
-const serverVersion = "0.3.6"
+const serverVersion = "0.3.7"
+
+// exportWriteTimeout 是审计导出每批写入的时限。客户端停止读取时，
+// 写操作会一直阻塞，handler 和数据库连接都释放不掉。
+const exportWriteTimeout = 60 * time.Second
 
 // Server 保存 API 依赖。
 type Server struct {
@@ -251,7 +255,9 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := clientIP(r)
 	key := ip + "|" + in.Username
-	if s.auth.Locked(key) {
+	// 两个维度：单个账号连续失败，以及同一来源 IP 跨用户名的总失败量。
+	// 后者是为防「灌满用户名表把锁定条目挤掉」而设，换用户名绕不过去。
+	if s.auth.Locked(key) || s.auth.LockedIP(ip) {
 		writeAudit(s, nil, "login_locked", in.Username, "", ip)
 		fail(w, http.StatusTooManyRequests, "locked", "尝试次数过多，请 10 分钟后再试")
 		return
@@ -265,7 +271,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		auth.VerifyPassword(dummyHash, in.Password)
 	}
 	if err != nil || !u.Enabled || !verified {
-		s.auth.Fail(key)
+		s.auth.FailFrom(key, ip)
 		writeAudit(s, nullableID(u.ID), "login_failed", in.Username, "", ip)
 		fail(w, http.StatusUnauthorized, "invalidCredentials", "用户名或密码错误")
 		return
@@ -647,6 +653,10 @@ func (s *Server) exportAudit(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="deskgw-audit.csv"`)
 	_, _ = w.Write([]byte("\xef\xbb\xbf时间,用户,动作,目标,详情,来源IP\n"))
 	flusher, _ := w.(http.Flusher)
+	// 客户端长时间收不动就中断，避免 handler 与数据库连接被无限占用。
+	// 服务端没有全局 WriteTimeout（要为 WebSocket 让路），只能在这里按批刷新。
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(exportWriteTimeout))
 	count := 0
 	err := audit.Each(s.db, uid, q.Get("action"), q.Get("q"), 200000, func(e audit.Event) error {
 		var b strings.Builder
@@ -665,8 +675,11 @@ func (s *Server) exportAudit(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		count++
-		if flusher != nil && count%500 == 0 {
-			flusher.Flush()
+		if count%500 == 0 {
+			_ = rc.SetWriteDeadline(time.Now().Add(exportWriteTimeout))
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
 		return nil
 	})

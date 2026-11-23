@@ -3,6 +3,7 @@ package audit
 
 import (
 	"database/sql"
+	"math"
 	"time"
 )
 
@@ -103,30 +104,63 @@ func List(db *sql.DB, userID int64, action, keyword string, limit, offset int) (
 	return out, rows.Err()
 }
 
-// Each 按时间倒序流式遍历事件，供 CSV 导出使用。
-// 与 List 的分页上限不同，这里以回调逐行消费，不会把全部记录读进内存。
+// Each 按时间倒序分批遍历事件，供 CSV 导出使用。
+//
+// 不能像普通查询那样一直持有 rows：SQLite 只开了一条连接
+// （store.SetMaxOpenConns(1)），导出期间慢客户端会把登录、会话创建和
+// 审计写入全部堵死。这里按主键倒序分批，每批读进内存后立即关闭 rows，
+// 连接归还后再交给回调慢慢写；单批上限几百行，内存可以忽略。
 func Each(db *sql.DB, userID int64, action, keyword string, limit int, fn func(Event) error) error {
 	if limit <= 0 || limit > 200000 {
 		limit = 200000
 	}
-	q, args := buildQuery(userID, action, keyword)
-	q += ` ORDER BY a.id DESC LIMIT ?`
-	args = append(args, limit)
-	rows, err := db.Query(q, args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		e, err := scanEvent(rows)
+	const batchSize = 500
+	lastID := int64(math.MaxInt64)
+	remaining := limit
+	for remaining > 0 {
+		n := batchSize
+		if remaining < n {
+			n = remaining
+		}
+		q, args := buildQuery(userID, action, keyword)
+		q += ` AND a.id < ? ORDER BY a.id DESC LIMIT ?`
+		args = append(args, lastID, n)
+		batch, err := queryEvents(db, q, args...)
 		if err != nil {
 			return err
 		}
-		if err := fn(e); err != nil {
-			return err
+		if len(batch) == 0 {
+			return nil
+		}
+		for _, e := range batch {
+			if err := fn(e); err != nil {
+				return err
+			}
+		}
+		lastID = batch[len(batch)-1].ID
+		remaining -= len(batch)
+		if len(batch) < n {
+			return nil
 		}
 	}
-	return rows.Err()
+	return nil
+}
+
+func queryEvents(db *sql.DB, q string, args ...any) ([]Event, error) {
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Event, 0, 64)
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // Purge 删除超过 retentionDays 天的日志。

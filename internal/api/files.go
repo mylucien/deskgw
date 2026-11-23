@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -188,6 +189,10 @@ func (s *Server) beginUpload(w http.ResponseWriter, r *http.Request) {
 	id, err := s.uploads.Add(up, fc.userID, fc.host.ID, fc.sessionID)
 	if err != nil {
 		up.Close()
+		if errors.Is(err, filegw.ErrTooManyUploads) {
+			fail(w, http.StatusTooManyRequests, "tooManyUploads", err.Error())
+			return
+		}
 		serverError(w, err)
 		return
 	}
@@ -250,8 +255,10 @@ func (s *Server) finishUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	var in struct {
 		UploadID string `json:"upload_id"`
-		Share    string `json:"share"`
-		Path     string `json:"path"`
+		// Path 与 Share 只为兼容旧前端而保留，审计一律使用 begin 时记录的值，
+		// 否则调用方可以随便填一个路径来伪造审计记录。
+		Path  string `json:"path"`
+		Share string `json:"share"`
 	}
 	if err := readJSON(r, &in); err != nil || in.UploadID == "" {
 		fail(w, http.StatusBadRequest, "badRequest", "请求格式不正确")
@@ -263,13 +270,16 @@ func (s *Server) finishUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	size := up.Offset()
-	s.uploads.Drop(in.UploadID)
-	if name, err := filegw.NormalizePath(in.Path); err == nil {
-		share, _ := filegw.NormalizeShare(in.Share)
-		writeAudit(s, fc.userID, "file.upload",
-			fmt.Sprintf(`\%s\%s\%s`, fc.host.Address, share, name),
-			fmt.Sprintf("bytes=%d", size), clientIP(r))
+	// 关掉临时文件并改名到目标路径。失败时临时文件会被清理，目标文件保持原样。
+	if err := up.Commit(); err != nil {
+		s.uploads.Drop(in.UploadID)
+		fail(w, http.StatusBadGateway, "smb", err.Error())
+		return
 	}
+	s.uploads.Drop(in.UploadID)
+	writeAudit(s, fc.userID, "file.upload",
+		fmt.Sprintf(`\%s\%s\%s`, fc.host.Address, up.ShareName(), up.TargetPath()),
+		fmt.Sprintf("bytes=%d", size), clientIP(r))
 	ok(w, map[string]any{"bytes": size})
 }
 

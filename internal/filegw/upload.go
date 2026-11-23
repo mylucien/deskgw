@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,28 +15,72 @@ import (
 // ErrUploadOffset 表示分片偏移与已写入位置不一致。
 var ErrUploadOffset = errors.New("分片偏移不连续，请重新上传")
 
+// ErrTooManyUploads 表示并发上传会话已达上限。
+var ErrTooManyUploads = errors.New("同时进行的上传过多，请先完成或取消其他上传")
+
+// 上传会话的并发上限。全局 SMB 名额只有 24 个（client.go 的 maxConns），
+// begin 不限量的话，一个用户可以全部占满，其他人的列表、下载、上传都会失败。
+const (
+	maxUploadsPerUser = 3
+	maxUploadsGlobal  = 16
+)
+
 // Upload 是一次分片上传会话：整条上传复用同一条 SMB 连接与文件句柄，
 // 避免每个 4MiB 分片都重新做一次 TCP + NTLM 认证（2GiB 约 512 次）。
+//
+// 数据先写到同目录的临时文件，finish 时再改名到目标路径：直接截断目标
+// 文件的话，上传中途断开会把用户原有文件变成残缺文件。
 type Upload struct {
 	conn   *Conn
 	file   *smb2.File
+	share  string
+	final  string
+	tmp    string
 	mu     sync.Mutex
 	offset int64
 	closed bool
 }
 
-// BeginUpload 建立上传会话并创建（截断）目标文件。
+// BeginUpload 建立上传会话，在目标目录下创建临时文件。
 func BeginUpload(address string, port int, share, path string, creds Credentials) (*Upload, error) {
 	conn, err := Connect(address, port, share, creds)
 	if err != nil {
 		return nil, err
 	}
-	f, err := conn.OpenWrite(path, 0)
+	tmp := tempName(path)
+	f, err := conn.OpenWrite(tmp, 0)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
-	return &Upload{conn: conn, file: f}, nil
+	return &Upload{conn: conn, file: f, share: share, final: path, tmp: tmp}, nil
+}
+
+// tempName 生成同目录下的临时文件名，带随机后缀避免并发上传互相覆盖。
+func tempName(path string) string {
+	var tag [4]byte
+	_, _ = rand.Read(tag[:])
+	suffix := ".deskgw-" + hex.EncodeToString(tag[:]) + ".part"
+	if len(path)+len(suffix) <= 240 {
+		return path + suffix
+	}
+	// Windows 单个文件名上限 255 字节；超长时截断基名，保留目录。
+	dir, base := "", path
+	if i := strings.LastIndexByte(path, '\\'); i >= 0 {
+		dir, base = path[:i+1], path[i+1:]
+	}
+	keep := 240 - len(dir) - len(suffix)
+	if keep < 1 {
+		keep = 1
+	}
+	if len(base) > keep {
+		// 不切断多字节字符。
+		for keep > 0 && base[keep]&0xC0 == 0x80 {
+			keep--
+		}
+		base = base[:keep]
+	}
+	return dir + base + suffix
 }
 
 // Offset 返回已写入字节数。
@@ -64,7 +109,52 @@ func (u *Upload) WriteChunk(offset int64, r io.Reader, limit int64) (int64, erro
 	return n, err
 }
 
-// Close 关闭文件与连接。重复调用安全。
+// ShareName 返回上传所在的共享名，供审计使用。
+func (u *Upload) ShareName() string { return u.share }
+
+// TargetPath 返回 begin 时确定的目标路径。审计必须取这里的值，
+// 不能用 finish 请求体里的 path，否则调用方可以伪造审计记录。
+func (u *Upload) TargetPath() string { return u.final }
+
+// Commit 关闭临时文件并把它改名到目标路径。
+//
+// Windows 的 SMB rename 不覆盖已存在文件，先删目标再改名；两步之间有
+// 极短窗口，但比「一开始就截断原文件」安全得多。
+func (u *Upload) Commit() error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.closed {
+		return errors.New("上传会话已关闭")
+	}
+	u.closed = true
+	if u.file != nil {
+		err := u.file.Close()
+		u.file = nil
+		if err != nil {
+			u.discardLocked()
+			return err
+		}
+	}
+	_ = u.conn.share.Remove(u.final)
+	if err := u.conn.share.Rename(u.tmp, u.final); err != nil {
+		u.discardLocked()
+		return err
+	}
+	u.tmp = ""
+	u.conn.Close()
+	return nil
+}
+
+// discardLocked 删除临时文件并释放连接。调用方必须持有 u.mu。
+func (u *Upload) discardLocked() {
+	if u.tmp != "" {
+		_ = u.conn.share.Remove(u.tmp)
+		u.tmp = ""
+	}
+	u.conn.Close()
+}
+
+// Close 丢弃未完成的上传并释放连接。重复调用安全。
 func (u *Upload) Close() {
 	if u == nil {
 		return
@@ -76,9 +166,14 @@ func (u *Upload) Close() {
 	}
 	u.closed = true
 	f := u.file
+	u.file = nil
 	u.mu.Unlock()
 	if f != nil {
 		_ = f.Close()
+	}
+	if u.tmp != "" {
+		_ = u.conn.share.Remove(u.tmp)
+		u.tmp = ""
 	}
 	u.conn.Close()
 }
@@ -108,7 +203,8 @@ func NewUploadManager(ttl time.Duration) *UploadManager {
 	return m
 }
 
-// Add 登记一条上传会话，返回随机 ID。
+// Add 登记一条上传会话，返回随机 ID。超出并发上限时返回 ErrTooManyUploads，
+// 调用方负责关闭已经建立的 SMB 连接。
 func (m *UploadManager) Add(up *Upload, userID, hostID, sessionID int64) (string, error) {
 	b := make([]byte, 18)
 	if _, err := rand.Read(b); err != nil {
@@ -116,11 +212,23 @@ func (m *UploadManager) Add(up *Upload, userID, hostID, sessionID int64) (string
 	}
 	id := hex.EncodeToString(b)
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.items) >= maxUploadsGlobal {
+		return "", ErrTooManyUploads
+	}
+	perUser := 0
+	for _, e := range m.items {
+		if e.userID == userID {
+			perUser++
+		}
+	}
+	if perUser >= maxUploadsPerUser {
+		return "", ErrTooManyUploads
+	}
 	m.items[id] = &uploadEntry{
 		up: up, userID: userID, hostID: hostID, sessionID: sessionID,
 		lastUsed: time.Now(),
 	}
-	m.mu.Unlock()
 	return id, nil
 }
 

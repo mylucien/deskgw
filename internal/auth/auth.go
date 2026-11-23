@@ -27,9 +27,17 @@ const (
 	maxFailures  = 5
 	lockDuration = 10 * time.Minute
 
-	// maxFailureKeys 限制失败计数表的条目数。键是「IP|用户名」，
+	// maxIPFailures 是同一来源 IP 在锁定期内允许的失败总数（跨用户名）。
+	// 用户名维度可以靠随机用户名灌满，IP 维度是第二道闸门：
+	// 攻击者可以换用户名，但换不掉来源地址。
+	maxIPFailures = 50
+
+	// maxFailureKeys 是每张计数表的软上限。键是「IP|用户名」，
 	// 攻击者可以用随机用户名制造无限增长，因此必须设上限并在后台清理。
 	maxFailureKeys = 4096
+	// maxFailureKeysHard 是硬上限：软上限只淘汰未锁定条目，
+	// 涨到硬上限才会动锁定中的条目。灌表挤掉别人锁定的成本因此翻倍。
+	maxFailureKeysHard = maxFailureKeys * 2
 )
 
 // argonSlots 限制同时进行的 argon2 计算数量。每次校验要占约 19MB 内存，
@@ -100,18 +108,20 @@ type failure struct {
 
 // Manager 管理会话与失败计数，全部在内存中。
 type Manager struct {
-	mu       sync.Mutex
-	sessions map[string]*Session
-	failures map[string]*failure
-	idle     time.Duration
+	mu         sync.Mutex
+	sessions   map[string]*Session
+	failures   map[string]*failure
+	ipFailures map[string]*failure
+	idle       time.Duration
 }
 
 // NewManager 创建会话管理器。
 func NewManager(idleMinutes int) *Manager {
 	m := &Manager{
-		sessions: make(map[string]*Session),
-		failures: make(map[string]*failure),
-		idle:     time.Duration(idleMinutes) * time.Minute,
+		sessions:   make(map[string]*Session),
+		failures:   make(map[string]*failure),
+		ipFailures: make(map[string]*failure),
+		idle:       time.Duration(idleMinutes) * time.Minute,
 	}
 	go m.janitor()
 	return m
@@ -140,10 +150,16 @@ func (m *Manager) pruneSessionsLocked() {
 }
 
 func (m *Manager) pruneFailuresLocked() {
+	m.pruneTableLocked(m.failures)
+	m.pruneTableLocked(m.ipFailures)
+}
+
+// pruneTableLocked 删除已经解锁且不再计数的条目。
+func (m *Manager) pruneTableLocked(table map[string]*failure) {
 	now := time.Now()
-	for k, f := range m.failures {
+	for k, f := range table {
 		if f.count == 0 && !f.lockedUntil.IsZero() && !now.Before(f.lockedUntil) {
-			delete(m.failures, k)
+			delete(table, k)
 		}
 	}
 }
@@ -241,7 +257,22 @@ func (m *Manager) RevokeUser(userID int64) int {
 func (m *Manager) Locked(key string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	f := m.failures[key]
+	return lockedIn(m.failures, key)
+}
+
+// LockedIP 判断来源 IP 是否因跨用户名的失败总量被锁定。
+func (m *Manager) LockedIP(ip string) bool {
+	if ip == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return lockedIn(m.ipFailures, ip)
+}
+
+// lockedIn 在已持锁的前提下判断条目是否仍在锁定期内，顺便清掉过期的。
+func lockedIn(table map[string]*failure, key string) bool {
+	f := table[key]
 	if f == nil {
 		return false
 	}
@@ -251,46 +282,72 @@ func (m *Manager) Locked(key string) bool {
 	if time.Now().Before(f.lockedUntil) {
 		return true
 	}
-	delete(m.failures, key)
+	delete(table, key)
 	return false
 }
 
 // Fail 记录一次失败，达到阈值后锁定。
 func (m *Manager) Fail(key string) {
+	m.FailFrom(key, "")
+}
+
+// FailFrom 同时记录「IP|用户名」与来源 IP 两个维度的失败。
+func (m *Manager) FailFrom(key, ip string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
-	f := m.failures[key]
+	m.bumpLocked(m.failures, key, maxFailures, now)
+	if ip != "" {
+		m.bumpLocked(m.ipFailures, ip, maxIPFailures, now)
+	}
+}
+
+func (m *Manager) bumpLocked(table map[string]*failure, key string, threshold int, now time.Time) {
+	if key == "" {
+		return
+	}
+	f := table[key]
 	if f == nil {
-		if len(m.failures) >= maxFailureKeys {
-			m.pruneFailuresLocked()
-			if len(m.failures) >= maxFailureKeys {
-				m.evictOldestLocked()
+		if len(table) >= maxFailureKeys {
+			m.pruneTableLocked(table)
+			if len(table) >= maxFailureKeys {
+				// 先只淘汰未锁定的条目；只有涨到硬上限才动锁定中的，
+				// 否则灌满表就能把别人正在生效的锁定挤掉。
+				if !evictOldest(table, false) && len(table) >= maxFailureKeysHard {
+					evictOldest(table, true)
+				}
 			}
 		}
 		f = &failure{}
-		m.failures[key] = f
+		table[key] = f
 	}
 	f.last = now
 	f.count++
-	if f.count >= maxFailures {
+	if f.count >= threshold {
 		f.lockedUntil = now.Add(lockDuration)
 		f.count = 0
 	}
 }
 
-// evictOldestLocked 在计数表达到上限时淘汰最久未活动的条目。
-func (m *Manager) evictOldestLocked() {
+// evictOldest 淘汰最久未活动的条目。includeLocked 为 false 时跳过仍在
+// 锁定期的条目，保证攻击者无法用新键把别人的锁定挤出去。
+func evictOldest(table map[string]*failure, includeLocked bool) bool {
+	now := time.Now()
 	var oldestKey string
 	var oldest time.Time
-	for k, f := range m.failures {
+	for k, f := range table {
+		if !includeLocked && !f.lockedUntil.IsZero() && now.Before(f.lockedUntil) {
+			continue
+		}
 		if oldestKey == "" || f.last.Before(oldest) {
 			oldestKey, oldest = k, f.last
 		}
 	}
-	if oldestKey != "" {
-		delete(m.failures, oldestKey)
+	if oldestKey == "" {
+		return false
 	}
+	delete(table, oldestKey)
+	return true
 }
 
 // Clear 清除某键的失败记录。
