@@ -7,6 +7,7 @@
         <option value="1280x720">1280 × 720</option>
         <option value="1920x1080">1920 × 1080</option>
       </select>
+      <span class="rc-size">{{ vpWidth }} × {{ vpHeight }}</span>
       <button v-if="canFile" :class="{ active: showFiles }" @click="showFiles = !showFiles" :disabled="!session">文件</button>
       <button @click="toggleFullscreen" :disabled="!session">全屏</button>
       <button class="danger" @click="close">断开</button>
@@ -68,7 +69,14 @@ function fitViewport() {
   if (!el) return
   // 固定分辨率模式下不跟随容器。
   if (resolution.value !== '0') return
-  const size = pickDesktopSize(el.clientWidth || 1280, el.clientHeight || 720)
+  // 按物理像素取基准（DPR 封顶 2）；手机再压一道长边上限，避免 wasm 解码跟不上。
+  const dpr = Math.min(window.devicePixelRatio || 1, 2)
+  const coarse = window.matchMedia('(pointer: coarse)').matches
+  const size = pickDesktopSize(
+    (el.clientWidth || 1280) * dpr,
+    (el.clientHeight || 720) * dpr,
+    coarse ? 1280 : 1920,
+  )
   if (size.width === vpWidth.value && size.height === vpHeight.value) return
   vpWidth.value = size.width
   vpHeight.value = size.height
@@ -190,13 +198,14 @@ onBeforeUnmount(() => {
 .rc-tools button:disabled { opacity: .45; }
 .rc-tools button.active { border-color: #2563eb; color: #93c5fd; }
 .rc-tools button.danger { color: #fca5a5; }
+.rc-size { font: 11px ui-monospace, monospace; color: #6b7280; flex: none; }
 .rc-main { display: flex; flex: 1; min-height: 0; }
 /* 画布按位图比例尽量铺满，留黑边而不拉伸：远端分辨率与容器比例不一致时不会变形。 */
 .rc-stage { flex: 1; position: relative; overflow: hidden; background: #0f1115;
   display: flex; align-items: center; justify-content: center; }
 .rc-stage.immersive { position: fixed; inset: 0; z-index: 9999; background: #000; }
 canvas { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto;
-  outline: none; background: #000; }
+  outline: none; background: #000; touch-action: none; }
 .rc-exit { position: absolute; top: 10px; right: 10px; z-index: 2; background: rgba(38,42,51,.82);
   color: #e5e7eb; border: 1px solid #3a3f4b; border-radius: 6px; padding: 6px 12px; font-size: 12px; }
 .overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(15,17,21,.85); }

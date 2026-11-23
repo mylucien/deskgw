@@ -140,9 +140,12 @@ export function describeError(e: unknown): string {
 
 // 远端桌面尺寸不能直接用浏览器 CSS 像素：手机 DPR 高、CSS 尺寸小（例如 390×780），
 // 这个值会被 Windows 收缩到最小分辨率，画面比例也对不上容器。这里按容器宽高比换算，
-// 短边不低于 640、长边不超过 1280，8 像素对齐（RDP 桌面尺寸的常见约束）。
-export function pickDesktopSize(width: number, height: number): { width: number; height: number } {
-  const MAX_LONG = 1280
+// 短边不低于 640，长边不超过 maxLong，8 像素对齐（RDP 桌面尺寸的常见约束）。
+export function pickDesktopSize(
+  width: number,
+  height: number,
+  maxLong = 1920,
+): { width: number; height: number } {
   const MIN_SHORT = 640
   let w = Math.max(1, Math.round(width))
   let h = Math.max(1, Math.round(height))
@@ -153,8 +156,8 @@ export function pickDesktopSize(width: number, height: number): { width: number;
     h *= k
   }
   const long = Math.max(w, h)
-  if (long > MAX_LONG) {
-    const k = MAX_LONG / long
+  if (long > maxLong) {
+    const k = maxLong / long
     w *= k
     h *= k
   }
@@ -414,6 +417,45 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     send((t) => t.addEvent(DeviceEvent.mouseButtonPressed(e.button)))
   }
   const onMouseUp = (e: MouseEvent) => { send((t) => t.addEvent(DeviceEvent.mouseButtonReleased(e.button))) }
+
+  // 触摸设备上浏览器不派发 mousemove，单靠鼠标事件无法移动远端指针。
+  // 这里把手指按下的位置直接映射成「移动 + 左键按下」，松开时抬起，拖动即为拖拽。
+  const pointAt = (clientX: number, clientY: number) => {
+    const rect = canvas.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0) return null
+    const x = Math.max(0, Math.min(viewport.width - 1, Math.round((clientX - rect.left) * viewport.width / rect.width)))
+    const y = Math.max(0, Math.min(viewport.height - 1, Math.round((clientY - rect.top) * viewport.height / rect.height)))
+    return { x, y }
+  }
+  const onPointerDown = (e: PointerEvent) => {
+    if (e.pointerType === 'mouse') return
+    e.preventDefault()
+    const p = pointAt(e.clientX, e.clientY)
+    if (!p) return
+    const rect = canvas.getBoundingClientRect()
+    sink.style.left = Math.max(0, Math.min(rect.width - 1, e.clientX - rect.left)) + 'px'
+    sink.style.top = Math.max(0, Math.min(rect.height - 1, e.clientY - rect.top)) + 'px'
+    focus()
+    try { canvas.setPointerCapture(e.pointerId) } catch { /* ignore */ }
+    send((t) => {
+      t.addEvent(DeviceEvent.mouseMove(p.x, p.y))
+      t.addEvent(DeviceEvent.mouseButtonPressed(0))
+    })
+  }
+  const onPointerMove = (e: PointerEvent) => {
+    if (e.pointerType === 'mouse' || !e.buttons) return
+    const p = pointAt(e.clientX, e.clientY)
+    if (!p) return
+    send((t) => t.addEvent(DeviceEvent.mouseMove(p.x, p.y)))
+  }
+  const onPointerUp = (e: PointerEvent) => {
+    if (e.pointerType === 'mouse') return
+    const p = pointAt(e.clientX, e.clientY)
+    send((t) => {
+      if (p) t.addEvent(DeviceEvent.mouseMove(p.x, p.y))
+      t.addEvent(DeviceEvent.mouseButtonReleased(0))
+    })
+  }
   const onWheel = (e: WheelEvent) => {
     e.preventDefault()
     const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX)
@@ -493,6 +535,10 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   canvas.addEventListener('mousemove', onMouseMove)
   canvas.addEventListener('mousedown', onMouseDown)
   canvas.addEventListener('mouseup', onMouseUp)
+  canvas.addEventListener('pointerdown', onPointerDown)
+  canvas.addEventListener('pointermove', onPointerMove)
+  canvas.addEventListener('pointerup', onPointerUp)
+  canvas.addEventListener('pointercancel', onPointerUp)
   canvas.addEventListener('wheel', onWheel, { passive: false })
   canvas.addEventListener('contextmenu', onContextMenu)
   sink.addEventListener('keydown', onKeyDown)
@@ -506,6 +552,10 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     canvas.removeEventListener('mousemove', onMouseMove)
     canvas.removeEventListener('mousedown', onMouseDown)
     canvas.removeEventListener('mouseup', onMouseUp)
+    canvas.removeEventListener('pointerdown', onPointerDown)
+    canvas.removeEventListener('pointermove', onPointerMove)
+    canvas.removeEventListener('pointerup', onPointerUp)
+    canvas.removeEventListener('pointercancel', onPointerUp)
     canvas.removeEventListener('wheel', onWheel)
     canvas.removeEventListener('contextmenu', onContextMenu)
     sink.removeEventListener('keydown', onKeyDown)
