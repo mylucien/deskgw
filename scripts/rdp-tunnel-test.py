@@ -334,7 +334,7 @@ with tempfile.TemporaryDirectory() as tmp:
     fp = hashlib.sha256(tls.cert).hexdigest()
     if fp != expect_fp:
         fail('隧道内 TLS 证书指纹不符: 期望 %s，实际 %s' % (expect_fp, fp))
-    print('   ok  经隧道完成 TLS 握手（%s，指纹 %s…）' % (seen.get('tls', '?'), fp[:16]))
+    print('   ok  经隧道完成 TLS 握手（%s，指纹 %s…）' % (tls.obj.version() or 'TLS', fp[:16]))
 
     tls.send(b'ping')
     echo = tls.recv(16)
