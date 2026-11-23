@@ -36,13 +36,9 @@ impl Canvas {
         self.canvas.set_height(height.get());
     }
 
-    /// Blits a dirty region with `put_image_data`. Forces alpha opaque first: the framebuffer isn't
-    /// guaranteed opaque (zero-init columns, QOI-RGBA) and `put_image_data` stores alpha verbatim.
+    /// Blits a dirty region with `put_image_data`. The canvas is created with `alpha: false`,
+    /// so the alpha channel of the framebuffer is ignored and needs no fix-up pass.
     pub(crate) fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
-        for pixel in buffer.chunks_exact_mut(4) {
-            pixel[3] = 0xFF;
-        }
-
         #[cfg(target_arch = "wasm32")]
         {
             let image = ImageData::new_with_u8_clamped_array_and_sh(
@@ -67,8 +63,21 @@ impl Canvas {
 fn context_2d(canvas: &HtmlCanvasElement) -> anyhow::Result<CanvasRenderingContext2d> {
     #[cfg(target_arch = "wasm32")]
     {
+        // alpha:false —— 桌面画面本身不透明，关掉 alpha 让浏览器省掉逐像素混合，
+        // 也让 draw() 不必再补 alpha 通道。desynchronized —— 降低合成延迟。
+        let options = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &options,
+            &wasm_bindgen::JsValue::from_str("alpha"),
+            &wasm_bindgen::JsValue::FALSE,
+        );
+        let _ = js_sys::Reflect::set(
+            &options,
+            &wasm_bindgen::JsValue::from_str("desynchronized"),
+            &wasm_bindgen::JsValue::TRUE,
+        );
         canvas
-            .get_context("2d")
+            .get_context_with_context_options("2d", &options)
             .map_err(|err| anyhow!("get_context(\"2d\") failed: {err:?}"))?
             .ok_or_else(|| anyhow!("canvas has no 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()

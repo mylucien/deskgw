@@ -1,6 +1,6 @@
 [package]
 name = "ironrdp-web"
-version = "0.17.0-deskgw.2"
+version = "0.17.0-deskgw.3"
 readme = "README.md"
 description = "WebAssembly high-level bindings targeting web browsers (patched for direct TLS)"
 publish = false

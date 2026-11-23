@@ -138,6 +138,30 @@ export function describeError(e: unknown): string {
   return String(e)
 }
 
+// 远端桌面尺寸不能直接用浏览器 CSS 像素：手机 DPR 高、CSS 尺寸小（例如 390×780），
+// 这个值会被 Windows 收缩到最小分辨率，画面比例也对不上容器。这里按容器宽高比换算，
+// 短边不低于 640、长边不超过 1280，8 像素对齐（RDP 桌面尺寸的常见约束）。
+export function pickDesktopSize(width: number, height: number): { width: number; height: number } {
+  const MAX_LONG = 1280
+  const MIN_SHORT = 640
+  let w = Math.max(1, Math.round(width))
+  let h = Math.max(1, Math.round(height))
+  const short = Math.min(w, h)
+  if (short < MIN_SHORT) {
+    const k = MIN_SHORT / short
+    w *= k
+    h *= k
+  }
+  const long = Math.max(w, h)
+  if (long > MAX_LONG) {
+    const k = MAX_LONG / long
+    w *= k
+    h *= k
+  }
+  const align = (v: number) => Math.max(8, Math.round(v / 8) * 8)
+  return { width: align(w), height: align(h) }
+}
+
 // 建立 RDP 会话并绑定画布输入。该函数返回后不再持有凭据。
 export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   const log = opts.onLog || (() => {})
@@ -173,6 +197,9 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   builder.desktopSize(new DesktopSize(opts.width, opts.height))
   builder.renderCanvas(opts.canvas)
   builder.extension(new Extension('enable_credssp', true))
+  // 开启 Display Control 虚拟通道：没有它，会话中的 resize 请求会被服务端忽略，
+  // 窗口尺寸变化后远端桌面仍然停在连接时的分辨率。
+  builder.extension(new Extension('display_control', true))
 
   // 远端下发光标样式时改画布的光标。data 是 data:image/png;base64,... 的完整 URI，
   // 热点坐标按图片原始像素给出，直接交给 CSS 即可。

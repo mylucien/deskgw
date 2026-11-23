@@ -12,8 +12,9 @@
       <button class="danger" @click="close">断开</button>
     </div>
     <div class="rc-main">
-      <div class="rc-stage" ref="wrap">
-        <canvas ref="canvas" :width="vpWidth" :height="vpHeight"></canvas>
+      <div class="rc-stage" ref="wrap" :class="{ immersive }">
+        <canvas ref="canvas"></canvas>
+        <button v-if="immersive" class="rc-exit" @click="exitImmersive">退出全屏</button>
         <div v-if="!connected" class="overlay">
           <div class="overlay-card">
             <h3>{{ statusText }}</h3>
@@ -31,7 +32,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { connectRdp, describeError, resolveWsUrl } from '../rdp'
+import { connectRdp, describeError, pickDesktopSize, resolveWsUrl } from '../rdp'
 import type { RdpSession } from '../rdp'
 import { closeTab, wipeCreds } from '../sessionTabs'
 import type { TabInfo } from '../sessionTabs'
@@ -50,6 +51,8 @@ const connected = ref(false)
 const detail = ref('正在建立 RDP 隧道…')
 const logs = ref<{ level: string; message: string }[]>([])
 const showFiles = ref(false)
+// iOS Safari（iPhone）没有网页全屏 API，退化成分页内的沉浸模式。
+const immersive = ref(false)
 let session: RdpSession | null = null
 
 const statusText = computed(() => ({
@@ -63,10 +66,20 @@ function addLog(level: string, message: string) {
 function fitViewport() {
   const el = wrap.value
   if (!el) return
-  const w = el.clientWidth || vpWidth.value
-  const h = el.clientHeight || vpHeight.value
-  vpWidth.value = w; vpHeight.value = h
-  if (session && resolution.value === '0') session.resize(w, h)
+  // 固定分辨率模式下不跟随容器。
+  if (resolution.value !== '0') return
+  const size = pickDesktopSize(el.clientWidth || 1280, el.clientHeight || 720)
+  if (size.width === vpWidth.value && size.height === vpHeight.value) return
+  vpWidth.value = size.width
+  vpHeight.value = size.height
+  if (session) session.resize(size.width, size.height)
+}
+// 手机地址栏收起、软键盘弹出都会触发 resize，逐次改远端分辨率会拖慢会话，
+// 这里合并成一次，只在真正停下后重新协商。
+let fitTimer: number | undefined
+function scheduleFit() {
+  if (fitTimer) window.clearTimeout(fitTimer)
+  fitTimer = window.setTimeout(() => { fitTimer = undefined; fitViewport() }, 220)
 }
 function applyResolution() {
   if (resolution.value === '0') { fitViewport(); session?.focus(); return }
@@ -78,11 +91,25 @@ function applyResolution() {
 function toggleFullscreen() {
   const el = wrap.value
   if (!el) return
-  if (document.fullscreenElement) document.exitFullscreen()
-  else el.requestFullscreen?.()
+  if (document.fullscreenElement) { document.exitFullscreen(); return }
+  if (el.requestFullscreen) {
+    el.requestFullscreen().catch(enterImmersive)
+    return
+  }
+  enterImmersive()
 }
-// 全屏切换后键盘焦点会回到文档，需要重新交给远程桌面。
-function onFullscreenChange() { session?.focus() }
+function enterImmersive() {
+  immersive.value = true
+  nextTick(() => { fitViewport(); session?.focus() })
+}
+function exitImmersive() {
+  immersive.value = false
+  nextTick(() => { fitViewport(); session?.focus() })
+}
+// 全屏切换后键盘焦点会回到文档，需要重新交给远程桌面；尺寸也要等过渡结束再算。
+function onFullscreenChange() {
+  window.setTimeout(() => { fitViewport(); session?.focus() }, 260)
+}
 function sendCtrlAltDel() { session?.sendCtrlAltDel(); session?.focus() }
 function closeFiles() { showFiles.value = false; session?.focus() }
 function close() {
@@ -98,7 +125,7 @@ watch(() => props.active, async (v) => {
 })
 
 onMounted(async () => {
-  window.addEventListener('resize', fitViewport)
+  window.addEventListener('resize', scheduleFit)
   document.addEventListener('fullscreenchange', onFullscreenChange)
   await nextTick()
   fitViewport()
@@ -142,7 +169,8 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  window.removeEventListener('resize', fitViewport)
+  window.removeEventListener('resize', scheduleFit)
+  if (fitTimer) window.clearTimeout(fitTimer)
   document.removeEventListener('fullscreenchange', onFullscreenChange)
   session?.shutdown()
   session = null
@@ -153,16 +181,24 @@ onBeforeUnmount(() => {
 <style scoped>
 .rdp-canvas { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .rc-tools { display: flex; align-items: center; gap: 8px; height: 44px; padding: 0 12px;
-  background: #1b1e24; border-bottom: 1px solid #2a2e37; flex: none; }
+  background: #1b1e24; border-bottom: 1px solid #2a2e37; flex: none;
+  overflow-x: auto; scrollbar-width: none; }
+.rc-tools::-webkit-scrollbar { display: none; }
 .rc-tools button, .rc-tools select { background: #262a33; color: #e5e7eb; border: 1px solid #3a3f4b;
-  border-radius: 6px; padding: 5px 10px; font: inherit; font-size: 12px; }
+  border-radius: 6px; padding: 5px 10px; font: inherit; font-size: 12px; flex: none; }
 .rc-tools button:hover:not(:disabled) { background: #313643; }
 .rc-tools button:disabled { opacity: .45; }
 .rc-tools button.active { border-color: #2563eb; color: #93c5fd; }
 .rc-tools button.danger { color: #fca5a5; }
 .rc-main { display: flex; flex: 1; min-height: 0; }
-.rc-stage { flex: 1; position: relative; overflow: hidden; background: #0f1115; }
-canvas { display: block; width: 100%; height: 100%; outline: none; background: #000; }
+/* 画布按位图比例尽量铺满，留黑边而不拉伸：远端分辨率与容器比例不一致时不会变形。 */
+.rc-stage { flex: 1; position: relative; overflow: hidden; background: #0f1115;
+  display: flex; align-items: center; justify-content: center; }
+.rc-stage.immersive { position: fixed; inset: 0; z-index: 9999; background: #000; }
+canvas { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto;
+  outline: none; background: #000; }
+.rc-exit { position: absolute; top: 10px; right: 10px; z-index: 2; background: rgba(38,42,51,.82);
+  color: #e5e7eb; border: 1px solid #3a3f4b; border-radius: 6px; padding: 6px 12px; font-size: 12px; }
 .overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(15,17,21,.85); }
 .overlay-card { width: 420px; max-width: 90%; background: #1b1e24; color: #e5e7eb;
   border: 1px solid #343945; border-radius: 12px; padding: 22px; text-align: center; }

@@ -55,7 +55,9 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.workspace { display: flex; flex-direction: column; height: 100vh; background: #0f1115; color: #e5e7eb; }
+/* dvh 跟随移动端地址栏收缩，避免底部被浏览器工具栏盖住。 */
+.workspace { display: flex; flex-direction: column; height: 100vh; height: 100dvh;
+  background: #0f1115; color: #e5e7eb; }
 .ws-top { display: flex; align-items: center; gap: 12px; height: 46px; padding: 0 12px;
   background: #16181d; border-bottom: 1px solid #2a2e37; flex: none; }
 .ws-top .logo { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 6px;
