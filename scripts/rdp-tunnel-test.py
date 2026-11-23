@@ -142,18 +142,30 @@ class WsReader:
             ln = struct.unpack('!Q', exact(self.sock, 8))[0]
         return opcode, exact(self.sock, ln) if ln else b''
 
+    def _fill(self):
+        """再取一帧放进缓冲；遇到 close 帧抛错。"""
+        opcode, payload = self._frame()
+        if opcode == 0x8:
+            reason = payload[2:].decode('utf-8', 'replace') if len(payload) > 2 else ''
+            raise IOError('网关关闭连接: %s' % (reason or '(无原因)'))
+        if opcode == 0x9:
+            ws_send(self.sock, payload, 0xA)
+            return
+        if opcode in (0x1, 0x2, 0x0):
+            self.buf += payload
+
     def read(self, n):
+        """读满 n 字节（用于定长报文）。"""
         while len(self.buf) < n:
-            opcode, payload = self._frame()
-            if opcode == 0x8:
-                reason = payload[2:].decode('utf-8', 'replace') if len(payload) > 2 else ''
-                raise IOError('网关关闭连接: %s' % (reason or '(无原因)'))
-            if opcode == 0x9:
-                ws_send(self.sock, payload, 0xA)
-                continue
-            if opcode in (0x1, 0x2, 0x0):
-                self.buf += payload
+            self._fill()
         out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def read_some(self, limit=16384):
+        """有多少读多少（TLS 记录长度不固定，不能等读满）。"""
+        while not self.buf:
+            self._fill()
+        out, self.buf = self.buf[:limit], self.buf[limit:]
         return out
 
 
@@ -183,7 +195,7 @@ class WsTls:
                 break
             except ssl.SSLWantReadError:
                 self._flush()
-                self.inb.write(self.reader.read(4096))
+                self.inb.write(self.reader.read_some())
         self.cert = self.obj.getpeercert(binary_form=True)
 
     def send(self, data):
@@ -196,7 +208,7 @@ class WsTls:
                 return self.obj.read(n)
             except ssl.SSLWantReadError:
                 self._flush()
-                self.inb.write(self.reader.read(4096))
+                self.inb.write(self.reader.read_some())
 
 
 # ---- 假 RDP 服务端 --------------------------------------------------------
