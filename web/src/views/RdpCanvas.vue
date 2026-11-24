@@ -1,22 +1,5 @@
 <template>
   <div class="rdp-canvas">
-    <div class="rc-tools">
-      <template v-if="touch">
-        <button :class="{ active: inputMode === 'pointer' }" @click="setMode('pointer')" :disabled="!session">指针</button>
-        <button :class="{ active: inputMode === 'touch' }" @click="setMode('touch')" :disabled="!session">触摸</button>
-        <button :class="{ active: keyboardOpen }" @click="toggleKeyboard" :disabled="!session">键盘</button>
-      </template>
-      <button @click="sendCtrlAltDel" :disabled="!session">Ctrl+Alt+Del</button>
-      <select v-model="resolution" @change="applyResolution" :disabled="!session" title="分辨率">
-        <option value="0">自适应</option>
-        <option value="1280x720">1280 × 720</option>
-        <option value="1920x1080">1920 × 1080</option>
-      </select>
-      <span class="rc-size">{{ vpWidth }} × {{ vpHeight }}</span>
-      <button v-if="canFile" :class="{ active: showFiles }" @click="showFiles = !showFiles" :disabled="!session">文件</button>
-      <button @click="toggleFullscreen" :disabled="!session">全屏</button>
-      <button class="danger" @click="close">断开</button>
-    </div>
     <div class="rc-main">
       <div class="rc-stage" ref="wrap" :class="{ immersive }">
         <canvas ref="canvas"></canvas>
@@ -46,6 +29,8 @@ import { state } from '../state'
 import FilePanel from './FilePanel.vue'
 
 const props = defineProps<{ tab: TabInfo; active: boolean }>()
+// 远端尺寸变化要同步到会话页的面板与标签列表，那里是唯一显示分辨率的地方。
+const emit = defineEmits<{ (e: 'viewport', size: { w: number; h: number }): void }>()
 const wrap = ref<HTMLDivElement | null>(null)
 const canvas = ref<HTMLCanvasElement | null>(null)
 const canFile = computed(() => !!state.user?.allow_file)
@@ -112,6 +97,7 @@ function fitViewport() {
   if (size.width === vpWidth.value && size.height === vpHeight.value) return
   vpWidth.value = size.width
   vpHeight.value = size.height
+  emit('viewport', { w: size.width, h: size.height })
   if (session) session.resize(size.width, size.height)
 }
 // 手机地址栏收起、软键盘弹出都会触发 resize，逐次改远端分辨率会拖慢会话，
@@ -125,8 +111,19 @@ function applyResolution() {
   if (resolution.value === '0') { fitViewport(); session?.focus(); return }
   const [w, h] = resolution.value.split('x').map(Number)
   vpWidth.value = w; vpHeight.value = h
+  emit('viewport', { w, h })
   session?.resize(w, h)
   session?.focus()
+}
+// 面板里的下拉用它改值：直接改 resolution 再计算，避免 v-model 依赖暴露的 ref。
+function setResolution(v: string) {
+  resolution.value = v
+  applyResolution()
+}
+function toggleFiles() {
+  // 文件面板会占掉右侧宽度，关掉后尺寸要重新算一次。
+  showFiles.value = !showFiles.value
+  if (!showFiles.value) { fitViewport(); session?.focus() }
 }
 function toggleFullscreen() {
   const el = wrap.value
@@ -159,6 +156,17 @@ function close() {
   showFiles.value = false
   closeTab(props.tab.key)
 }
+
+// 会话页的悬浮面板通过这个接口操作当前标签。工具栏已从本组件移走，
+// 状态仍留在这里：每个标签的会话、输入模式与分辨率都是独立的。
+defineExpose({
+  touch, canFile, connected, vpWidth, vpHeight, resolution,
+  inputMode, keyboardOpen, showFiles,
+  setMode, toggleKeyboard, sendCtrlAltDel, setResolution, toggleFiles,
+  toggleFullscreen, close,
+  // 触摸设备上 focus 是空操作，只有桌面浏览器会把键盘焦点还给远程桌面。
+  focus: () => session?.focus(),
+})
 
 watch(() => props.active, async (v) => {
   if (v) { await nextTick(); fitViewport(); session?.focus() }
@@ -226,17 +234,6 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .rdp-canvas { display: flex; flex-direction: column; height: 100%; min-height: 0; }
-.rc-tools { display: flex; align-items: center; gap: 8px; height: 44px; padding: 0 12px;
-  background: #1b1e24; border-bottom: 1px solid #2a2e37; flex: none;
-  overflow-x: auto; scrollbar-width: none; }
-.rc-tools::-webkit-scrollbar { display: none; }
-.rc-tools button, .rc-tools select { background: #262a33; color: #e5e7eb; border: 1px solid #3a3f4b;
-  border-radius: 6px; padding: 5px 10px; font: inherit; font-size: 12px; flex: none; }
-.rc-tools button:hover:not(:disabled) { background: #313643; }
-.rc-tools button:disabled { opacity: .45; }
-.rc-tools button.active { border-color: #2563eb; color: #93c5fd; }
-.rc-tools button.danger { color: #fca5a5; }
-.rc-size { font: 11px ui-monospace, monospace; color: #6b7280; flex: none; }
 .rc-main { display: flex; flex: 1; min-height: 0; }
 /* 画布按位图比例尽量铺满，留黑边而不拉伸：远端分辨率与容器比例不一致时不会变形。 */
 .rc-stage { flex: 1; position: relative; overflow: hidden; background: #0f1115;

@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=deskgw
-PKG_VERSION:=0.3.11
+PKG_VERSION:=0.3.12
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=mylucien
