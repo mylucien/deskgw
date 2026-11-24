@@ -855,6 +855,12 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     }
     const k = pointerGain()
     movePointerBy(dx * k, dy * k)
+    // 双击后的第二下已经划过抖动阈值：两次按下的位置差本身就打破了双击判定，
+    // 不必再等计时器，立刻按下开始拖。否则指针先跑开再按下，会拖错目标。
+    if (g.second && !g.holding) {
+      if (g.holdTimer) { window.clearTimeout(g.holdTimer); g.holdTimer = 0 }
+      startHold(g)
+    }
   }
 
   const onPointerUp = (e: PointerEvent) => {
