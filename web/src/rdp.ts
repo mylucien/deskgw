@@ -653,7 +653,9 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   const TAP_SLOP = 10           // 超过这个位移（CSS 像素）就不再算点击
   const LONG_PRESS_MS = 520     // 单击后按住多久算右键
   const DOUBLE_TAP_MS = 320     // 两次按下间隔超过这个值就不算双击
-  const HOLD_MS = 260           // 双击后按住多久进入左键拖拽
+  // 双击后的第二下必须晚于系统双击窗口按下，否则远端会把它当成「第二次单击」：
+  // 落在标题栏上就是直接最大化，永远进不了拖拽。Windows 默认双击间隔 500ms。
+  const DOUBLE_CLICK_WINDOW = 560
 
   interface Gesture {
     id: number
@@ -661,6 +663,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     startY: number
     lastX: number
     lastY: number
+    downAt: number
     moved: boolean
     holding: boolean
     second: boolean
@@ -672,7 +675,8 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   // 同时按下的触摸点，只有两个及以上才用于滚动。
   const touches = new Map<number, { x: number; y: number }>()
   let gesture: Gesture | null = null
-  let lastTapAt = 0
+  let lastTapAt = 0     // 上一次点击抬起（或双击中的第一次按下）的时刻
+  let lastDownAt = 0    // 上一次完整点击按下的时刻，用于把拖拽按下推到双击窗口之外
   let scrolling = false
   let scrollAccum = 0
   let scrollLastY = 0
@@ -782,21 +786,27 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     if (inputMode === 'pointer') {
       touches.set(e.pointerId, { x: e.clientX, y: e.clientY })
       if (touches.size >= 2) { beginScroll(); return }
-      const second = Date.now() - lastTapAt < DOUBLE_TAP_MS
+      const now = Date.now()
+      const second = now - lastTapAt < DOUBLE_TAP_MS
       const g: Gesture = {
         id: e.pointerId,
         startX: e.clientX, startY: e.clientY,
         lastX: e.clientX, lastY: e.clientY,
+        downAt: now,
         moved: false, holding: false, second, rightFired: false,
         longTimer: 0, holdTimer: 0,
       }
       gesture = g
       if (second) {
-        // 双击后按住：进入左键拖拽，这是 Windows 触控板的标准手势。
+        // 双击后按住 = 左键拖拽，但按下时刻要推迟到第一次按下之后
+        // DOUBLE_CLICK_WINDOW：提前按下会被远端合并成一次双击。
+        // 期间手指可以照常挪动指针，按下时位置已经变了，更不会被算作双击。
+        const delay = Math.max(90, DOUBLE_CLICK_WINDOW - (now - lastDownAt))
         g.holdTimer = window.setTimeout(() => {
-          if (gesture === g && !g.moved) startHold(g)
-        }, HOLD_MS)
+          if (gesture === g) startHold(g)
+        }, delay)
       } else {
+        lastDownAt = now
         // 单击后按住：右键。
         g.longTimer = window.setTimeout(() => {
           if (gesture !== g || g.moved) return
@@ -839,9 +849,9 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     if (!g.moved) {
       if (Math.hypot(e.clientX - g.startX, e.clientY - g.startY) < TAP_SLOP) return
       g.moved = true
-      clearGestureTimers(g)
-      // 双击后的第二次按下直接拖动：先按下左键再跟着走。
-      if (g.second) startHold(g)
+      // 移动了就不再是单击，右键计时作废。双击后的第二下保留按住计时器：
+      // 按下仍要等过双击窗口，但指针从这一刻起就跟手。
+      if (g.longTimer) { window.clearTimeout(g.longTimer); g.longTimer = 0 }
     }
     const k = pointerGain()
     movePointerBy(dx * k, dy * k)
@@ -872,6 +882,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
       // 单击立刻发左键，不为双击判定加延迟：第二次点击落在同一个位置就是双击。
       clickAtPointer(0)
       lastTapAt = Date.now()
+      lastDownAt = g.downAt
       buzz(4)
     }
   }
@@ -1051,6 +1062,9 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
       }
       scrolling = false
       touches.clear()
+      // 切换模式前的点击不应被算成双击序列的一半。
+      lastTapAt = 0
+      lastDownAt = 0
       inputMode = mode
       applyCanvasCursor()
       // 切到指针模式时把远端指针挪到自绘指针的位置，两边保持重合。

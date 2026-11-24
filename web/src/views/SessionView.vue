@@ -1,5 +1,5 @@
 <template>
-  <div class="workspace">
+  <div class="workspace" ref="workspaceEl">
     <div class="ws-body">
       <p v-if="!workspace.tabs.length" class="empty">
         没有打开的会话。<a @click="goHosts">前往主机列表</a>
@@ -13,17 +13,24 @@
       </template>
     </div>
 
-    <!-- 悬浮按钮：替代原来的标签栏。会话数用角标，连接状态用右下圆点。 -->
-    <button class="fab" :class="{ on: menuOpen, hide: filesOpen }" :aria-expanded="menuOpen"
+    <!-- 隐藏后留下的贴边把手，点一下把按钮放回来。 -->
+    <button v-if="fabHidden && !filesOpen" class="fab-handle" :style="handleStyle"
+      @click="showFab" aria-label="显示会话菜单" title="显示会话菜单"></button>
+
+    <!-- 悬浮按钮：替代原来的标签栏。会话数用角标，连接状态用右下圆点。
+         可拖动摆放，靠近左右边缘会吸附。 -->
+    <button class="fab"
+      :class="{ on: menuOpen, hide: filesOpen || fabHidden, drag: dragging }"
+      :style="fabStyle" :aria-expanded="menuOpen"
       :title="activeName || '会话菜单'" aria-label="会话菜单"
-      @click="menuOpen ? closeMenu() : (menuOpen = true)">
+      @pointerdown="onFabDown" @click="onFabTap">
       <span class="mark">DG</span>
       <span v-if="workspace.tabs.length > 1" class="badge">{{ workspace.tabs.length }}</span>
       <span v-if="anyConnected" class="live"></span>
     </button>
 
-    <div class="panel" :class="{ open: menuOpen }" :aria-hidden="!menuOpen" role="dialog"
-      aria-label="会话菜单" ref="panelEl">
+    <div class="panel" :class="{ open: menuOpen }" :style="panelStyle" :aria-hidden="!menuOpen"
+      role="dialog" aria-label="会话菜单" ref="panelEl">
       <div class="p-top">
         <span class="p-cap">会话</span>
         <span class="p-ver">{{ workspace.tabs.length }} / {{ MAX_TABS }}</span>
@@ -65,7 +72,11 @@
           <button :disabled="!api.connected" @click="act(() => api?.toggleFullscreen(), true)">全屏</button>
         </div>
         <div class="p-meta">远端 {{ api.vpWidth }} × {{ api.vpHeight }}{{ api.resolution === '0' ? ' · 自适应' : ' · 固定' }}</div>
+      </template>
 
+      <button class="p-mini" @click="hideFab">隐藏悬浮按钮</button>
+
+      <template v-if="api && workspace.tabs.length">
         <div class="p-foot">
           <button class="p-danger" @click="act(() => api?.close(), true)">断开当前会话</button>
           <button class="p-quit" @click="exitWorkspace">退出工作区</button>
@@ -113,6 +124,149 @@ const router = useRouter()
 const notice = ref('')
 const menuOpen = ref(false)
 const panelEl = ref<HTMLElement | null>(null)
+const workspaceEl = ref<HTMLElement | null>(null)
+
+// ---- 悬浮按钮的位置与显隐 ----
+// 位置存的是相对工作区的像素坐标；换屏后由 clamp 拉回可见范围。
+const FAB_SIZE = 46
+const FAB_MARGIN = 14
+const FAB_EDGE = 6            // 贴边时留的缝，太贴手不好按
+const POS_KEY = 'deskgw.fabPos'
+const HIDE_KEY = 'deskgw.fabHidden'
+
+const vw = ref(window.innerWidth)
+const vh = ref(window.innerHeight)
+const safeBottom = ref(0)
+const fabX = ref(-1)
+const fabY = ref(-1)
+const fabHidden = ref(localStorage.getItem(HIDE_KEY) === '1')
+const dragging = ref(false)
+let dragFrom: { px: number; py: number; ox: number; oy: number } | null = null
+let lastDragEndAt = 0
+
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
+
+function maxX() { return Math.max(FAB_EDGE, vw.value - FAB_SIZE - FAB_EDGE) }
+function maxY() { return Math.max(FAB_EDGE, vh.value - FAB_SIZE - FAB_EDGE - safeBottom.value) }
+
+function savePos() {
+  try {
+    localStorage.setItem(POS_KEY, JSON.stringify({ x: Math.round(fabX.value), y: Math.round(fabY.value) }))
+  } catch { /* 隐私模式下写不进去，位置只在本页有效 */ }
+}
+
+function measure() {
+  const r = workspaceEl.value?.getBoundingClientRect()
+  vw.value = Math.round(r?.width || window.innerWidth)
+  vh.value = Math.round(r?.height || window.innerHeight)
+  if (fabX.value < 0) {
+    fabX.value = clamp(vw.value - FAB_SIZE - FAB_MARGIN, FAB_EDGE, maxX())
+    fabY.value = clamp(vh.value - FAB_SIZE - FAB_MARGIN - safeBottom.value, FAB_EDGE, maxY())
+  } else {
+    fabX.value = clamp(fabX.value, FAB_EDGE, maxX())
+    fabY.value = clamp(fabY.value, FAB_EDGE, maxY())
+  }
+}
+
+// env(safe-area-inset-bottom) 在 JS 里读不到，用一个 1px 高的探针量一次。
+function readSafeBottom() {
+  const probe = document.createElement('div')
+  probe.style.cssText =
+    'position:fixed;left:0;bottom:0;width:1px;height:env(safe-area-inset-bottom,0px);visibility:hidden;pointer-events:none'
+  document.body.appendChild(probe)
+  safeBottom.value = Math.round(probe.getBoundingClientRect().height) || 0
+  probe.remove()
+}
+
+const fabStyle = computed(() => ({
+  transform: `translate3d(${Math.round(fabX.value)}px, ${Math.round(fabY.value)}px, 0)`,
+}))
+
+const handleStyle = computed(() => {
+  const onLeft = fabX.value + FAB_SIZE / 2 < vw.value / 2
+  return onLeft
+    ? { left: '0px', top: `${Math.round(fabY.value)}px`, borderRadius: '0 10px 10px 0' }
+    : { right: '0px', top: `${Math.round(fabY.value)}px`, borderRadius: '10px 0 0 10px' }
+})
+
+// 面板贴着按钮所在的一侧；上方放不下就翻到下方。
+const panelStyle = computed(() => {
+  const w = Math.min(288, vw.value - 28)
+  const cx = fabX.value + FAB_SIZE / 2
+  const left = clamp(cx < vw.value / 2 ? fabX.value : fabX.value + FAB_SIZE - w,
+    14, Math.max(14, vw.value - w - 14))
+  const originX = clamp(cx - left, 12, w - 12)
+  const below = fabY.value + FAB_SIZE / 2 < vh.value / 2
+  const style: Record<string, string> = { left: `${Math.round(left)}px`, width: `${Math.round(w)}px` }
+  if (below) {
+    style.top = `${Math.round(fabY.value + FAB_SIZE + 10)}px`
+    style.maxHeight = `${Math.round(Math.max(160, vh.value - fabY.value - FAB_SIZE - 24))}px`
+    style.transformOrigin = `${Math.round(originX)}px 0`
+  } else {
+    style.bottom = `${Math.round(vh.value - fabY.value + 10)}px`
+    style.maxHeight = `${Math.round(Math.max(160, fabY.value - 24))}px`
+    style.transformOrigin = `${Math.round(originX)}px 100%`
+  }
+  return style
+})
+
+// 移动超过 6px 才算拖动，避免手抖把点击吃掉。
+function onFabDown(e: PointerEvent) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  if (menuOpen.value) return   // 面板开着时按下就是收起，交给 click
+  dragFrom = { px: e.clientX, py: e.clientY, ox: fabX.value, oy: fabY.value }
+  window.addEventListener('pointermove', onFabMove, { passive: false })
+  window.addEventListener('pointerup', onFabEnd)
+  window.addEventListener('pointercancel', onFabEnd)
+}
+
+function onFabMove(e: PointerEvent) {
+  if (!dragFrom) return
+  const dx = e.clientX - dragFrom.px
+  const dy = e.clientY - dragFrom.py
+  if (!dragging.value) {
+    if (Math.hypot(dx, dy) < 6) return
+    dragging.value = true
+  }
+  e.preventDefault()
+  fabX.value = clamp(dragFrom.ox + dx, FAB_EDGE, maxX())
+  fabY.value = clamp(dragFrom.oy + dy, FAB_EDGE, maxY())
+}
+
+function onFabEnd() {
+  window.removeEventListener('pointermove', onFabMove)
+  window.removeEventListener('pointerup', onFabEnd)
+  window.removeEventListener('pointercancel', onFabEnd)
+  if (!dragFrom) return
+  dragFrom = null
+  if (!dragging.value) return
+  dragging.value = false
+  // 松手时贴近左右边缘就吸上去，其余位置原地保留。
+  if (fabX.value < FAB_MARGIN + 12) fabX.value = FAB_EDGE
+  else if (fabX.value > vw.value - FAB_SIZE - FAB_MARGIN - 12) fabX.value = maxX()
+  savePos()
+  // 拖动结束后浏览器仍会补一次 click；用时间窗挡掉，不用布尔标记，
+  // 免得浏览器压根没发 click 时把下一次正常点击吃掉。
+  lastDragEndAt = Date.now()
+}
+
+function onFabTap() {
+  if (Date.now() - lastDragEndAt < 400) return
+  if (menuOpen.value) closeMenu()
+  else menuOpen.value = true
+}
+
+function hideFab() {
+  menuOpen.value = false
+  fabHidden.value = true
+  try { localStorage.setItem(HIDE_KEY, '1') } catch { /* ignore */ }
+}
+function showFab() {
+  fabHidden.value = false
+  try { localStorage.removeItem(HIDE_KEY) } catch { /* ignore */ }
+}
+
+function onResize() { measure() }
 
 // shallowReactive：只关心「哪个 key 有实例」，不能把组件代理再包一层响应式。
 const canvasMap = shallowReactive<Record<string, RdpApi>>({})
@@ -196,10 +350,24 @@ function onKey(e: KeyboardEvent) {
 
 onMounted(() => {
   if (workspace.tabs.length >= MAX_TABS) notice.value = `最多同时打开 ${MAX_TABS} 个会话`
+  readSafeBottom()
+  const savedPos = localStorage.getItem(POS_KEY)
+  if (savedPos) {
+    try {
+      const p = JSON.parse(savedPos)
+      if (Number.isFinite(p?.x) && Number.isFinite(p?.y)) { fabX.value = p.x; fabY.value = p.y }
+    } catch { /* 坏数据就用默认位置 */ }
+  }
+  measure()
+  window.addEventListener('resize', onResize)
   document.addEventListener('pointerdown', onDocDown)
   document.addEventListener('keydown', onKey)
 })
 onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
+  window.removeEventListener('pointermove', onFabMove)
+  window.removeEventListener('pointerup', onFabEnd)
+  window.removeEventListener('pointercancel', onFabEnd)
   document.removeEventListener('pointerdown', onDocDown)
   document.removeEventListener('keydown', onKey)
 })
@@ -218,19 +386,22 @@ onBeforeUnmount(() => {
   background: #7c2d12; color: #fed7aa; padding: 8px 16px; border-radius: 8px; font-size: 12px; }
 
 /* ---------- 悬浮按钮 ---------- */
-.fab { position: absolute; right: 14px;
-  bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+/* 位置由 JS 算好后写进 transform，left/top 始终是 0，左右吸附只是改 x。 */
+.fab { position: absolute; left: 0; top: 0;
   width: 46px; height: 46px; border-radius: 50%; padding: 0;
   display: grid; place-items: center; z-index: 30;
   border: 1px solid rgba(255, 255, 255, .14);
   background: linear-gradient(180deg, #2f3540 0%, #1b1f27 100%);
   color: #fff; cursor: pointer;
+  touch-action: none; -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none;
   box-shadow: 0 8px 22px rgba(0, 0, 0, .5), inset 0 1px 0 rgba(255, 255, 255, .14);
-  transition: transform .16s ease, box-shadow .16s ease;
+  transition: transform .18s cubic-bezier(.2, .8, .3, 1), box-shadow .16s ease;
 }
-.fab:hover { transform: translateY(-1px);
-  box-shadow: 0 12px 26px rgba(0, 0, 0, .58), inset 0 1px 0 rgba(255, 255, 255, .18); }
-.fab:active { transform: scale(.96); }
+.fab:hover { box-shadow: 0 12px 26px rgba(0, 0, 0, .58), inset 0 1px 0 rgba(255, 255, 255, .18); }
+.fab:active { filter: brightness(1.18); }
+.fab.drag { transition: none; cursor: grabbing; filter: brightness(1.12);
+  box-shadow: 0 16px 34px rgba(0, 0, 0, .66), inset 0 1px 0 rgba(255, 255, 255, .2); }
 .fab.on { border-color: rgba(59, 130, 246, .6); }
 .fab.hide { display: none; }
 .fab .mark { font-size: 12px; letter-spacing: .04em; font-weight: 600; }
@@ -241,18 +412,24 @@ onBeforeUnmount(() => {
 .fab .live { position: absolute; bottom: 1px; right: 1px; width: 10px; height: 10px;
   border-radius: 50%; background: #22c55e; border: 2px solid #1b1f27; }
 
+/* 隐藏后的贴边把手：只露一条窄边，点一下恢复按钮。 */
+.fab-handle { position: absolute; z-index: 30; width: 16px; height: 46px; padding: 0;
+  border: 1px solid rgba(255, 255, 255, .14);
+  background: rgba(47, 53, 64, .62);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.fab-handle::before { content: ""; display: block; width: 3px; height: 16px; margin: 0 auto;
+  border-radius: 2px; background: rgba(255, 255, 255, .4); }
+.fab-handle:hover { background: rgba(60, 68, 82, .8); }
+
 /* ---------- 展开面板 ---------- */
-.panel { position: absolute; right: 14px; z-index: 29;
-  bottom: calc(68px + env(safe-area-inset-bottom, 0px));
-  width: min(288px, calc(100% - 28px));
-  max-height: calc(100% - 96px);
+.panel { position: absolute; z-index: 29;
   display: flex; flex-direction: column; overflow-y: auto;
   background: rgba(24, 27, 33, .92);
   -webkit-backdrop-filter: blur(18px) saturate(1.3);
   backdrop-filter: blur(18px) saturate(1.3);
   border: 1px solid rgba(255, 255, 255, .1); border-radius: 12px;
   box-shadow: 0 20px 48px rgba(0, 0, 0, .6);
-  transform-origin: calc(100% - 23px) bottom;
   opacity: 0; transform: scale(.92) translateY(8px); pointer-events: none;
   transition: opacity .13s ease, transform .13s cubic-bezier(.2, .8, .3, 1);
 }
@@ -310,6 +487,10 @@ onBeforeUnmount(() => {
 
 .p-meta { padding: 8px 12px 0; color: #5c636f; font-size: 10.5px; flex: none;
   font-family: ui-monospace, monospace; }
+
+.p-mini { height: 28px; margin: 6px 10px 0; border: 0; border-radius: 6px; flex: none;
+  background: transparent; color: #5c636f; font-size: 11px; cursor: pointer; font-family: inherit; }
+.p-mini:hover { color: #98a1b0; background: rgba(255, 255, 255, .04); }
 
 .p-foot { display: grid; gap: 6px; padding: 10px; margin-top: 4px; flex: none;
   border-top: 1px solid rgba(255, 255, 255, .06); }
