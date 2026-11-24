@@ -6,7 +6,9 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	smb2 "github.com/hirochachacha/go-smb2"
@@ -72,11 +74,14 @@ func Connect(address string, port int, share string, creds Credentials) (*Conn, 
 		tcp.Close()
 		return nil, fmt.Errorf("SMB 认证失败: %w", err)
 	}
-	sh, err := sess.Mount(share)
+	// 显式构造 UNC 路径。go-smb2 在只传共享名时会拿 TCP 对端地址拼路径，而
+	// RemoteAddr 带端口，最终变成 `\\192.168.1.213:445\C$`；这个字符串会进
+	// 目标机的安全软件日志，多出来的端口让拦截记录难以辨认。
+	sh, err := sess.Mount(fmt.Sprintf(`\\%s\%s`, address, share))
 	if err != nil {
 		sess.Logoff()
 		tcp.Close()
-		return nil, fmt.Errorf("挂载共享失败: %w", err)
+		return nil, mountError(share, err)
 	}
 	_ = tcp.SetDeadline(time.Time{})
 	release = false
@@ -84,6 +89,28 @@ func Connect(address string, port int, share string, creds Credentials) (*Conn, 
 		tcp: tcp, session: sess, share: sh,
 		release: func() { <-connSlots },
 	}, nil
+}
+
+// mountError 把挂载阶段的失败翻译成用户能看懂的原因。这一步的连接重置几乎都
+// 来自目标机的安全软件：隐藏共享（C$、ADMIN$ 等以 $ 结尾的名字）是横向渗透
+// 防护的重点目标，被拦下时对方直接重置连接，客户端只能看到 connection reset。
+func mountError(share string, err error) error {
+	if !isConnReset(err) {
+		return fmt.Errorf("挂载共享失败: %w", err)
+	}
+	if strings.HasSuffix(share, "$") {
+		return fmt.Errorf("挂载共享失败: %w（%s 是隐藏共享，目标机的安全软件常以「横向渗透防护」拦截这类访问，请改用普通共享名，或把本机加入该软件的信任列表）", err, share)
+	}
+	return fmt.Errorf("挂载共享失败: %w（目标机在挂载阶段断开了连接，常见原因是安全软件拦截或 SMB 服务异常）", err)
+}
+
+// isConnReset 判断错误链里是否包含 TCP 连接被重置。go-smb2 会在错误文本里
+// 保留底层 net 错误，但 ConnectionError 没有实现 Unwrap，两种方式都试一遍。
+func isConnReset(err error) bool {
+	if errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	return strings.Contains(err.Error(), "connection reset by peer")
 }
 
 // Close 释放共享、会话与 TCP 连接，并归还并发名额。

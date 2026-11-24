@@ -35,7 +35,7 @@ const csrfCookie = "deskgw_csrf"
 const dummyHash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 // serverVersion 与 openwrt/Makefile 的 PKG_VERSION 保持一致，CI 会校验两者相同。
-const serverVersion = "0.3.10"
+const serverVersion = "0.3.11"
 
 // exportWriteTimeout 是审计导出每批写入的时限。客户端停止读取时，
 // 写操作会一直阻塞，handler 和数据库连接都释放不掉。
