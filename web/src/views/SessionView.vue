@@ -258,6 +258,8 @@ function onFabTap() {
 
 function hideFab() {
   menuOpen.value = false
+  // 面板收起后把键盘焦点还给远程桌面，避免桌面浏览器里打不了字。
+  api.value?.focus()
   fabHidden.value = true
   try { localStorage.setItem(HIDE_KEY, '1') } catch { /* ignore */ }
 }
