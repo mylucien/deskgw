@@ -401,6 +401,30 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     return null
   }
 
+  // 远端剪贴板的最新文本。远端复制后我们会把它写回本地浏览器剪贴板，此时两边
+  // 内容一致；用户在远端按粘贴时若再把这份内容推回去，会把远端剪贴板里的其它
+  // 格式（HTML、图片）一起清掉，粘贴结果就从「刚复制的链接」变成浏览器里的旧
+  // 内容。所以推送前要比对，相同就跳过。
+  let remoteText = ''
+
+  // writeText 要求文档有焦点，失焦时会被拒。用隐藏 textarea + execCommand 兜底，
+  // 保证本地剪贴板真的被远端内容覆盖 —— 否则下一次推送会把旧内容盖到远端去。
+  const copyViaTextarea = (value: string) => {
+    try {
+      const ta = document.createElement('textarea')
+      ta.value = value
+      ta.setAttribute('readonly', '')
+      ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0'
+      document.body.appendChild(ta)
+      ta.select()
+      const ok = document.execCommand('copy')
+      ta.remove()
+      return ok
+    } catch {
+      return false
+    }
+  }
+
   // 把远端剪贴板写进浏览器。图片优先，写不进去时退回文本，
   // Firefox 不支持脚本写图片剪贴板，这条降级路径是常态而非异常。
   const writeRemoteClipboard = async (data: ClipboardData) => {
@@ -435,14 +459,17 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
       }
     }
     if (text) {
+      remoteText = text
       try { await navigator.clipboard.writeText(text) }
-      catch (e: any) { log('warn', '写入本地剪贴板失败：' + (e?.message || e)) }
+      catch (e: any) {
+        if (!copyViaTextarea(text)) log('warn', '写入本地剪贴板失败：' + (e?.message || e))
+      }
     }
   }
 
   // 把浏览器剪贴板的当前内容交给远端。读取只在用户手势内可用，
   // 所以由按下粘贴键时触发，而不是轮询。
-  const pushLocalClipboard = async (trigger: string, quiet = false) => {
+  const pushLocalClipboard = async (trigger: string, quiet = false, force = false) => {
     const s = session
     if (!s) return
     let text = ''
@@ -472,14 +499,39 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
       }
     }
     if (!text && !png) return
+    // 本地内容与远端最新文本一致时不必再推：推上去只会把远端剪贴板里的其它
+    // 格式清掉，反而破坏用户刚在远端复制的内容。带图片时不比对，图片无从比较。
+    if (!force && !png && text === remoteText) return
     try {
       const data = new ClipboardData()
       if (text) data.addText('text/plain', text)
       if (png) data.addBinary('image/png', png)
       await s.onClipboardPaste(data)
+      if (!png) remoteText = text
     } catch (e: any) {
       log('warn', '同步剪贴板到远端失败：' + (e?.message || e))
     }
+  }
+
+  // 页面内复制时系统剪贴板还没写入，直接拿 copy 事件里的文本推给远端。
+  const pushTextToRemote = async (text: string) => {
+    const s = session
+    if (!s || !text) return
+    try {
+      const data = new ClipboardData()
+      data.addText('text/plain', text)
+      await s.onClipboardPaste(data)
+      remoteText = text
+    } catch (e: any) {
+      log('warn', '同步剪贴板到远端失败：' + (e?.message || e))
+    }
+  }
+
+  // 在页面里复制（主机名、路径、日志）就地同步，不必等远端按粘贴时再来要。
+  const onCopy = (e: ClipboardEvent) => {
+    const text = e.clipboardData?.getData('text/plain') || window.getSelection()?.toString() || ''
+    if (!text) return
+    void pushTextToRemote(text)
   }
 
   if (opts.allowClipboard !== false) {
@@ -948,7 +1000,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
 
   // 本地粘贴：先把内容交给远端，再发 Ctrl+V。顺序反了远端会读到上一次的剪贴板。
   const forwardPaste = async () => {
-    await pushLocalClipboard('用户粘贴')
+    await pushLocalClipboard('用户粘贴', false, true)
     send((t) => {
       t.addEvent(DeviceEvent.keyPressed(0x1d))
       t.addEvent(DeviceEvent.keyPressed(0x2f))
@@ -1018,6 +1070,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   sink.addEventListener('compositionend', onCompositionEnd)
   sink.addEventListener('input', onInput)
   sink.addEventListener('blur', onBlur)
+  if (opts.allowClipboard !== false) document.addEventListener('copy', onCopy)
 
   const detach = () => {
     if (moveRaf) { cancelAnimationFrame(moveRaf); moveRaf = 0 }
@@ -1044,6 +1097,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     sink.removeEventListener('compositionend', onCompositionEnd)
     sink.removeEventListener('input', onInput)
     sink.removeEventListener('blur', onBlur)
+    document.removeEventListener('copy', onCopy)
     sink.remove()
     cursorEl.remove()
     canvas.style.cursor = ''
