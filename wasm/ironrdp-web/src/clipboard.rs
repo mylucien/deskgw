@@ -66,6 +66,23 @@ const FORMAT_MIME_HTML: ClientFormatDescriptor =
 const FORMAT_PNG: ClientFormatDescriptor = ClientFormatDescriptor::new(FORMAT_PNG_ID, FORMAT_PNG_NAME);
 const FORMAT_MIME_PNG: ClientFormatDescriptor = ClientFormatDescriptor::new(FORMAT_MIME_PNG_ID, FORMAT_MIME_PNG_NAME);
 
+/// CF_HTML 数据一定以 `Version:` 开头（大小写不敏感）。
+///
+/// 用来识别「CF_HTML 被当成 CF_UNICODETEXT 送过来」这种错位：CF_HTML 是 UTF-8
+/// 字节流，按 UTF-16LE 解会得到一串形似汉字的字符（`version:` 解成 `敖獲潩㩮`），
+/// 粘到本地就成了乱码。
+fn looks_like_cf_html(data: &[u8]) -> bool {
+    // 两个特征同时满足才判定：以 "Version:" 开头，且头部带 "StartFragment" 偏移。
+    // 只看前缀会把恰好以 "Version:" 开头的普通文本（版本号、配置片段）误判成 HTML，
+    // 那样反而会把文本丢掉。
+    let starts_with_version = data
+        .get(..8)
+        .map(|head| head.eq_ignore_ascii_case(b"Version:"))
+        .unwrap_or(false);
+
+    starts_with_version && data.windows(13).any(|w| w.eq_ignore_ascii_case(b"StartFragment"))
+}
+
 /// Message proxy used to send clipboard-related messages to the application main event loop
 #[derive(Debug, Clone)]
 pub(crate) struct WasmClipboardMessageProxy {
@@ -223,6 +240,22 @@ pub(crate) struct WasmClipboard {
     remote_mapping: HashMap<ClipboardFormatId, String>,
     remote_formats_to_read: Vec<ClipboardFormatId>,
 
+    /// 已发出、还没收到响应的格式。
+    ///
+    /// CLIPRDR 的 `FormatDataResponse` 不带格式 id，只能靠「同一时刻只有一个请求
+    /// 在飞」来配对。早先的实现是用 `remote_formats_to_read.last()` 反推响应属于
+    /// 哪个格式，一旦远端连着发两次 FormatList（浏览器复制时很常见：先是基础格式，
+    /// 延迟渲染时再补一次），第二次列表会再发一个请求，两个响应回来后第二个会被
+    /// 配给队列里的下一个格式 —— 于是 CF_HTML 的字节被当成 CF_UNICODETEXT 按
+    /// UTF-16 解码，本地粘贴到的就是「敖獲潩㩮…」这种汉字。
+    pending_request: Option<ClipboardFormatId>,
+
+    /// `pending_request` 是否已被新的 FormatList 作废。
+    ///
+    /// 作废意味着这个响应属于上一份剪贴板内容，必须整条丢弃，否则会把旧内容混进
+    /// 新内容。丢弃后再按新列表继续请求。
+    pending_is_stale: bool,
+
     /// Deferred file list paste: when the remote FormatList includes FileGroupDescriptorW,
     /// we store its format ID here and trigger `SendInitiatePaste` only after all text/image
     /// formats have been fetched (or immediately if no text/image formats are present).
@@ -258,6 +291,8 @@ impl WasmClipboard {
 
             remote_mapping: HashMap::new(),
             remote_formats_to_read: Vec::new(),
+            pending_request: None,
+            pending_is_stale: false,
             pending_file_list_paste: None,
         }
     }
@@ -388,15 +423,12 @@ impl WasmClipboard {
         self.pending_file_list_paste = None;
 
         // We accumulate all formats in the `remote_formats_to_read` attribute.
-        // Later, we loop over and fetch all of these (see `process_remote_data_response`).
+        // Later, we loop over and fetch all of these (see `request_next_format`).
         //
-        // SAFETY (stale response concern): clearing both `remote_mapping` and
-        // `remote_formats_to_read` here is safe because the WASM runtime is
-        // single-threaded. Any in-flight `FormatDataResponse` for the previous
-        // format list will be processed after this function returns. At that
-        // point `remote_formats_to_read` is either empty (response dropped by
-        // the guard in `process_remote_data_response`) or repopulated with the
-        // new format list, so stale data cannot be misattributed to a new format.
+        // 清空列表本身是安全的：WASM 单线程，上一份列表的在飞响应只会在本函数返回
+        // 后才被处理。届时它会被 `pending_is_stale` 整条丢弃，不会误配到新列表的
+        // 格式上 —— 早先正是这一步的错配，让 CF_HTML 的字节被当成 CF_UNICODETEXT
+        // 按 UTF-16 解码，本地粘出来全是乱码汉字。
         self.remote_formats_to_read.clear();
 
         // In this loop, we ignore some formats. There are two reasons for that:
@@ -482,7 +514,18 @@ impl WasmClipboard {
             self.remote_formats_to_read.push(format.id());
         }
 
-        return Ok(self.remote_formats_to_read.last().copied());
+        // 上一个请求还没回来：这里绝不能再发一个，否则两个响应无法区分，第二个就会
+        // 把 CF_HTML 的数据配给 CF_UNICODETEXT。把它标记作废，响应回来时整条丢弃，
+        // 再按这份新列表重新开始请求。
+        if self.pending_request.is_some() {
+            self.pending_is_stale = true;
+            return Ok(None);
+        }
+
+        // 从队尾取（与原实现一致）：先请求最后一个格式，响应后依次向前。
+        let next = self.remote_formats_to_read.pop();
+        self.pending_request = next;
+        return Ok(next);
 
         fn format_name_eq(format: &ClipboardFormat, name: &str) -> bool {
             format
@@ -493,7 +536,9 @@ impl WasmClipboard {
     }
 
     fn process_remote_data_response(&mut self, response: FormatDataResponse<'_>) -> anyhow::Result<()> {
-        let pending_format = match self.remote_formats_to_read.pop() {
+        // 响应里没有格式 id，只能和「最近一次发出的请求」配对。这一点必须靠
+        // 「同一时刻只有一个请求在飞」来保证，见 `pending_request` 的说明。
+        let pending_format = match self.pending_request.take() {
             Some(format) => format,
             None => {
                 warn!("Remote returned format data, but no formats were requested");
@@ -501,93 +546,120 @@ impl WasmClipboard {
             }
         };
 
-        if response.is_error() {
-            // Format is not available anymore.
+        // 这次请求是在上一份 FormatList 下发出的，数据属于旧剪贴板内容，整条丢弃，
+        // 否则旧内容会混进用户刚复制的新内容里。
+        if core::mem::take(&mut self.pending_is_stale) {
+            trace!(?pending_format, "Dropping clipboard data for a superseded format list");
+            self.request_next_format();
             return Ok(());
         }
 
-        let item = match pending_format {
-            ClipboardFormatId::CF_UNICODETEXT => match response.to_unicode_string() {
-                Ok(text) => Some(ClipboardItem::new_text(MIME_TEXT, text)),
-                Err(err) => {
-                    error!(error = %err, "CF_UNICODETEXT decode error");
-                    None
-                }
-            },
-            ClipboardFormatId::CF_DIB => match dib_to_png(response.data()) {
-                Ok(png) => Some(ClipboardItem::new_binary(MIME_PNG, png)),
-                Err(err) => {
-                    warn!(error = %err, "DIB decode error");
-                    None
-                }
-            },
-            ClipboardFormatId::CF_DIBV5 => match dibv5_to_png(response.data()) {
-                Ok(png) => Some(ClipboardItem::new_binary(MIME_PNG, png)),
-                Err(err) => {
-                    warn!(error = %err, "DIBv5 decode error");
-                    None
-                }
-            },
-            registered => {
-                let format_name = self.remote_mapping.get(&registered).map(|s| s.as_str());
-
-                match format_name {
-                    Some(FORMAT_WIN_HTML_NAME) => match cf_html_to_plain_html(response.data()) {
-                        Ok(text) => Some(ClipboardItem::new_text(MIME_HTML, text.to_owned())),
-                        Err(err) => {
-                            warn!(error = %err, "CF_HTML decode error");
-                            None
+        if !response.is_error() {
+            let item = match pending_format {
+                ClipboardFormatId::CF_UNICODETEXT => {
+                    // 防御：万一还是错位了（这里拿到的是 CF_HTML 的字节），不能按
+                    // UTF-16 解出一串汉字写进本地剪贴板，改按它真实的格式解析。
+                    if looks_like_cf_html(response.data()) {
+                        warn!("CF_UNICODETEXT carried CF_HTML data, decoding as HTML instead");
+                        match cf_html_to_plain_html(response.data()) {
+                            Ok(html) => Some(ClipboardItem::new_text(MIME_HTML, html.to_owned())),
+                            Err(err) => {
+                                warn!(error = %err, "CF_HTML decode error");
+                                None
+                            }
                         }
-                    },
-                    Some(FORMAT_MIME_HTML_NAME) => match response.to_string() {
-                        Ok(text) => Some(ClipboardItem::new_text(MIME_HTML, text)),
-                        Err(err) => {
-                            warn!(error = %err, "text/html decode error");
-                            None
+                    } else {
+                        match response.to_unicode_string() {
+                            Ok(text) => Some(ClipboardItem::new_text(MIME_TEXT, text)),
+                            Err(err) => {
+                                error!(error = %err, "CF_UNICODETEXT decode error");
+                                None
+                            }
                         }
-                    },
-                    Some(FORMAT_MIME_PNG_NAME) | Some(FORMAT_PNG_NAME) => {
-                        Some(ClipboardItem::new_binary(MIME_PNG, response.data().to_owned()))
                     }
-                    _ => {
-                        // Not supported format
+                }
+                ClipboardFormatId::CF_DIB => match dib_to_png(response.data()) {
+                    Ok(png) => Some(ClipboardItem::new_binary(MIME_PNG, png)),
+                    Err(err) => {
+                        warn!(error = %err, "DIB decode error");
                         None
                     }
-                }
-            }
-        };
+                },
+                ClipboardFormatId::CF_DIBV5 => match dibv5_to_png(response.data()) {
+                    Ok(png) => Some(ClipboardItem::new_binary(MIME_PNG, png)),
+                    Err(err) => {
+                        warn!(error = %err, "DIBv5 decode error");
+                        None
+                    }
+                },
+                registered => {
+                    let format_name = self.remote_mapping.get(&registered).map(|s| s.as_str());
 
-        if let Some(item) = item {
-            self.remote_clipboard.add(item);
+                    match format_name {
+                        Some(FORMAT_WIN_HTML_NAME) => match cf_html_to_plain_html(response.data()) {
+                            Ok(text) => Some(ClipboardItem::new_text(MIME_HTML, text.to_owned())),
+                            Err(err) => {
+                                warn!(error = %err, "CF_HTML decode error");
+                                None
+                            }
+                        },
+                        Some(FORMAT_MIME_HTML_NAME) => match response.to_string() {
+                            Ok(text) => Some(ClipboardItem::new_text(MIME_HTML, text)),
+                            Err(err) => {
+                                warn!(error = %err, "text/html decode error");
+                                None
+                            }
+                        },
+                        Some(FORMAT_MIME_PNG_NAME) | Some(FORMAT_PNG_NAME) => {
+                            Some(ClipboardItem::new_binary(MIME_PNG, response.data().to_owned()))
+                        }
+                        _ => {
+                            // Not supported format
+                            None
+                        }
+                    }
+                }
+            };
+
+            if let Some(item) = item {
+                self.remote_clipboard.add(item);
+            }
         }
 
-        if let Some(format) = self.remote_formats_to_read.last() {
-            // Request next format.
-            self.proxy
-                .send_cliprdr_message(ClipboardMessage::SendInitiatePaste(*format));
-        } else {
-            // All text/image formats were read, send clipboard data to JS.
-            let clipboard_data = core::mem::take(&mut self.remote_clipboard);
-
-            if !clipboard_data.is_empty() {
-                if let Err(e) = self.js_callbacks.on_remote_clipboard_changed.call1(
-                    &JsValue::NULL,
-                    &JsValue::from(crate::wasm_bridge::ClipboardData::from(clipboard_data)),
-                ) {
-                    error!(error = ?e, "Failed to call remote clipboard changed callback");
-                }
-            }
-
-            // Now trigger the deferred file list fetch if the FormatList included
-            // FileGroupDescriptorW. The cliprdr layer handles parsing the file
-            // descriptors and calling `on_remote_file_list()` automatically.
-            if let Some(file_format) = self.pending_file_list_paste.take() {
-                self.proxy
-                    .send_cliprdr_message(ClipboardMessage::SendInitiatePaste(file_format));
-            }
-        }
-
+        self.request_next_format();
         Ok(())
+    }
+
+    /// 请求列表里的下一个格式；全部读完后把结果交给 JS。
+    ///
+    /// 单个格式返回 error 时也继续往下走：否则一次失败会让整份剪贴板都推不出去。
+    fn request_next_format(&mut self) {
+        if let Some(format) = self.remote_formats_to_read.pop() {
+            self.pending_request = Some(format);
+            self.proxy
+                .send_cliprdr_message(ClipboardMessage::SendInitiatePaste(format));
+            return;
+        }
+
+        // All text/image formats were read, send clipboard data to JS.
+        let clipboard_data = core::mem::take(&mut self.remote_clipboard);
+
+        if !clipboard_data.is_empty() {
+            if let Err(e) = self.js_callbacks.on_remote_clipboard_changed.call1(
+                &JsValue::NULL,
+                &JsValue::from(crate::wasm_bridge::ClipboardData::from(clipboard_data)),
+            ) {
+                error!(error = ?e, "Failed to call remote clipboard changed callback");
+            }
+        }
+
+        // Now trigger the deferred file list fetch if the FormatList included
+        // FileGroupDescriptorW. The cliprdr layer handles parsing the file
+        // descriptors and calling `on_remote_file_list()` automatically.
+        if let Some(file_format) = self.pending_file_list_paste.take() {
+            self.proxy
+                .send_cliprdr_message(ClipboardMessage::SendInitiatePaste(file_format));
+        }
     }
 
     /// Process backend event. This method should be called from the main event loop.
@@ -1678,6 +1750,48 @@ mod tests {
         );
         // File format should be stored for deferred paste
         assert_eq!(clipboard.pending_file_list_paste, Some(ClipboardFormatId::new(0xC080)));
+    }
+
+    #[test]
+    fn test_second_format_list_does_not_double_request() {
+        // 浏览器复制时远端会连发两次 FormatList（先给基础格式，延迟渲染时再补）。
+        // 第二次到达时如果第一个响应还在路上，绝不能再发一个请求：两个响应无法
+        // 区分，第二个会把 CF_HTML 的字节配给 CF_UNICODETEXT，按 UTF-16 解出一串
+        // 汉字写进本地剪贴板，粘贴出来就是「敖獲潩㩮…」。
+        let (proxy, _rx) = create_test_proxy();
+        let callbacks = create_test_callbacks();
+        let mut clipboard = WasmClipboard::new(proxy, callbacks);
+
+        let formats = vec![
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+            ClipboardFormat::new(FORMAT_WIN_HTML_ID).with_name(ClipboardFormatName::new_static(FORMAT_WIN_HTML_NAME)),
+        ];
+
+        let first = clipboard.process_remote_clipboard_changed(formats.clone()).unwrap();
+        assert_eq!(first, Some(FORMAT_WIN_HTML_ID), "先请求队尾的 HTML Format");
+        assert_eq!(clipboard.pending_request, Some(FORMAT_WIN_HTML_ID));
+
+        let second = clipboard.process_remote_clipboard_changed(formats).unwrap();
+        assert_eq!(second, None, "已有请求在飞时不能再发");
+        assert!(clipboard.pending_is_stale, "在飞的请求应被标记作废");
+
+        // 迟到的 CF_HTML 响应必须整条丢弃，不能落到 CF_UNICODETEXT 上。
+        let cf_html = b"Version:0.9\r\nStartHTML:0000000107\r\nEndHTML:0000000123\r\n\
+StartFragment:0000000149\r\nEndFragment:0000000194\r\n\
+<html><body><!--StartFragment--><b>x</b><!--EndFragment--></body></html>";
+        clipboard
+            .process_remote_data_response(FormatDataResponse::new_data(cf_html.to_vec()))
+            .unwrap();
+
+        assert!(
+            clipboard.remote_clipboard.is_empty(),
+            "旧剪贴板内容不能混进新内容"
+        );
+        assert_eq!(
+            clipboard.pending_request,
+            Some(FORMAT_WIN_HTML_ID),
+            "丢弃后应按新列表重新开始请求"
+        );
     }
 
     #[test]
