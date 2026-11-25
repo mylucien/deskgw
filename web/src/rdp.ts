@@ -460,9 +460,16 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     }
     if (text) {
       remoteText = text
+      let written = true
       try { await navigator.clipboard.writeText(text) }
       catch (e: any) {
-        if (!copyViaTextarea(text)) log('warn', '写入本地剪贴板失败：' + (e?.message || e))
+        written = copyViaTextarea(text)
+        if (!written) log('warn', '写入本地剪贴板失败：' + (e?.message || e))
+      }
+      // 远端复制后本地到底拿到了什么，这条日志是唯一的现场证据：
+      // 内容正常说明链路已通，仍是「敖獲潩㩮…」这种就说明格式还配错着。
+      if (written) {
+        log('info', `远端剪贴板已写入本地（${text.length} 字）：${text.slice(0, 24)}`)
       }
     }
   }
