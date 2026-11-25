@@ -7,6 +7,7 @@ package tunnel
 
 import (
 	"database/sql"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -147,6 +148,15 @@ func (g *Gateway) Serve(w http.ResponseWriter, r *http.Request, sess *auth.Sessi
 	}
 	g.addLive(entry)
 
+	// 同一台 Windows 主机只允许一个交互式会话。上一次异常断开（浏览器直接关
+	// 标签、手机切网）时，网关这边的 TCP 可能还残留到读超时，远端仍认为旧会话
+	// 在线，新连接的 NLA 会被拒（STATUS_LOGON_FAILURE），表现为「必须重启网关
+	// 服务才能再连」。新隧道就绪后先收掉指向同一主机的旧隧道，让远端立即释放。
+	if n := g.supersedeHost(ticket.HostID, ticket.SessionID); n > 0 {
+		g.audit(sess.UserID, "rdp.supersede", h.Name,
+			fmt.Sprintf("关闭 %d 条同主机旧隧道", n), ticket.ClientIP)
+	}
+
 	var lastData atomic.Int64
 	lastData.Store(time.Now().UnixNano())
 
@@ -260,6 +270,14 @@ func (g *Gateway) CloseUser(userID int64) int {
 // CloseHost 强制断开指向某台主机的全部在线会话，返回断开数量。
 func (g *Gateway) CloseHost(hostID int64) int {
 	return g.closeWhere(func(e *liveSession) bool { return e.hostID == hostID })
+}
+
+// supersedeHost 收掉指向同一主机的其他在线隧道，返回关闭数量。
+// 新连接自己通过 keepID 排除在外。
+func (g *Gateway) supersedeHost(hostID, keepID int64) int {
+	return g.closeWhere(func(e *liveSession) bool {
+		return e.hostID == hostID && e.id != keepID
+	})
 }
 
 func (g *Gateway) closeWhere(match func(*liveSession) bool) int {

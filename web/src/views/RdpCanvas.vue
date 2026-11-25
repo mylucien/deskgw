@@ -21,8 +21,9 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { connectRdp, describeError, pickDesktopSize, resolveWsUrl } from '../rdp'
+import { connectRdp, describeError, isLogonFailure, pickDesktopSize, resolveWsUrl } from '../rdp'
 import type { InputMode, RdpSession } from '../rdp'
+import { post } from '../api'
 import { closeTab, wipeCreds } from '../sessionTabs'
 import type { TabInfo } from '../sessionTabs'
 import { state } from '../state'
@@ -45,6 +46,8 @@ const showFiles = ref(false)
 // iOS Safari（iPhone）没有网页全屏 API，退化成分页内的沉浸模式。
 const immersive = ref(false)
 let session: RdpSession | null = null
+// 自动重试是异步的，期间组件可能已被卸载，落笔前要检查。
+let unmounted = false
 
 // 触摸设备才显示指针/触摸切换与键盘按钮。触屏笔记本也满足条件。
 const touch = window.matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0
@@ -172,6 +175,55 @@ watch(() => props.active, async (v) => {
   if (v) { await nextTick(); fitViewport(); session?.focus() }
 })
 
+interface SessionTicket { session_id: number; ws_path: string }
+
+async function openSession(): Promise<RdpSession> {
+  if (!canvas.value) throw new Error('画布未就绪')
+  const creds = props.tab.creds
+  return connectRdp({
+    wsUrl: resolveWsUrl(props.tab.wsPath),
+    destination: props.tab.address,
+    fingerprintKey: 'host-' + props.tab.hostId,
+    canvas: canvas.value,
+    credentials: { username: creds.username, password: creds.password, domain: creds.domain },
+    width: vpWidth.value,
+    height: vpHeight.value,
+    allowClipboard: state.user?.allow_clipboard !== false,
+    inputMode: touch ? inputMode.value : undefined,
+    onLog: addLog,
+    onKeyboard: (open) => {
+      keyboardOpen.value = open
+      // 键盘收起后可视高度恢复，再补算一次分辨率（弹出期间是跳过的）。
+      if (!open) scheduleFit()
+    },
+  })
+}
+
+// 远端偶发在 NLA 阶段拒绝登录（STATUS_LOGON_FAILURE）。这类拒绝多半是上一次
+// 会话没干净退出、账户策略或主机刚唤醒造成的，隔一两秒重试往往就能过。票据是
+// 一次性的，重试前必须重新申请，否则网关只会回「连接票据无效」。
+const RETRY_DELAY = 2000
+async function connectWithRetry(): Promise<RdpSession> {
+  try {
+    return await openSession()
+  } catch (e) {
+    if (!isLogonFailure(e)) throw e
+    addLog('warn', '远端拒绝了本次登录，2 秒后重试一次…')
+    await new Promise<void>((r) => { window.setTimeout(r, RETRY_DELAY) })
+    if (unmounted) throw e
+    let t: SessionTicket
+    try {
+      t = await post<SessionTicket>('/sessions', { host_id: props.tab.hostId })
+    } catch {
+      // 拿不到新票据（例如并发上限）就保持原始错误，别让 429 盖掉真正原因。
+      throw e
+    }
+    props.tab.sessionId = t.session_id
+    props.tab.wsPath = t.ws_path
+    return openSession()
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('resize', scheduleFit)
   document.addEventListener('fullscreenchange', onFullscreenChange)
@@ -185,35 +237,21 @@ onMounted(async () => {
   }
   try {
     addLog('info', '正在加载 RDP 协议组件…')
-    if (!canvas.value) throw new Error('画布未就绪')
-    session = await connectRdp({
-      wsUrl: resolveWsUrl(props.tab.wsPath),
-      destination: props.tab.address,
-      fingerprintKey: 'host-' + props.tab.hostId,
-      canvas: canvas.value,
-      credentials: { username: creds.username, password: creds.password, domain: creds.domain },
-      width: vpWidth.value,
-      height: vpHeight.value,
-      allowClipboard: state.user?.allow_clipboard !== false,
-      inputMode: touch ? inputMode.value : undefined,
-      onLog: addLog,
-      onKeyboard: (open) => {
-        keyboardOpen.value = open
-        // 键盘收起后可视高度恢复，再补算一次分辨率（弹出期间是跳过的）。
-        if (!open) scheduleFit()
-      },
-    })
+    const s = await connectWithRetry()
+    // 重试期间用户可能已经关掉标签，别把会话挂在已卸载的组件上。
+    if (unmounted) { s.shutdown(); return }
+    session = s
     connected.value = true
     props.tab.status = 'connected'
     detail.value = '远程会话已建立'
     session.focus()
-    session.terminated.then((reason) => {
+    s.terminated.then((reason) => {
+      if (session === s) session = null
       connected.value = false
       if (props.tab.status !== 'disconnected') {
         props.tab.status = 'error'
         detail.value = '会话已结束：' + reason
       }
-      session = null
     })
   } catch (e: unknown) {
     props.tab.status = 'error'
@@ -223,6 +261,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  unmounted = true
   window.removeEventListener('resize', scheduleFit)
   if (fitTimer) window.clearTimeout(fitTimer)
   document.removeEventListener('fullscreenchange', onFullscreenChange)

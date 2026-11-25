@@ -163,6 +163,12 @@ export function describeError(e: unknown): string {
   return String(e)
 }
 
+// 远端在 NLA 阶段拒绝登录。与密码错误的 STATUS_WRONG_PASSWORD(0xc000006a)
+// 不是一回事：这个码多半是远端残留会话、账户策略或主机刚唤醒，重试有意义。
+export function isLogonFailure(e: unknown): boolean {
+  return /LogonFailure|STATUS_LOGON_FAILURE|0xc000006d/i.test(describeError(e))
+}
+
 // 远端桌面尺寸不能直接用浏览器 CSS 像素：手机 DPR 高、CSS 尺寸小（例如 390×780），
 // 这个值会被 Windows 收缩到最小分辨率，画面比例也对不上容器。这里按容器宽高比换算，
 // 短边不低于 640，长边不超过 maxLong，8 像素对齐（RDP 桌面尺寸的常见约束）。
@@ -492,6 +498,8 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   try {
     opened = await builder.connect()
   } catch (e) {
+    // 重试会重新走一遍 connectRdp，先把自绘光标摘掉，免得叠出第二层。
+    cursorEl.remove()
     throw new Error(describeError(e))
   }
   session = opened

@@ -93,3 +93,24 @@ func TestTicketUnknownToken(t *testing.T) {
 		t.Fatalf("未知票据应拒绝，实际 %v", err)
 	}
 }
+
+// 新连接建立时只收掉指向同一主机的旧隧道，别的目标和它自己都要留着。
+func TestSupersedeHost(t *testing.T) {
+	g := NewGateway(nil, nil, nil, nil)
+	var closed []int64
+	mk := func(id, hostID int64) {
+		e := &liveSession{id: id, hostID: hostID}
+		e.closeFn = func() { closed = append(closed, id) }
+		g.addLive(e)
+	}
+	mk(1, 100) // 同主机旧隧道，应被关闭
+	mk(2, 100) // 本次新连接，应保留
+	mk(3, 200) // 其他主机，应保留
+
+	if n := g.supersedeHost(100, 2); n != 1 {
+		t.Fatalf("应关闭 1 条同主机旧隧道，实际 %d", n)
+	}
+	if len(closed) != 1 || closed[0] != 1 {
+		t.Fatalf("应只关闭 id=1，实际 %v", closed)
+	}
+}
