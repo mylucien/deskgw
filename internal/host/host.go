@@ -268,3 +268,20 @@ func SetPerfKey(db *sql.DB, id int64, key []byte) error {
 	_, err := db.Exec(`UPDATE hosts SET perf_key=? WHERE id=?`, key, id)
 	return err
 }
+
+// PerfSecret 返回批准时记下的重连密钥（16 字节）。网关重启后靠它把回来的
+// 被控端认回原身份，不用管理员再批准一次。
+func PerfSecret(db *sql.DB, id int64) ([]byte, error) {
+	var secret []byte
+	err := db.QueryRow(`SELECT perf_secret FROM hosts WHERE id=?`, id).Scan(&secret)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return secret, err
+}
+
+// SetPerfSecret 记下（或更新）重连密钥。
+func SetPerfSecret(db *sql.DB, id int64, secret []byte) error {
+	_, err := db.Exec(`UPDATE hosts SET perf_secret=? WHERE id=?`, secret, id)
+	return err
+}

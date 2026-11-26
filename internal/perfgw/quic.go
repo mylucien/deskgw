@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -57,6 +58,13 @@ type Server struct {
 	// onPeer 在第一次（Noise XX）握手学到被控端公钥时被调用，用来记进数据库。
 	// 必须在 Start 之前设置。
 	onPeer func(code uint32, pub []byte)
+	// onAdopt 在进程重启后判断「这个控制码与重连密钥是不是一台批准过的主机」。
+	onAdopt func(code uint32, secret [16]byte) bool
+	// onApproved / onSecret 把批准结果与换新的重连密钥写回数据库。
+	onApproved func(hostID int64, secret [16]byte)
+	onSecret   func(hostID uint32, secret [16]byte)
+	// onRegister 在一台新被控端出现在待批准列表时被调用（写审计用）。
+	onRegister func(p Pending)
 
 	// conns 记录每个控制码当前挂在哪条 QUIC 连接上，用于发 Incoming 与收掉
 	// 同一台主机的旧连接：浏览器直接关标签或切换网络时，旧连接可能残留到空闲超时。
@@ -76,6 +84,81 @@ type hostConn struct {
 	conn *quic.Conn
 	sig  *quic.Stream
 	wmu  sync.Mutex
+
+	// subs 按会话号分拣被控端新开的单向流。AcceptUniStream 是整条连接共用
+	// 的，而一条连接上可能同时挂多个会话（同屏共享），所以必须在这里按流头
+	// 里的会话号分发，否则两个会话会互相抢流。
+	smu  sync.Mutex
+	subs map[uint64]chan sessionStream
+}
+
+// sessionStream 是被控端新开的一条单向流以及它的通道号（流头已经读掉）。
+type sessionStream struct {
+	rs   *quic.ReceiveStream
+	lane uint8
+}
+
+// subscribe 给一个会话开一条分发通道。缓冲几帧，免得接受循环被慢会话拖住。
+func (h *hostConn) subscribe(sid uint64) chan sessionStream {
+	ch := make(chan sessionStream, 16)
+	h.smu.Lock()
+	h.subs[sid] = ch
+	h.smu.Unlock()
+	return ch
+}
+
+// unsubscribe 注销会话，并把还没来得及取走的流取消掉。
+func (h *hostConn) unsubscribe(sid uint64) {
+	h.smu.Lock()
+	ch, ok := h.subs[sid]
+	if ok {
+		delete(h.subs, sid)
+	}
+	h.smu.Unlock()
+	if !ok {
+		return
+	}
+	for {
+		select {
+		case st := <-ch:
+			st.rs.CancelRead(0)
+		default:
+			return
+		}
+	}
+}
+
+// demux 把被控端新开的单向流按会话号交给对应会话；没有会话认领的直接丢弃。
+func (h *hostConn) demux() {
+	for {
+		rs, err := h.conn.AcceptUniStream(h.conn.Context())
+		if err != nil {
+			return
+		}
+		var hdr [sessionHeaderLen]byte
+		if _, err := io.ReadFull(rs, hdr[:]); err != nil {
+			rs.CancelRead(0)
+			continue
+		}
+		sid, lane, err := decodeSessionHeader(hdr[:])
+		if err != nil {
+			rs.CancelRead(0)
+			continue
+		}
+		h.smu.Lock()
+		ch := h.subs[sid]
+		h.smu.Unlock()
+		if ch == nil {
+			rs.CancelRead(0)
+			continue
+		}
+		select {
+		case ch <- sessionStream{rs: rs, lane: lane}:
+		default:
+			// 会话侧来不及取：丢掉这一帧，比卡住整条连接好（浏览器会请求关键帧）。
+			rs.CancelRead(0)
+		}
+	}
 }
 
 // sendSignal 往信令流写一条消息。
@@ -109,11 +192,18 @@ func New(cfg config.Config) (*Server, error) {
 		NextProtos:   []string{alpn},
 		MinVersion:   tls.VersionTLS13,
 	}, &quic.Config{
-		EnableDatagrams:       true,
-		HandshakeIdleTimeout:  10 * time.Second,
-		MaxIdleTimeout:        30 * time.Second,
+		EnableDatagrams: true,
+		// 被控端自己 8 秒放弃握手，这里留一点余量。
+		HandshakeIdleTimeout: 10 * time.Second,
+		MaxIdleTimeout:       45 * time.Second,
+		// 空闲桌面可能几十秒没有画面变化，靠 QUIC 心跳保住连接与 NAT 表项。
+		KeepAlivePeriod: 20 * time.Second,
+		// 每帧画面一条单向流，连续几帧同时在传是常事。
 		MaxIncomingStreams:    8,
-		MaxIncomingUniStreams: 1024,
+		MaxIncomingUniStreams: 64,
+		// 一帧上限 32MiB，接收窗口必须容得下整帧，否则读一半就卡住。
+		MaxStreamReceiveWindow:     36 << 20,
+		MaxConnectionReceiveWindow: 80 << 20,
 	})
 	if err != nil {
 		pc.Close()
@@ -138,6 +228,19 @@ func (s *Server) Listen() string { return s.cfg.PerfListen }
 // OnPeerKey 设置「学到被控端公钥」的回调。code 是主机 id（批准之后控制码
 // 就等于它）。必须在 Start 之前调用。
 func (s *Server) OnPeerKey(fn func(code uint32, pub []byte)) { s.onPeer = fn }
+
+// OnAdopt 设置「重启后认回已批准主机」的回调。返回 true 表示数据库里有这台
+// 主机且重连密钥一致。必须在 Start 之前调用。
+func (s *Server) OnAdopt(fn func(code uint32, secret [16]byte) bool) { s.onAdopt = fn }
+
+// OnApproved 设置批准之后持久化重连密钥的回调。必须在 Start 之前调用。
+func (s *Server) OnApproved(fn func(hostID int64, secret [16]byte)) { s.onApproved = fn }
+
+// OnSecret 设置重连密钥更换后的持久化回调（被控端本机换了控制码时会走 Rekey）。
+func (s *Server) OnSecret(fn func(hostID uint32, secret [16]byte)) { s.onSecret = fn }
+
+// OnRegister 设置「新被控端接入」的回调，用来写审计。
+func (s *Server) OnRegister(fn func(p Pending)) { s.onRegister = fn }
 
 // Start 启动接受连接与清理过期记录的循环。
 func (s *Server) Start() {
@@ -192,8 +295,12 @@ func (s *Server) Approve(code uint32, hostID int64) error {
 	if hostID <= 0 || hostID > math.MaxUint32 {
 		return errHostIDUsed
 	}
-	if err := s.reg.approve(code, uint32(hostID)); err != nil {
+	secret, err := s.reg.approve(code, uint32(hostID))
+	if err != nil {
 		return err
+	}
+	if s.onApproved != nil {
+		s.onApproved(hostID, secret)
 	}
 	s.cmu.Lock()
 	hc := s.conns[code]
@@ -274,16 +381,27 @@ func (s *Server) serve(conn *quic.Conn) {
 	if err != nil || msg.kind != msgRegister {
 		return
 	}
-	p, err := s.reg.claim(msg.reclaim, hello.name, hello.os, ip, time.Now().Unix())
+	p, created, err := s.reg.claim(msg.reclaim, hello.name, hello.os, ip,
+		time.Now().Unix(), s.onAdopt)
 	if err != nil {
 		return
 	}
 	if err := writeFrame(st, encodeRegistered(p.code, p.secret)); err != nil {
 		return
 	}
+	if created && s.onRegister != nil && !p.approved {
+		s.onRegister(Pending{
+			Code: p.code, Name: p.name, OS: p.os, IP: p.ip,
+			FirstSeen: p.firstSeen, LastSeen: p.lastSeen,
+		})
+	}
 	_ = st.SetDeadline(time.Time{})
 
-	hc := &hostConn{code: p.code, name: p.name, os: p.os, ip: ip, conn: conn, sig: st}
+	hc := &hostConn{
+		code: p.code, name: p.name, os: p.os, ip: ip, conn: conn, sig: st,
+		subs: map[uint64]chan sessionStream{},
+	}
+	go hc.demux()
 
 	s.cmu.Lock()
 	old := s.conns[p.code]
@@ -319,6 +437,9 @@ func (s *Server) serve(conn *quic.Conn) {
 				return
 			}
 			s.reg.setSecret(p.code, secret)
+			if p.approved && s.onSecret != nil {
+				s.onSecret(p.code, secret)
+			}
 			if err := hc.sendSignal(encodeRekeyed(secret)); err != nil {
 				return
 			}

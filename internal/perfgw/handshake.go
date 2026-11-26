@@ -35,6 +35,10 @@ const (
 var (
 	// errRefused 表示被控端明确拒绝了这次握手。
 	errRefused = errors.New("被控端拒绝了这次握手")
+	// errPairingRequired 是被控端拒绝的一种具体原因：它没有预置路由器的公钥。
+	// 单独分出来是为了让浏览器显示「该主机的性能模式尚未配置」，而不是笼统的
+	// 版本不匹配。
+	errPairingRequired = errors.New("被控端没有预置路由器的公钥")
 	// errVersion 表示会话版本对不上。
 	errVersion = errors.New("被控端的会话版本不匹配")
 )
@@ -52,7 +56,7 @@ func refusalError(r refusal) error {
 	case refusalIncompatible:
 		return fmt.Errorf("%w：没有双方都支持的会话版本", errRefused)
 	case refusalPairingRequired:
-		return fmt.Errorf("%w：这台被控端没有预置路由器的公钥，需要在它的 config.toml 里加 [[paired]]", errRefused)
+		return fmt.Errorf("%w：%w（需要在它的 config.toml 里加 [[paired]]）", errRefused, errPairingRequired)
 	default:
 		return fmt.Errorf("%w：未知原因 %d", errRefused, uint64(r))
 	}
@@ -276,6 +280,21 @@ type sessionKeys struct {
 	datagram [2][keyLen]byte
 	// video 是各路口径的接收密钥，只收不发。
 	video [][keyLen]byte
+}
+
+// wipe 清掉密钥。密钥包发给浏览器之后路由器就不再需要它们，留着只会在
+// 内存转储里多一份可解密画面的东西。
+func (s *sessionKeys) wipe() {
+	for i := range s.control {
+		s.control[i] = [keyLen]byte{}
+	}
+	for i := range s.datagram {
+		s.datagram[i] = [keyLen]byte{}
+	}
+	for i := range s.video {
+		s.video[i] = [keyLen]byte{}
+	}
+	s.hash = nil
 }
 
 // deriveSessionKeys 从握手哈希与两个方向的原始密钥派生全部通道密钥。

@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"database/sql"
@@ -76,6 +77,26 @@ func run(cfg config.Config) error {
 				if err := host.SetPerfKey(st.DB, int64(code), pub); err != nil {
 					log.Printf("性能模式：记录被控端公钥失败（主机 %d）: %v", code, err)
 				}
+			})
+			// 批准结果与重连密钥落库：网关重启后被控端带着控制码回来时能直接
+			// 认回身份，不用再批准一遍。
+			perf.OnAdopt(func(code uint32, secret [16]byte) bool {
+				want, err := host.PerfSecret(st.DB, int64(code))
+				return err == nil && len(want) == len(secret) &&
+					subtle.ConstantTimeCompare(want, secret[:]) == 1
+			})
+			perf.OnApproved(func(hostID int64, secret [16]byte) {
+				if err := host.SetPerfSecret(st.DB, hostID, secret[:]); err != nil {
+					log.Printf("性能模式：记录重连密钥失败（主机 %d）: %v", hostID, err)
+				}
+			})
+			perf.OnSecret(func(hostID uint32, secret [16]byte) {
+				if err := host.SetPerfSecret(st.DB, int64(hostID), secret[:]); err != nil {
+					log.Printf("性能模式：更新重连密钥失败（主机 %d）: %v", hostID, err)
+				}
+			})
+			perf.OnRegister(func(p perfgw.Pending) {
+				_ = audit.Write(st.DB, nil, "perf.host_register", p.Name, p.IP, p.IP)
 			})
 			perf.Start()
 			defer perf.Close()

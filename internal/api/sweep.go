@@ -54,6 +54,12 @@ func (s *Server) sweepStaleSessions() {
 	rows.Close()
 
 	live := s.gateway.LiveIDs()
+	// 性能模式的会话不走 RDP 隧道，得单独问一句，否则挂满 5 分钟就被误判成僵尸。
+	if s.perfConsole != nil {
+		for id := range s.perfConsole.LiveIDs() {
+			live[id] = true
+		}
+	}
 	for _, c := range list {
 		if c.state == "active" && (live[c.id] || c.startedAt >= staleCutoff) {
 			continue

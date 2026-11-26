@@ -36,7 +36,7 @@ const csrfCookie = "deskgw_csrf"
 const dummyHash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 // serverVersion 与 openwrt/Makefile 的 PKG_VERSION 保持一致，CI 会校验两者相同。
-const serverVersion = "0.3.20"
+const serverVersion = "0.3.21"
 
 // exportWriteTimeout 是审计导出每批写入的时限。客户端停止读取时，
 // 写操作会一直阻塞，handler 和数据库连接都释放不掉。
@@ -44,15 +44,16 @@ const exportWriteTimeout = 60 * time.Second
 
 // Server 保存 API 依赖。
 type Server struct {
-	db         *sql.DB
-	auth       *auth.Manager
-	cfg        config.Config
-	tickets    *tunnel.TicketManager
-	gateway    *tunnel.Gateway
-	fileTokens *filegw.TokenManager
-	uploads    *filegw.UploadManager
-	perf       *perfgw.Server
-	started    time.Time
+	db          *sql.DB
+	auth        *auth.Manager
+	cfg         config.Config
+	tickets     *tunnel.TicketManager
+	gateway     *tunnel.Gateway
+	fileTokens  *filegw.TokenManager
+	uploads     *filegw.UploadManager
+	perf        *perfgw.Server
+	perfConsole *perfgw.Console
+	started     time.Time
 }
 
 type ctxKey int
@@ -82,6 +83,9 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config, perf *perfgw.Server) 
 		})
 	// 收尾上一个进程遗留的会话，并周期清理未建立连接或已失联的僵尸记录。
 	s.startSessionSweeper()
+	if perf != nil {
+		s.wirePerfConsole()
+	}
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	// clientIP 直接取 r.RemoteAddr（真实 TCP 对端），不信任 X-Forwarded-For / X-Real-IP。
@@ -104,6 +108,7 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config, perf *perfgw.Server) 
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireSession)
 		r.Get("/ws/rdp", s.rdpWebSocket)
+		r.Get("/ws/perf", s.perfWebSocket)
 	})
 
 	r.Group(func(r chi.Router) {
@@ -113,6 +118,7 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config, perf *perfgw.Server) 
 		r.Get("/api/me", s.me)
 		r.Get("/api/hosts", s.myHosts)
 		r.Post("/api/sessions", s.createSession)
+		r.Post("/api/perf/ticket", s.perfTicket)
 
 		r.Route("/api/files", func(r chi.Router) {
 			r.Post("/token", s.createFileToken)
@@ -323,45 +329,72 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "badRequest", "请求格式不正确")
 		return
 	}
-	h, err := host.Get(s.db, in.HostID)
+	h, permitted := s.authorizeHost(w, sess, in.HostID)
+	if !permitted {
+		return
+	}
+	ip := clientIP(r)
+	sid, created := s.newPendingSession(w, sess, in.HostID, ip, "rdp")
+	if !created {
+		return
+	}
+	tok, err := s.tickets.Issue(sess.UserID, in.HostID, sid, ip)
+	if err != nil {
+		_, _ = s.db.Exec(`UPDATE sessions SET state='failed', ended_at=? WHERE id=?`,
+			time.Now().Unix(), sid)
+		serverError(w, err)
+		return
+	}
+	writeAudit(s, sess.UserID, "rdp.ticket", h.Name, strconv.FormatInt(sid, 10), ip)
+	ok(w, map[string]any{"ticket": tok, "session_id": sid, "ws_path": "/ws/rdp?ticket=" + tok})
+}
+
+// authorizeHost 校验主机存在、已启用、用户有权访问。失败时已经写好响应。
+func (s *Server) authorizeHost(w http.ResponseWriter, sess *auth.Session, hostID int64) (host.Host, bool) {
+	h, err := host.Get(s.db, hostID)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && !h.Enabled) {
 		fail(w, http.StatusNotFound, "notFound", "主机不存在或已停用")
-		return
+		return host.Host{}, false
 	}
 	if err != nil {
 		serverError(w, err)
-		return
+		return host.Host{}, false
 	}
 	if sess.Role != "admin" {
 		var granted int
 		if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_hosts WHERE user_id=? AND host_id=?`,
-			sess.UserID, in.HostID).Scan(&granted); err != nil {
+			sess.UserID, hostID).Scan(&granted); err != nil {
 			serverError(w, err)
-			return
+			return host.Host{}, false
 		}
 		if granted == 0 {
 			fail(w, http.StatusForbidden, "forbidden", "无权访问该主机")
-			return
+			return host.Host{}, false
 		}
 	}
+	return h, true
+}
+
+// newPendingSession 在并发上限内建一条 pending 会话记录，返回会话 id。
+//
+// 检查与插入必须原子：否则两个同时到达的请求都能读到同一个未达上限的计数，
+// 各自建一条会话，突破 max_sessions。超过 90 秒仍未升级为 WebSocket 的
+// pending 记录视为废票（票据 30 秒过期），不再占用名额，避免升级失败或
+// 客户端放弃后要等清理任务才释放。
+func (s *Server) newPendingSession(w http.ResponseWriter, sess *auth.Session, hostID int64, ip, mode string) (int64, bool) {
 	u, err := user.Get(s.db, sess.UserID)
 	if err != nil {
 		serverError(w, err)
-		return
+		return 0, false
 	}
 	limit := u.MaxSessions
 	if limit <= 0 {
 		limit = 2
 	}
-
-	// 并发上限的检查与建记录必须原子：否则两个同时到达的请求都能读到
-	// 同一个未达上限的计数，各自建一条会话，突破 max_sessions。
-	// 超过 90 秒仍未升级为 WebSocket 的 pending 记录视为废票（票据 30 秒过期），
-	// 不再占用名额，避免升级失败或客户端放弃后要等清理任务才释放。
 	tx, err := s.db.Begin()
 	if err != nil {
 		serverError(w, err)
-		return
+		return 0, false
 	}
 	defer tx.Rollback()
 	var active int
@@ -369,37 +402,29 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		WHERE user_id=? AND (state='active' OR (state='pending' AND started_at > ?))`,
 		sess.UserID, time.Now().Unix()-90).Scan(&active); err != nil {
 		serverError(w, err)
-		return
+		return 0, false
 	}
 	if active >= limit {
 		fail(w, http.StatusTooManyRequests, "limit", "已达到并发会话上限")
-		return
+		return 0, false
 	}
 	res, err := tx.Exec(`INSERT INTO sessions (user_id, host_id, client_ip, started_at, state, mode)
-		VALUES (?, ?, ?, ?, 'pending', 'rdp')`,
-		sess.UserID, in.HostID, clientIP(r), time.Now().Unix())
+		VALUES (?, ?, ?, ?, 'pending', ?)`,
+		sess.UserID, hostID, ip, time.Now().Unix(), mode)
 	if err != nil {
 		serverError(w, err)
-		return
+		return 0, false
 	}
 	sid, err := res.LastInsertId()
 	if err != nil {
 		serverError(w, err)
-		return
+		return 0, false
 	}
 	if err := tx.Commit(); err != nil {
 		serverError(w, err)
-		return
+		return 0, false
 	}
-	tok, err := s.tickets.Issue(sess.UserID, in.HostID, sid, clientIP(r))
-	if err != nil {
-		_, _ = s.db.Exec(`UPDATE sessions SET state='failed', ended_at=? WHERE id=?`,
-			time.Now().Unix(), sid)
-		serverError(w, err)
-		return
-	}
-	writeAudit(s, sess.UserID, "rdp.ticket", h.Name, strconv.FormatInt(sid, 10), clientIP(r))
-	ok(w, map[string]any{"ticket": tok, "session_id": sid, "ws_path": "/ws/rdp?ticket=" + tok})
+	return sid, true
 }
 
 // rdpWebSocket 将已登录的请求交给隧道网关处理。
@@ -785,17 +810,26 @@ func (s *Server) killSession(w http.ResponseWriter, r *http.Request) {
 		s.uploads.RevokeSession(id)
 	}
 	// 记录可能早已结束（僵尸），此时 CloseSession 不命中，但仍应尝试关闭潜在连接。
-	s.gateway.CloseSession(id)
-	writeAudit(s, idFromContext(r), "rdp.kill", strconv.FormatInt(id, 10), "", clientIP(r))
+	var mode string
+	_ = s.db.QueryRow(`SELECT mode FROM sessions WHERE id=?`, id).Scan(&mode)
+	if mode == "perf" {
+		if s.perfConsole != nil {
+			s.perfConsole.CloseSession(id)
+		}
+		writeAudit(s, idFromContext(r), "perf.kick", strconv.FormatInt(id, 10), "", clientIP(r))
+	} else {
+		s.gateway.CloseSession(id)
+		writeAudit(s, idFromContext(r), "rdp.kill", strconv.FormatInt(id, 10), "", clientIP(r))
+	}
 	ok(w, map[string]any{})
 }
 
 var allowedSettings = map[string]bool{
 	"session_idle_min":  true,
 	"max_upload_mb":     true,
-	"perf.enabled":      false, // M8 启用
-	"perf.max_sessions": false,
-	"perf.max_per_host": false,
+	"perf.enabled":      false, // 开关只在启动时读，改库不会拉起 QUIC 监听
+	"perf.max_sessions": true,
+	"perf.max_per_host": true,
 }
 
 func (s *Server) getSettings(w http.ResponseWriter, _ *http.Request) {
@@ -842,6 +876,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if k == "perf.max_sessions" || k == "perf.max_per_host" {
+			n, e := strconv.Atoi(v)
+			if e != nil || n <= 0 || n > 32 {
+				fail(w, http.StatusBadRequest, "invalid", "性能模式名额须为 1–32 之间的整数")
+				return
+			}
+		}
 		if k == "max_upload_mb" {
 			n, e := strconv.Atoi(v)
 			if e != nil || n <= 0 || n > 102400 {
@@ -864,6 +905,13 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		if n, e := strconv.Atoi(v); e == nil {
 			s.auth.SetIdle(n)
 		}
+	}
+	// 性能模式的并发上限同理：改完立刻对下一次连接生效。
+	if _, exists := in["perf.max_sessions"]; exists {
+		s.reloadPerfLimits()
+	}
+	if _, exists := in["perf.max_per_host"]; exists {
+		s.reloadPerfLimits()
 	}
 	writeAudit(s, idFromContext(r), "settings.update", strings.Join(keysOf(in), ","), "", clientIP(r))
 	ok(w, map[string]any{})

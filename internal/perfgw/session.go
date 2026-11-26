@@ -25,6 +25,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -174,6 +175,16 @@ func encodeIncoming(sessionID uint64, peer sessionPeer, observed *net.UDPAddr, i
 	return w.b, nil
 }
 
+// sessionIn 是被控端开的控制流。握手期间由 startSession 读，握手之后交给
+// 转发层继续读（控制通道上的 Hello、Displays、Cursor 等都从这里来）。
+type sessionIn struct {
+	r     io.Reader
+	close func()
+	// headerDone 表示 9 字节会话头已经被分拣器读掉了（真实 QUIC 路径）。
+	// 测试里直接给字节流，需要 startSession 自己读。
+	headerDone bool
+}
+
 // sessionWire 是建立会话时要用的三条流。
 //
 // ctrlIn 要等 Incoming 发出去、被控端才会开，所以给的是回调而不是现成的流；
@@ -183,82 +194,110 @@ type sessionWire struct {
 	// writeFrame 分「长度前缀」「负载」两次写，接成 io.Writer 就会被别的消息插进去。
 	signal  func(payload []byte) error
 	ctrlOut io.Writer
-	// accept 拿到被控端开的控制流，以及用完之后的清理函数。
-	accept func() (io.Reader, func(), error)
+	// accept 拿到被控端开的控制流。
+	accept func() (sessionIn, error)
 }
 
 // startSession 发 Incoming、在被控端开的控制流上走完握手、发出 Confirm，
-// 返回会话密钥。返回之后路由器就不再需要这些密钥（除了测试用的自检）。
-func startSession(sessionID uint64, hs *handshake, peer sessionPeer, observed *net.UDPAddr, w sessionWire) (*sessionKeys, error) {
+// 返回会话密钥与被控端的控制流。成功之后控制流归调用方所有，失败时在内部关掉。
+func startSession(sessionID uint64, hs *handshake, peer sessionPeer, observed *net.UDPAddr, w sessionWire) (*sessionKeys, sessionIn, error) {
 	init, err := hs.start()
 	if err != nil {
-		return nil, err
+		return nil, sessionIn{}, err
 	}
 	incoming, err := encodeIncoming(sessionID, peer, observed, init)
 	if err != nil {
-		return nil, err
+		return nil, sessionIn{}, err
 	}
 	if err := w.signal(incoming); err != nil {
-		return nil, fmt.Errorf("发送 Incoming: %w", err)
+		return nil, sessionIn{}, fmt.Errorf("发送 Incoming: %w", err)
 	}
 
 	// 本端控制流的会话头先写：XX 的被控端在这一步之后才等它。
 	if _, err := w.ctrlOut.Write(sessionHeader(sessionID, laneControl)); err != nil {
-		return nil, fmt.Errorf("写控制流的会话头: %w", err)
+		return nil, sessionIn{}, fmt.Errorf("写控制流的会话头: %w", err)
 	}
 
-	ctrlIn, release, err := w.accept()
+	in, err := w.accept()
 	if err != nil {
-		return nil, err
+		return nil, sessionIn{}, err
 	}
-	defer release()
-	if err := readSessionHeader(ctrlIn, sessionID, laneControl); err != nil {
-		return nil, err
+	if !in.headerDone {
+		if err := readSessionHeader(in.r, sessionID, laneControl); err != nil {
+			in.close()
+			return nil, sessionIn{}, err
+		}
 	}
 
-	reply, err := readFrame(ctrlIn, maxControlMsg)
+	reply, err := readFrame(in.r, maxControlMsg)
 	if err != nil {
-		return nil, fmt.Errorf("读被控端的握手回答: %w", err)
+		in.close()
+		return nil, sessionIn{}, fmt.Errorf("读被控端的握手回答: %w", err)
 	}
 	finish, err := hs.reply(reply)
 	if err != nil {
-		return nil, err
+		in.close()
+		return nil, sessionIn{}, err
 	}
 	if finish != nil {
 		if err := writeFrame(w.ctrlOut, finish); err != nil {
-			return nil, fmt.Errorf("发送 HandshakeFinish: %w", err)
+			in.close()
+			return nil, sessionIn{}, fmt.Errorf("发送 HandshakeFinish: %w", err)
 		}
 	}
 	if hs.pattern() == patternFirst {
-		verdict, err := readFrame(ctrlIn, maxControlMsg)
+		verdict, err := readFrame(in.r, maxControlMsg)
 		if err != nil {
-			return nil, fmt.Errorf("读被控端的决定: %w", err)
+			in.close()
+			return nil, sessionIn{}, fmt.Errorf("读被控端的决定: %w", err)
 		}
 		if err := hs.verdictReply(verdict); err != nil {
-			return nil, err
+			in.close()
+			return nil, sessionIn{}, err
 		}
 	}
 
 	keys, err := hs.keys()
 	if err != nil {
-		return nil, err
+		in.close()
+		return nil, sessionIn{}, err
 	}
 	// Confirm 是控制通道上第一帧密文，计数 0；被控端解开它才会显示这个控制端。
 	// 之后的帧（浏览器发的输入）从计数 1 接着往下。
 	if err := writeFrame(w.ctrlOut, seal(keys.control[0], 0, confirmMessage())); err != nil {
-		return nil, fmt.Errorf("发送 Confirm: %w", err)
+		in.close()
+		return nil, sessionIn{}, fmt.Errorf("发送 Confirm: %w", err)
 	}
-	return keys, nil
+	return keys, in, nil
 }
 
 // session 是一个已经握手完成的会话。密钥交给浏览器之后路由器就不再需要它们，
-// 只留下控制流用于转发；这里先保留，等转发层接上来。
+// 只留下两条控制流用于转发。
 type session struct {
 	id   uint64
 	host *hostConn
 	keys *sessionKeys
 	// ctrl 是本端开的控制流：已经有会话头与 Confirm，之后是浏览器发来的密文帧。
 	ctrl *quic.SendStream
+	// ctrlIn 是被控端开的控制流，握手的应答已经读掉，剩下的是控制通道密文帧。
+	ctrlIn io.Reader
+	// conn 是这台被控端的 QUIC 连接：会话结束时只能取消本会话的流，不能关它。
+	conn *quic.Conn
+	// streams 是被控端后续开的单向流，按会话号分拣后送到这里。
+	streams chan sessionStream
+	// release 注销分发通道。用 sync.Once 包着，会话结束调几次都行。
+	release func()
+}
+
+// close 取消本会话的所有流并注销分发通道，不影响这台被控端上的其他会话。
+func (s *session) close() {
+	s.ctrl.CancelWrite(0)
+	if rs, ok := s.ctrlIn.(*quic.ReceiveStream); ok {
+		rs.CancelRead(0)
+	}
+	if s.release != nil {
+		s.release()
+	}
 }
 
 // StartSession 让指定控制码的被控端开一个会话：发 Incoming、走完端到端握手、
@@ -299,23 +338,51 @@ func (s *Server) StartSession(code uint32, peer sessionPeer, intro controllerInt
 	}()
 
 	sid := s.sid.Add(1)
+	streams := hc.subscribe(sid)
+	release := sync.OnceFunc(func() { hc.unsubscribe(sid) })
+	keep := false
+	defer func() {
+		if !keep {
+			release()
+		}
+	}()
+
 	hs := newHandshake(s.id, peerKey, intro)
-	keys, err := startSession(sid, hs, peer, observed, sessionWire{
+	keys, in, err := startSession(sid, hs, peer, observed, sessionWire{
 		signal:  hc.sendSignal,
 		ctrlOut: ctrl,
-		accept: func() (io.Reader, func(), error) {
-			ctx, cancel := context.WithTimeout(context.Background(), stepTimeout)
-			defer cancel()
-			rs, err := hc.conn.AcceptUniStream(ctx)
-			if err != nil {
-				return nil, nil, fmt.Errorf("被控端没有开控制流: %w", err)
+		accept: func() (sessionIn, error) {
+			// 被控端开的第一条单向流必须是控制通道。分拣器可能先送进来
+			// 别的通道（理论上不会），直接丢掉继续等。
+			timer := time.NewTimer(stepTimeout)
+			defer timer.Stop()
+			for {
+				select {
+				case st := <-streams:
+					if st.lane != laneControl {
+						st.rs.CancelRead(0)
+						continue
+					}
+					_ = st.rs.SetReadDeadline(deadline)
+					return sessionIn{
+						r:          st.rs,
+						close:      func() { st.rs.CancelRead(0) },
+						headerDone: true,
+					}, nil
+				case <-timer.C:
+					return sessionIn{}, errors.New("被控端没有开控制流")
+				case <-hc.conn.Context().Done():
+					return sessionIn{}, errHostOffline
+				}
 			}
-			_ = rs.SetReadDeadline(deadline)
-			return rs, func() { rs.CancelRead(0) }, nil
 		},
 	})
 	if err != nil {
 		return nil, err
+	}
+	// 握手用的读超时到此为止：控制流后面要一直挂着等被控端的消息。
+	if rs, ok := in.r.(*quic.ReceiveStream); ok {
+		_ = rs.SetReadDeadline(time.Time{})
 	}
 	done = true
 	// 第一次（XX）握手顺手学到被控端公钥：记进 hosts.perf_key，下次就走 IK。
@@ -323,6 +390,10 @@ func (s *Server) StartSession(code uint32, peer sessionPeer, intro controllerInt
 	if peerKey == nil && s.onPeer != nil && hs.noise.peerKey != nil {
 		s.onPeer(code, hs.noise.peerKey.Bytes())
 	}
+	keep = true
 	log.Printf("性能模式：会话 %d 建立（%s，安全码 %s）", sid, hc.name, keys.safety)
-	return &session{id: sid, host: hc, keys: keys, ctrl: ctrl}, nil
+	return &session{
+		id: sid, host: hc, keys: keys, ctrl: ctrl, ctrlIn: in.r, conn: hc.conn,
+		streams: streams, release: release,
+	}, nil
 }

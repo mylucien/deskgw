@@ -4,11 +4,118 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/mylucien/deskgw/internal/host"
+	"github.com/mylucien/deskgw/internal/perfgw"
 )
+
+// wirePerfConsole 把性能模式接到 API：票据、主机信息、会话记录与审计都
+// 以回调注入，perfgw 本身不碰数据库。
+func (s *Server) wirePerfConsole() {
+	c := perfgw.NewConsole(s.perf, perfgw.NewTicketManager(30*time.Second), perfgw.NewLimits(0, 0))
+	c.Host = func(id int64) (perfgw.HostInfo, error) {
+		h, err := host.Get(s.db, id)
+		if err != nil {
+			return perfgw.HostInfo{}, err
+		}
+		key, err := host.PerfKey(s.db, id)
+		if err != nil {
+			return perfgw.HostInfo{}, err
+		}
+		return perfgw.HostInfo{
+			ID: h.ID, Name: h.Name, OS: h.PerfOS, Modes: h.Modes,
+			Enabled: h.Enabled, PerfKey: key,
+		}, nil
+	}
+	c.Begin = func(sid int64) {
+		_, _ = s.db.Exec(`UPDATE sessions SET state='active' WHERE id=? AND ended_at IS NULL`, sid)
+	}
+	c.End = func(sid int64, state, detail string) {
+		_, _ = s.db.Exec(`UPDATE sessions SET state=?, ended_at=?, detail=?
+			WHERE id=? AND ended_at IS NULL`,
+			state, time.Now().Unix(), clipText(detail, 512), sid)
+	}
+	c.Audit = func(uid int64, action, target, detail, ip string) {
+		writeAudit(s, uid, action, target, detail, ip)
+	}
+	s.perfConsole = c
+	s.reloadPerfLimits()
+}
+
+// reloadPerfLimits 从 settings 读性能模式的并发上限。没设过就用 perfgw 的默认值。
+func (s *Server) reloadPerfLimits() {
+	if s.perfConsole == nil {
+		return
+	}
+	s.perfConsole.Limits().Set(
+		s.settingInt("perf.max_sessions", 0),
+		s.settingInt("perf.max_per_host", 0))
+}
+
+// clipText 截断详情，并避开 UTF-8 字符中间。
+func clipText(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && s[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return s[:cut]
+}
+
+// perfTicket 校验权限、会话名额与主机状态后签发一次性性能模式票据。
+func (s *Server) perfTicket(w http.ResponseWriter, r *http.Request) {
+	if s.perfConsole == nil {
+		fail(w, http.StatusNotFound, "disabled", "性能模式没有启用")
+		return
+	}
+	var in struct {
+		HostID int64 `json:"host_id"`
+	}
+	if err := readJSON(r, &in); err != nil || in.HostID < 1 {
+		fail(w, http.StatusBadRequest, "badRequest", "请求格式不正确")
+		return
+	}
+	sess := fromContext(r.Context())
+	h, permitted := s.authorizeHost(w, sess, in.HostID)
+	if !permitted {
+		return
+	}
+	if !hasMode(h.Modes, "perf") {
+		// 没开性能模式的主机不暴露「它存在但不可用」，与 RDP 那边一致。
+		fail(w, http.StatusNotFound, "notFound", "这台主机没有启用性能模式")
+		return
+	}
+	ip := clientIP(r)
+	sid, created := s.newPendingSession(w, sess, in.HostID, ip, "perf")
+	if !created {
+		return
+	}
+	tok, err := s.perfConsole.Tickets().Issue(sess.UserID, in.HostID, sid, ip)
+	if err != nil {
+		_, _ = s.db.Exec(`UPDATE sessions SET state='failed', ended_at=? WHERE id=?`,
+			time.Now().Unix(), sid)
+		serverError(w, err)
+		return
+	}
+	ok(w, map[string]any{"ticket": tok, "session_id": sid, "ws_path": "/ws/perf?ticket=" + tok})
+}
+
+// perfWebSocket 把已登录的请求交给性能模式控制台。
+func (s *Server) perfWebSocket(w http.ResponseWriter, r *http.Request) {
+	if s.perfConsole == nil {
+		http.Error(w, "性能模式没有启用", http.StatusNotFound)
+		return
+	}
+	sess := fromContext(r.Context())
+	s.perfConsole.Serve(w, r, perfgw.ConsoleClient{
+		UserID: sess.UserID, Username: sess.Username, ClientIP: clientIP(r),
+	})
+}
 
 // perfStatus 返回性能模式的运行状态与待批准列表。证书指纹要写进每台被控端
 // 的 server_fp，控制端公钥要写进 [[paired]].key，两者都和监听地址一起给出来，

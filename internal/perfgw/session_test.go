@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -102,14 +101,14 @@ func TestSeal(t *testing.T) {
 }
 
 // scriptedStream 冒充被控端开的控制流：先给会话头，再给预先准备好的几帧。
-func scriptedStream(sessionID uint64, frames ...[]byte) func() (io.Reader, func(), error) {
+func scriptedStream(sessionID uint64, frames ...[]byte) func() (sessionIn, error) {
 	var buf bytes.Buffer
 	buf.Write(sessionHeader(sessionID, laneControl))
 	for _, f := range frames {
 		_ = writeFrame(&buf, f)
 	}
-	return func() (io.Reader, func(), error) {
-		return bytes.NewReader(buf.Bytes()), func() {}, nil
+	return func() (sessionIn, error) {
+		return sessionIn{r: bytes.NewReader(buf.Bytes()), close: func() {}}, nil
 	}
 }
 
@@ -135,7 +134,7 @@ func TestStartSessionIK(t *testing.T) {
 		reply = w.b
 	}
 
-	keys, err := startSession(sid, hs,
+	keys, in, err := startSession(sid, hs,
 		sessionPeer{name: "PC", ip: net.ParseIP("192.168.1.5")},
 		&net.UDPAddr{IP: net.ParseIP("192.168.1.10"), Port: 51234},
 		sessionWire{
@@ -146,6 +145,7 @@ func TestStartSessionIK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("握手失败: %v", err)
 	}
+	defer in.close()
 	if keys.safety != vecIKSafety {
 		t.Fatalf("安全码不对: %s", keys.safety)
 	}
@@ -207,7 +207,7 @@ func TestStartSessionXX(t *testing.T) {
 
 	const sid = 7
 	var sig, ctrl bytes.Buffer
-	keys, err := startSession(sid, hs,
+	keys, in, err := startSession(sid, hs,
 		sessionPeer{name: "PC", ip: net.ParseIP("192.168.1.5")},
 		&net.UDPAddr{IP: net.ParseIP("192.168.1.10"), Port: 51234},
 		sessionWire{
@@ -218,6 +218,7 @@ func TestStartSessionXX(t *testing.T) {
 	if err != nil {
 		t.Fatalf("握手失败: %v", err)
 	}
+	defer in.close()
 	if keys.safety != vecXXSafety {
 		t.Fatalf("安全码不对: %s", keys.safety)
 	}

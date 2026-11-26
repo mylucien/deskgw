@@ -59,32 +59,35 @@ func newRegistry() *registry {
 }
 
 // claim 按上一次的控制码与密钥找回记录；对不上就新分配一个控制码。
-func (g *registry) claim(rc *reclaim, name, os, ip string, now int64) (*pending, error) {
+//
+// adopt 用于进程重启之后：内存表是空的，但批准结果在数据库里，凭控制码
+// （= 主机 id）与重连密钥就能认回原来的身份，不必让管理员重新批准一遍。
+// 它可能查库，所以只在持锁之外调用。
+// 返回值 created 表示这是一条新记录（用于写 perf.host_register 审计）。
+func (g *registry) claim(rc *reclaim, name, os, ip string, now int64, adopt func(uint32, [16]byte) bool) (*pending, bool, error) {
 	// 名称与系统由对端填写，最长可以到一条信令帧的上限。截断到 64 个字符：
 	// 界面显示足够，也不至于让一批未批准的连接把路由器的内存占满。
 	name, os = clip(name, 64), clip(os, 64)
-	g.mu.Lock()
-	defer g.mu.Unlock()
 	if rc != nil {
-		code := rc.code
-		if a, ok := g.alias[code]; ok {
-			code = a
+		if p := g.reclaim(rc, name, os, ip, now); p != nil {
+			return p, false, nil
 		}
-		if p, ok := g.entries[code]; ok && p.secret == rc.secret {
-			p.name, p.os, p.ip = name, os, ip
-			p.lastSeen = now
-			p.online = true
-			out := *p
-			return &out, nil
+		if rc.code < pendingCodeBase && adopt != nil && adopt(rc.code, rc.secret) {
+			if p := g.adopt(rc, name, os, ip, now); p != nil {
+				return p, false, nil
+			}
 		}
 	}
+	g.mu.Lock()
 	code := g.alloc()
 	if code == 0 {
-		return nil, errNoCode
+		g.mu.Unlock()
+		return nil, false, errNoCode
 	}
 	secret, err := newSecret()
 	if err != nil {
-		return nil, err
+		g.mu.Unlock()
+		return nil, false, err
 	}
 	p := &pending{
 		code: code, name: name, os: os, ip: ip,
@@ -92,7 +95,49 @@ func (g *registry) claim(rc *reclaim, name, os, ip string, now int64) (*pending,
 	}
 	g.entries[code] = p
 	out := *p
-	return &out, nil
+	g.mu.Unlock()
+	return &out, true, nil
+}
+
+// reclaim 在内存表里按控制码与密钥找回记录；对不上返回 nil。
+func (g *registry) reclaim(rc *reclaim, name, os, ip string, now int64) *pending {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	code := rc.code
+	if a, ok := g.alias[code]; ok {
+		code = a
+	}
+	p, ok := g.entries[code]
+	if !ok || p.secret != rc.secret {
+		return nil
+	}
+	p.name, p.os, p.ip = name, os, ip
+	p.lastSeen = now
+	p.online = true
+	out := *p
+	return &out
+}
+
+// adopt 把数据库里已批准的主机放回内存表。
+func (g *registry) adopt(rc *reclaim, name, os, ip string, now int64) *pending {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if p, ok := g.entries[rc.code]; ok {
+		// 并发注册抢到了同一个码：只认同一个密钥。
+		if p.secret != rc.secret {
+			return nil
+		}
+		p.online, p.lastSeen = true, now
+		out := *p
+		return &out
+	}
+	p := &pending{
+		code: rc.code, name: name, os: os, ip: ip, secret: rc.secret,
+		firstSeen: now, lastSeen: now, online: true, approved: true,
+	}
+	g.entries[rc.code] = p
+	out := *p
+	return &out
 }
 
 // alloc 找一个还没用过的控制码。调用方已持有锁。
@@ -139,18 +184,18 @@ func (g *registry) dropLocked(code uint32) {
 // approve 把待批准记录换成正式主机：控制码改成 hosts.id，密钥不变，
 // 旧控制码留作别名。调用方随后要断开这条连接，让被控端带着旧控制码重连、
 // 从 Registered 里拿到新控制码。
-func (g *registry) approve(code, hostID uint32) error {
+func (g *registry) approve(code, hostID uint32) ([16]byte, error) {
 	if hostID == 0 || hostID >= pendingCodeBase {
-		return errNoCode
+		return [16]byte{}, errNoCode
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	p, ok := g.entries[code]
 	if !ok || p.approved {
-		return errNoPending
+		return [16]byte{}, errNoPending
 	}
 	if other, used := g.entries[hostID]; used && other != p {
-		return errHostIDUsed
+		return [16]byte{}, errHostIDUsed
 	}
 	delete(g.entries, code)
 	p.code = hostID
@@ -158,7 +203,7 @@ func (g *registry) approve(code, hostID uint32) error {
 	p.online = false
 	g.entries[hostID] = p
 	g.alias[code] = hostID
-	return nil
+	return p.secret, nil
 }
 
 // get 按控制码取一条记录（用来在批准前读出名称、系统与来源地址）。
