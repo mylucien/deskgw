@@ -7,12 +7,14 @@ package perfgw
 
 import (
 	"context"
+	"crypto/ecdh"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -46,20 +48,47 @@ type Server struct {
 	ln   *quic.Listener
 	reg  *registry
 	fp   string
+	id   *ecdh.PrivateKey
 	lim  *limiter
 	stop chan struct{}
 	once sync.Once
+	sid  atomic.Uint64
 
-	// conns 记录每个控制码当前挂在哪条 QUIC 连接上，用于收掉同一台主机的
-	// 旧连接：浏览器直接关标签或切换网络时，旧连接可能残留到空闲超时。
+	// conns 记录每个控制码当前挂在哪条 QUIC 连接上，用于发 Incoming 与收掉
+	// 同一台主机的旧连接：浏览器直接关标签或切换网络时，旧连接可能残留到空闲超时。
 	cmu   sync.Mutex
-	conns map[uint32]*quic.Conn
+	conns map[uint32]*hostConn
+}
+
+// hostConn 是一台在线被控端的连接。
+//
+// 信令流只有一个读者（serve 里的循环），但写有两处：serve 回答 Rekey、
+// 别的 goroutine 发 Incoming。帧是整体的，不能交叉写，所以加锁。
+type hostConn struct {
+	code uint32
+	name string
+	os   string
+	ip   string
+	conn *quic.Conn
+	sig  *quic.Stream
+	wmu  sync.Mutex
+}
+
+// sendSignal 往信令流写一条消息。
+func (h *hostConn) sendSignal(msg []byte) error {
+	h.wmu.Lock()
+	defer h.wmu.Unlock()
+	return writeFrame(h.sig, msg)
 }
 
 // New 读取（或生成）证书并绑定 UDP 端口。端口占用时返回错误，是否让整个
 // 网关因此启动失败由调用方决定。
 func New(cfg config.Config) (*Server, error) {
 	cert, fp, err := loadOrCreateCert(cfg.PerfCert, cfg.PerfKey)
+	if err != nil {
+		return nil, err
+	}
+	id, err := loadOrCreateIdentity(cfg.PerfIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -87,13 +116,17 @@ func New(cfg config.Config) (*Server, error) {
 		return nil, fmt.Errorf("启动 QUIC 监听: %w", err)
 	}
 	return &Server{
-		cfg: cfg, ln: ln, reg: newRegistry(), fp: fp, lim: newLimiter(),
-		stop: make(chan struct{}), conns: map[uint32]*quic.Conn{},
+		cfg: cfg, ln: ln, reg: newRegistry(), fp: fp, id: id, lim: newLimiter(),
+		stop: make(chan struct{}), conns: map[uint32]*hostConn{},
 	}, nil
 }
 
 // Fingerprint 返回证书指纹，需要写进每台被控端的 server_fp。
 func (s *Server) Fingerprint() string { return s.fp }
+
+// Identity 返回控制端公钥（64 位小写十六进制），需要写进每台被控端
+// config.toml 的 [[paired]].key。丢了私钥文件就要重新预置所有被控端。
+func (s *Server) Identity() string { return identityPublic(s.id) }
 
 // Listen 返回实际的监听地址。
 func (s *Server) Listen() string { return s.cfg.PerfListen }
@@ -111,8 +144,8 @@ func (s *Server) Close() error {
 		close(s.stop)
 		err = s.ln.Close()
 		s.cmu.Lock()
-		for code, conn := range s.conns {
-			_ = conn.CloseWithError(1, "server shutting down")
+		for code, hc := range s.conns {
+			_ = hc.conn.CloseWithError(1, "server shutting down")
 			delete(s.conns, code)
 		}
 		s.cmu.Unlock()
@@ -210,12 +243,14 @@ func (s *Server) serve(conn *quic.Conn) {
 	}
 	_ = st.SetDeadline(time.Time{})
 
+	hc := &hostConn{code: p.code, name: p.name, os: p.os, ip: ip, conn: conn, sig: st}
+
 	s.cmu.Lock()
 	old := s.conns[p.code]
-	s.conns[p.code] = conn
+	s.conns[p.code] = hc
 	s.cmu.Unlock()
-	if old != nil && old != conn {
-		_ = old.CloseWithError(1, "superseded")
+	if old != nil && old.conn != conn {
+		_ = old.conn.CloseWithError(1, "superseded")
 	}
 
 	log.Printf("性能模式：被控端接入 %s（%s，%s），控制码 %d", p.name, p.os, ip, p.code)
@@ -244,7 +279,7 @@ func (s *Server) serve(conn *quic.Conn) {
 				return
 			}
 			s.reg.setSecret(p.code, secret)
-			if err := writeFrame(st, encodeRekeyed(secret)); err != nil {
+			if err := hc.sendSignal(encodeRekeyed(secret)); err != nil {
 				return
 			}
 		}
@@ -254,7 +289,7 @@ func (s *Server) serve(conn *quic.Conn) {
 // detach 只在当前连接仍属于这个控制码时清理，避免把新连接的状态删掉。
 func (s *Server) detach(code uint32, conn *quic.Conn, name string) {
 	s.cmu.Lock()
-	if s.conns[code] == conn {
+	if hc := s.conns[code]; hc != nil && hc.conn == conn {
 		delete(s.conns, code)
 	}
 	s.cmu.Unlock()

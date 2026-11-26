@@ -118,11 +118,47 @@ Confirm         = a0                                 # 空映射
 （`ControllerIntro` 是 6 或 7 项，`QualitySettings` 是 5 或 6 项）。读的时候按剩余项数判断，
 不能假定固定长度。
 
+## 会话建立顺序
+
+对着 `host/streams.rs` 的 `HostStreams::open` 与 `secure.rs` 的 `respond` 读出来的，
+`session.go` 按这个顺序写：
+
+1. 路由器在信令流上发 `Incoming`，`init` 是 `HandshakeInit`。
+2. 被控端**立刻**开本端的控制流（9 字节会话头 + 长度前缀帧），握手回答写在里面 ——
+   不是路由器先开、被控端后开。
+3. `Pattern::Known`（IK）：被控端只回一条 `HandshakeReply`，里面同时有 `noise`（第 2 条）
+   和 `verdict`。`Pattern::First`（XX）：第一条只有 `noise`，路由器要开自己的控制流、
+   写 `HandshakeFinish`（负载是 `ControllerIntro`），被控端才回第二条带 `verdict` 的。
+   **XX 里流要在读决定之前开**，否则被控端在 `first_stream` 上一直等。
+4. `verdict` 是 `HostVerdict` 的密封单元：控制通道「被控端→控制端」的密钥、计数 0。
+5. 路由器在自己的控制流上写 `Confirm`（空映射 `a0`）：控制通道「控制端→被控端」的
+   密钥、计数 0。被控端解开它才会在托盘显示这个控制端。
+
+- 握手的这几帧是**明文** CBOR（带长度前缀），`Confirm` 才是这条流上第一帧密文。
+- 之后浏览器发的控制帧从计数 1 接着往下。
+- `noiseMaxMsg` = 16 KiB 是单条 Noise 消息的上限；控制通道一帧的上限是 64 KiB。
+
+## 控制端身份密钥
+
+- 路由器有一把长期 X25519 私钥（`perf_identity`，首次启动生成，权限 600），
+  公钥（64 位小写十六进制）要写进每台被控端 `config.toml`：
+
+  ```toml
+  [[paired]]
+  key = "<公钥>"
+  name = "deskgw"
+  since = 0
+  ```
+
+- 被控端的 `gate.is_known(控制端公钥)` 是硬门槛，`Pattern::First` 也要过这一关；
+  不在 `[[paired]]` 里就回 `Refusal::PairingRequired`（1）。
+- 私钥丢了或换掉，所有被控端都要重新预置 —— 它比证书更要紧，证书只影响传输层。
+
 ## 仍待实机验证
 
-- 真实被控端用 `Pattern::Known`（Noise IK）连上来握手 —— 黄金向量已逐字节对上，
+- 真实被控端连上来走完 `Incoming` → XX → `Confirm`，看托盘是否出现控制端。
+- 被控端用 `Pattern::Known`（Noise IK）时的字节一致性 —— 黄金向量已对上，
   还差一次真机联调。
 - `ReplayWindow`（128 位窗口）与计数起点：控制通道两个方向各先用掉计数 0
   （`Confirm` 与被控端的决定），浏览器侧收发都从 1 开始。
-- 流内的长度前缀在握手之后仍然逐帧存在，`Confirm` 是控制通道上的第一帧密文。
 - CBOR 用真实被控端抓包再对一遍（当前只有上游仓库的黄金字节）。

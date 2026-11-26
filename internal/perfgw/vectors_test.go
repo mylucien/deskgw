@@ -48,4 +48,11 @@ const (
 	vecIKSafety = "649-788"
 	// vecIKVerdictSealed IK 里被控端加密的决定：明文 8101，控制通道收方向、计数 0
 	vecIKVerdictSealed = "e52aae2a46f546c7db6a25fe59f8d6cdd1670000000000000000"
+	// vecIKConfirmSealed 控制端的 Confirm：明文 a0，控制通道发方向、计数 0
+	vecIKConfirmSealed = "1ae995928eaa0af5b917763f3bdbee8c750000000000000000"
+	// vecIncoming ServerMsg::Incoming：会话号 0x1122334455667788、对端 PC/192.168.1.5、
+	// 观察地址 192.168.1.10:51234、init 是 aabbcc
+	vecIncoming = "8203841b112233445566778882625043820044c0a8010582008244c0a8010a19c82243aabbcc"
+	// vecIncomingV6 同上但都是 IPv6、名称为空、init 为空
+	vecIncomingV6 = "82038401826082015020010db80000000000000000000000018201825020010db800000000000000000000000219115140"
 )

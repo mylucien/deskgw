@@ -247,6 +247,24 @@ func openSealed(key [keyLen]byte, data []byte) ([]byte, error) {
 	return plain, nil
 }
 
+// seal 生成一个密封单元：密文 | 16 字节标签 | 8 字节计数（小端）。
+// 与 openSealed 是一对；浏览器那边用 WebCrypto 做同样的事（去掉末尾 8 字节）。
+func seal(key [keyLen]byte, counter uint64, plain []byte) []byte {
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		// 密钥长度是常量，不会失败。
+		panic("aes: " + err.Error())
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		panic("aes-gcm: " + err.Error())
+	}
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], counter)
+	out := gcm.Seal(nil, nonce[:], plain, nil)
+	return binary.LittleEndian.AppendUint64(out, counter)
+}
+
 // sessionKeys 是握手之后路由器手里的密钥。方向按路由器算：sent 是发往被控端，
 // recv 是收自被控端。
 type sessionKeys struct {

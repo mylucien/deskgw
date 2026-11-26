@@ -16,3 +16,6 @@ config deskgw 'main'
 	option perf_listen '0.0.0.0:4433'
 	option perf_cert '/etc/deskgw/perf.crt'
 	option perf_key '/etc/deskgw/perf.key'
+	# 路由器作为控制端的 X25519 私钥，首次启动自动生成（权限 600）。
+	# 它的公钥要写进每台被控端 config.toml 的 [[paired]].key；丢了要重新预置所有被控端。
+	option perf_identity '/etc/deskgw/perf_identity'

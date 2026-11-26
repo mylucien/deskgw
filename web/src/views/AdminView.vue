@@ -97,6 +97,16 @@
             上面要换成被控端能访问到的地址（一般就是路由器的局域网 IP）。</p>
           <p>证书指纹：<code>{{ perf.fingerprint }}</code></p>
         </div>
+        <div class="card">
+          <p class="muted small">每台被控端的 <code>config.toml</code> 里还要预置路由器的控制端公钥，
+            否则被控端会拒绝握手（回「需要配对」）：</p>
+          <pre class="snippet">[[paired]]
+key = "{{ perf.identity }}"
+name = "deskgw"
+since = 0</pre>
+          <p class="muted small">对应的私钥在路由器的 <code>/etc/deskgw/perf_identity</code>（权限 600，
+            首次启动自动生成）。它丢了或换了，所有被控端都要重新预置。</p>
+        </div>
         <h4>待批准的被控端</h4>
         <table>
           <thead><tr><th>控制码</th><th>名称</th><th>系统</th><th>来源 IP</th><th>首次接入</th><th>最近在线</th></tr></thead>
@@ -171,8 +181,9 @@ const audit = ref<any[]>([])
 const auditQuery = ref('')
 const sessions = ref<{ web_sessions: number; sessions: any[] }>({ web_sessions: 0, sessions: [] })
 const status = ref('')
-const perf = ref<{ enabled: boolean; listen: string; fingerprint: string; hosts: any[] }>(
-  { enabled: false, listen: '', fingerprint: '', hosts: [] })
+const perf = ref<{
+  enabled: boolean; listen: string; fingerprint: string; identity: string; hosts: any[]
+}>({ enabled: false, listen: '', fingerprint: '', identity: '', hosts: [] })
 // 监听地址多半是 0.0.0.0:4433，被控端填这个连不上；只取端口，让管理员补一个
 // 被控端真能访问到的地址。
 const perfServer = computed(() => {

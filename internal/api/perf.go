@@ -3,11 +3,12 @@ package api
 import "net/http"
 
 // perfStatus 返回性能模式的运行状态与待批准列表。证书指纹要写进每台被控端
-// 的 server_fp，所以和监听地址一起给出来，省得管理员去翻日志。
+// 的 server_fp，控制端公钥要写进 [[paired]].key，两者都和监听地址一起给出来，
+// 省得管理员去翻日志。
 func (s *Server) perfStatus(w http.ResponseWriter, _ *http.Request) {
 	if s.perf == nil {
 		ok(w, map[string]any{
-			"enabled": false, "listen": "", "fingerprint": "", "hosts": []any{},
+			"enabled": false, "listen": "", "fingerprint": "", "identity": "", "hosts": []any{},
 		})
 		return
 	}
@@ -27,6 +28,7 @@ func (s *Server) perfStatus(w http.ResponseWriter, _ *http.Request) {
 		"enabled":     true,
 		"listen":      s.perf.Listen(),
 		"fingerprint": s.perf.Fingerprint(),
+		"identity":    s.perf.Identity(),
 		"hosts":       hosts,
 	})
 }

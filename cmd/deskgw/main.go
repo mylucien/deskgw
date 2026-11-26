@@ -72,8 +72,8 @@ func run(cfg config.Config) error {
 			perf = perfSrv
 			perf.Start()
 			defer perf.Close()
-			log.Printf("性能模式已启动: %s（被控端的 server_fp 填 %s）",
-				perf.Listen(), perf.Fingerprint())
+			log.Printf("性能模式已启动: %s（被控端的 server_fp 填 %s，[[paired]].key 填 %s）",
+				perf.Listen(), perf.Fingerprint(), perf.Identity())
 		}
 	}
 

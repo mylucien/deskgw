@@ -25,6 +25,7 @@ type Config struct {
 	PerfListen      string
 	PerfCert        string
 	PerfKey         string
+	PerfIdentity    string
 }
 
 // Load 读取环境变量，未设置时使用默认值。
@@ -43,6 +44,7 @@ func Load() Config {
 		PerfListen:      env("DESKGW_PERF_LISTEN", "0.0.0.0:4433"),
 		PerfCert:        env("DESKGW_PERF_CERT", ""),
 		PerfKey:         env("DESKGW_PERF_KEY", ""),
+		PerfIdentity:    env("DESKGW_PERF_IDENTITY", ""),
 	}
 	names := os.Getenv("DESKGW_CERT_NAMES")
 	if names == "" {
@@ -62,6 +64,9 @@ func Load() Config {
 	if c.PerfCert == "" || c.PerfKey == "" {
 		c.PerfCert = c.DataDir + "/perf.crt"
 		c.PerfKey = c.DataDir + "/perf.key"
+	}
+	if c.PerfIdentity == "" {
+		c.PerfIdentity = c.DataDir + "/perf_identity"
 	}
 	if p := os.Getenv("DESKGW_DB"); p != "" {
 		c.DBPath = p
