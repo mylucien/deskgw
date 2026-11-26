@@ -22,6 +22,7 @@ import (
 	"github.com/mylucien/deskgw/internal/config"
 	"github.com/mylucien/deskgw/internal/filegw"
 	"github.com/mylucien/deskgw/internal/host"
+	"github.com/mylucien/deskgw/internal/perfgw"
 	"github.com/mylucien/deskgw/internal/tunnel"
 	"github.com/mylucien/deskgw/internal/user"
 	"github.com/mylucien/deskgw/web"
@@ -35,7 +36,7 @@ const csrfCookie = "deskgw_csrf"
 const dummyHash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 // serverVersion 与 openwrt/Makefile 的 PKG_VERSION 保持一致，CI 会校验两者相同。
-const serverVersion = "0.3.17"
+const serverVersion = "0.3.18"
 
 // exportWriteTimeout 是审计导出每批写入的时限。客户端停止读取时，
 // 写操作会一直阻塞，handler 和数据库连接都释放不掉。
@@ -50,6 +51,7 @@ type Server struct {
 	gateway    *tunnel.Gateway
 	fileTokens *filegw.TokenManager
 	uploads    *filegw.UploadManager
+	perf       *perfgw.Server
 	started    time.Time
 }
 
@@ -57,9 +59,9 @@ type ctxKey int
 
 const sessionKey ctxKey = 1
 
-// New 构造 HTTP handler。
-func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
-	s := &Server{db: db, auth: mgr, cfg: cfg, started: time.Now()}
+// New 构造 HTTP handler。perf 为 nil 表示性能模式没有启用。
+func New(db *sql.DB, mgr *auth.Manager, cfg config.Config, perf *perfgw.Server) http.Handler {
+	s := &Server{db: db, auth: mgr, cfg: cfg, perf: perf, started: time.Now()}
 	// 启动时以数据库中持久化的会话超时为准（后台可改），缺省沿用环境变量配置。
 	var savedIdle string
 	if err := db.QueryRow(`SELECT value FROM settings WHERE key='session_idle_min'`).Scan(&savedIdle); err == nil {
@@ -146,6 +148,7 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config) http.Handler {
 			r.Delete("/sessions/{id}", s.killSession)
 			r.Get("/settings", s.getSettings)
 			r.Put("/settings", s.putSettings)
+			r.Get("/perf", s.perfStatus)
 		})
 	})
 

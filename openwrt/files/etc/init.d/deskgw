@@ -9,6 +9,7 @@ PROG=/usr/bin/deskgw
 
 start_service() {
 	local enabled listen cert key cert_names data_dir idle upload cookie_secure redirect mem_limit
+	local perf_enabled perf_listen perf_cert perf_key
 
 	config_load deskgw
 	config_get_bool enabled main enabled 1
@@ -24,6 +25,10 @@ start_service() {
 	config_get_bool cookie_secure main cookie_secure 1
 	config_get redirect main redirect_listen ''
 	config_get mem_limit main gomemlimit ''
+	config_get_bool perf_enabled main perf_enabled 0
+	config_get perf_listen main perf_listen '0.0.0.0:4433'
+	config_get perf_cert main perf_cert '/etc/deskgw/perf.crt'
+	config_get perf_key main perf_key '/etc/deskgw/perf.key'
 
 	if [ -z "$mem_limit" ]; then
 		# Go 默认把 GC 目标定在「堆的两倍」，而单次 Argon2 就要约 19MB。
@@ -53,6 +58,10 @@ start_service() {
 		DESKGW_SESSION_IDLE_MIN="$idle" \
 		DESKGW_MAX_UPLOAD_MB="$upload" \
 		DESKGW_COOKIE_SECURE="$cookie_secure" \
+		DESKGW_PERF_ENABLED="$perf_enabled" \
+		DESKGW_PERF_LISTEN="$perf_listen" \
+		DESKGW_PERF_CERT="$perf_cert" \
+		DESKGW_PERF_KEY="$perf_key" \
 		GOMEMLIMIT="$mem_limit"
 	procd_set_param file /etc/config/deskgw
 	procd_set_param respawn 3600 5 5

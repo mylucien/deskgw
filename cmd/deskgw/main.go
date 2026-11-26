@@ -29,6 +29,7 @@ import (
 	"github.com/mylucien/deskgw/internal/audit"
 	"github.com/mylucien/deskgw/internal/auth"
 	"github.com/mylucien/deskgw/internal/config"
+	"github.com/mylucien/deskgw/internal/perfgw"
 	"github.com/mylucien/deskgw/internal/store"
 	"github.com/mylucien/deskgw/internal/user"
 )
@@ -61,6 +62,21 @@ func run(cfg config.Config) error {
 		log.Printf("deskgw 证书 SHA-256 指纹: %s", fp)
 	}
 
+	// 性能模式可选：端口占用或证书损坏时只记日志，不影响 RDP 与文件功能。
+	var perf *perfgw.Server
+	if cfg.PerfEnabled {
+		perfSrv, err := perfgw.New(cfg)
+		if err != nil {
+			log.Printf("警告: 性能模式未启动: %v", err)
+		} else {
+			perf = perfSrv
+			perf.Start()
+			defer perf.Close()
+			log.Printf("性能模式已启动: %s（被控端的 server_fp 填 %s）",
+				perf.Listen(), perf.Fingerprint())
+		}
+	}
+
 	// 审计日志保留 90 天，每 24 小时清理一次过期记录。
 	go func() {
 		_ = audit.Purge(st.DB, 90)
@@ -76,7 +92,7 @@ func run(cfg config.Config) error {
 	mgr := auth.NewManager(cfg.SessionIdleMin)
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           api.New(st.DB, mgr, cfg),
+		Handler:           api.New(st.DB, mgr, cfg, perf),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}

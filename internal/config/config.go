@@ -7,7 +7,8 @@ import (
 	"strings"
 )
 
-// Config 是网关运行参数。
+// Config 是网关运行参数。Perf* 一组只在打开性能模式时使用：UDP 监听地址、
+// 独立的证书与私钥（被控端固定这张证书的指纹）。
 type Config struct {
 	Listen          string
 	RedirectListen  string
@@ -20,6 +21,10 @@ type Config struct {
 	CookieSecure    bool
 	SessionIdleMin  int
 	MaxUploadMB     int
+	PerfEnabled     bool
+	PerfListen      string
+	PerfCert        string
+	PerfKey         string
 }
 
 // Load 读取环境变量，未设置时使用默认值。
@@ -34,6 +39,10 @@ func Load() Config {
 		CookieSecure:    envBool("DESKGW_COOKIE_SECURE", true),
 		SessionIdleMin:  envInt("DESKGW_SESSION_IDLE_MIN", 30),
 		MaxUploadMB:     envInt("DESKGW_MAX_UPLOAD_MB", 2048),
+		PerfEnabled:     envBool("DESKGW_PERF_ENABLED", false),
+		PerfListen:      env("DESKGW_PERF_LISTEN", "0.0.0.0:4433"),
+		PerfCert:        env("DESKGW_PERF_CERT", ""),
+		PerfKey:         env("DESKGW_PERF_KEY", ""),
 	}
 	names := os.Getenv("DESKGW_CERT_NAMES")
 	if names == "" {
@@ -47,6 +56,12 @@ func Load() Config {
 	if c.CertFile == "" || c.KeyFile == "" {
 		c.CertFile = c.DataDir + "/server.crt"
 		c.KeyFile = c.DataDir + "/server.key"
+	}
+	// 性能模式单独一张证书：它只被被控端按指纹固定，与 HTTPS 的域名无关，
+	// 换 HTTPS 证书时不会连带把所有被控端的 server_fp 弄失效。
+	if c.PerfCert == "" || c.PerfKey == "" {
+		c.PerfCert = c.DataDir + "/perf.crt"
+		c.PerfKey = c.DataDir + "/perf.key"
 	}
 	if p := os.Getenv("DESKGW_DB"); p != "" {
 		c.DBPath = p

@@ -402,7 +402,7 @@ jobs:
             dist/deskgw-*.sha256
           body: |
             版本：${{ needs.prepare.outputs.version }} @ ${{ needs.prepare.outputs.short }}
-            范围：M4 + WASM 重构（IronRDP 0.17.0 官方源码构建，浏览器直连 TLS，网关只转发字节）
+            范围：性能模式接入层（Airhand 被控端 QUIC 接入、信令握手、待批准列表）
 
             | 文件 | 用途 |
             |---|---|

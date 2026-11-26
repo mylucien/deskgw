@@ -10,3 +10,9 @@ config deskgw 'main'
 	option cookie_secure '1'
 	# Go 运行时内存软上限，例如 '160MiB'；留空则按物理内存的 40% 自动计算。
 	option gomemlimit ''
+	# 性能模式：接收 Airhand 被控端的 QUIC 连接。默认关闭；打开后建议只监听
+	# 局域网接口（例如 192.168.1.1:4433），别把 UDP 端口暴露到公网。
+	option perf_enabled '0'
+	option perf_listen '0.0.0.0:4433'
+	option perf_cert '/etc/deskgw/perf.crt'
+	option perf_key '/etc/deskgw/perf.key'
