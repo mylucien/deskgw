@@ -87,6 +87,35 @@
       </table>
     </section>
 
+    <section v-else-if="tab === 'perf'" class="panel">
+      <div class="panel-head"><h3>性能模式</h3><button @click="loadPerf">刷新</button></div>
+      <template v-if="perf.enabled">
+        <div class="card">
+          <p class="muted small">被控端的 <code>config.toml</code> 里，<code>server</code> 填
+            <code>{{ perfServer }}</code>，<code>server_fp</code> 填下面的指纹。</p>
+          <p class="muted small">服务监听在 <code>{{ perf.listen }}</code>；如果那是 <code>0.0.0.0</code>，
+            上面要换成被控端能访问到的地址（一般就是路由器的局域网 IP）。</p>
+          <p>证书指纹：<code>{{ perf.fingerprint }}</code></p>
+        </div>
+        <h4>待批准的被控端</h4>
+        <table>
+          <thead><tr><th>控制码</th><th>名称</th><th>系统</th><th>来源 IP</th><th>首次接入</th><th>最近在线</th></tr></thead>
+          <tbody>
+            <tr v-for="p in perf.hosts" :key="p.code">
+              <td>{{ p.code }}</td><td>{{ p.name || '—' }}</td><td>{{ p.os || '—' }}</td>
+              <td>{{ p.ip }}</td>
+              <td>{{ new Date(p.first_seen * 1000).toLocaleString() }}</td>
+              <td>{{ new Date(p.last_seen * 1000).toLocaleString() }}</td>
+            </tr>
+            <tr v-if="!perf.hosts.length"><td colspan="6" class="muted small">还没有被控端接入。</td></tr>
+          </tbody>
+        </table>
+        <p class="muted small">这里只列出接入的设备，批准（核对安全码、记录被控端公钥、换成主机 id）在下一版接入。</p>
+      </template>
+      <p v-else class="muted small">性能模式没有启用。把 <code>/etc/config/deskgw</code> 里的
+        <code>perf_enabled</code> 设为 1，重启服务后生效。</p>
+    </section>
+
     <section v-else-if="tab === 'audit'" class="panel">
       <div class="panel-head">
         <h3>审计日志</h3>
@@ -114,7 +143,7 @@
         <label>单文件上传上限（MB）<input v-model.number="settings.max_upload_mb" type="number" min="1" /></label>
         <div class="full"><button class="primary" type="submit">保存</button></div>
       </form>
-      <p class="muted small">保存后立即生效。未保存过时，默认值来自 UCI 配置的对应选项。性能模式设置将在 M8 启用。</p>
+      <p class="muted small">保存后立即生效。未保存过时，默认值来自 UCI 配置的对应选项。性能模式的开关与监听地址在路由器的 UCI 配置里，并发上限在下一版开放。</p>
     </section>
 
     <section v-else class="panel">
@@ -125,13 +154,14 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { get, post, put, del } from '../api'
 
 const tabs = [
   { key: 'users', label: '用户' }, { key: 'hosts', label: '主机' },
-  { key: 'sessions', label: '会话' }, { key: 'audit', label: '审计' },
-  { key: 'settings', label: '设置' }, { key: 'status', label: '状态' },
+  { key: 'sessions', label: '会话' }, { key: 'perf', label: '性能模式' },
+  { key: 'audit', label: '审计' }, { key: 'settings', label: '设置' },
+  { key: 'status', label: '状态' },
 ]
 const tab = ref('users')
 const error = ref('')
@@ -141,6 +171,21 @@ const audit = ref<any[]>([])
 const auditQuery = ref('')
 const sessions = ref<{ web_sessions: number; sessions: any[] }>({ web_sessions: 0, sessions: [] })
 const status = ref('')
+const perf = ref<{ enabled: boolean; listen: string; fingerprint: string; hosts: any[] }>(
+  { enabled: false, listen: '', fingerprint: '', hosts: [] })
+// 监听地址多半是 0.0.0.0:4433，被控端填这个连不上；只取端口，让管理员补一个
+// 被控端真能访问到的地址。
+const perfServer = computed(() => {
+  const l = perf.value.listen
+  const i = l.lastIndexOf(':')
+  if (i < 0) return l
+  const host = l.slice(0, i)
+  const port = l.slice(i + 1)
+  if (host === '' || host === '0.0.0.0' || host === '::' || host === '[::]') {
+    return `路由器的局域网地址:${port}`
+  }
+  return l
+})
 const settings = reactive({ session_idle_min: 30, max_upload_mb: 2048 })
 const userForm = ref<any>(null)
 const hostForm = ref<any>(null)
@@ -178,7 +223,13 @@ async function load() {
     const cfg = await get<Record<string, string>>('/admin/settings')
     settings.session_idle_min = Number(cfg.session_idle_min || 30)
     settings.max_upload_mb = Number(cfg.max_upload_mb || 2048)
+    await loadPerf()
     await loadAudit()
+  } catch (e: any) { error.value = e.message }
+}
+async function loadPerf() {
+  try {
+    perf.value = await get<any>('/admin/perf')
   } catch (e: any) { error.value = e.message }
 }
 async function loadAudit() {
