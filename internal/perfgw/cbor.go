@@ -106,6 +106,19 @@ func (r *cbReader) array() (int, error) {
 	return int(n), nil
 }
 
+// mapLen 读映射头，返回条目个数。
+func (r *cbReader) mapLen() (int, error) {
+	major, n, err := r.head()
+	if err != nil {
+		return 0, err
+	}
+	// 每个条目至少占两字节（键和值各一），否则一个前缀就能让这边以为要读几十亿项。
+	if major != cbMap || n*2 > uint64(len(r.b)-r.i) {
+		return 0, errCBOR
+	}
+	return int(n), nil
+}
+
 // uint 读一个无符号整数。
 func (r *cbReader) uint() (uint64, error) {
 	major, n, err := r.head()
@@ -258,6 +271,9 @@ func (w *cbWriter) text(s string) {
 }
 
 func (w *cbWriter) array(n int) { w.head(cbArray, uint64(n)) }
+
+// mapN 写映射头。map 是关键字，所以不带后缀不行。
+func (w *cbWriter) mapN(n int) { w.head(cbMap, uint64(n)) }
 
 func (w *cbWriter) boolean(v bool) {
 	if v {
