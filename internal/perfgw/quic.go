@@ -46,8 +46,10 @@ const pendingTTL = int64(staleAfter / time.Second)
 // Server 是性能模式的接入端。启用之后监听一个 UDP 端口，接受被控端的 QUIC
 // 连接；浏览器侧的控制台连接在后续版本接入。
 type Server struct {
-	cfg  config.Config
-	ln   *quic.Listener
+	cfg config.Config
+	ln  *quic.Listener
+	// addr 是实际监听地址。配置里写 :0 时取到的是随机端口，日志与测试都要这个。
+	addr string
 	reg  *registry
 	fp   string
 	id   *ecdh.PrivateKey
@@ -210,7 +212,8 @@ func New(cfg config.Config) (*Server, error) {
 		return nil, fmt.Errorf("启动 QUIC 监听: %w", err)
 	}
 	return &Server{
-		cfg: cfg, ln: ln, reg: newRegistry(), fp: fp, id: id, lim: newLimiter(),
+		cfg: cfg, ln: ln, addr: pc.LocalAddr().String(),
+		reg: newRegistry(), fp: fp, id: id, lim: newLimiter(),
 		stop: make(chan struct{}), conns: map[uint32]*hostConn{},
 	}, nil
 }
@@ -223,7 +226,7 @@ func (s *Server) Fingerprint() string { return s.fp }
 func (s *Server) Identity() string { return identityPublic(s.id) }
 
 // Listen 返回实际的监听地址。
-func (s *Server) Listen() string { return s.cfg.PerfListen }
+func (s *Server) Listen() string { return s.addr }
 
 // OnPeerKey 设置「学到被控端公钥」的回调。code 是主机 id（批准之后控制码
 // 就等于它）。必须在 Start 之前调用。
