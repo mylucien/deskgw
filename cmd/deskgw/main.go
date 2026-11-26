@@ -98,6 +98,11 @@ func run(cfg config.Config) error {
 			perf.OnRegister(func(p perfgw.Pending) {
 				_ = audit.Write(st.DB, nil, "perf.host_register", p.Name, p.IP, p.IP)
 			})
+			perf.OnOnline(func(code uint32, name, os string, lastSeen int64) {
+				if err := host.SetPerfMeta(st.DB, int64(code), name, os, lastSeen); err != nil {
+					log.Printf("性能模式：更新最近在线失败（主机 %d）: %v", code, err)
+				}
+			})
 			perf.Start()
 			defer perf.Close()
 			log.Printf("性能模式已启动: %s（被控端的 server_fp 填 %s，[[paired]].key 填 %s）",

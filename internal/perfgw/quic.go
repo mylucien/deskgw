@@ -67,6 +67,8 @@ type Server struct {
 	onSecret   func(hostID uint32, secret [16]byte)
 	// onRegister 在一台新被控端出现在待批准列表时被调用（写审计用）。
 	onRegister func(p Pending)
+	// onOnline 在每次被控端接入（含重连）时被调用，上层用它刷新「最近在线」。
+	onOnline func(code uint32, name, os string, lastSeen int64)
 
 	// conns 记录每个控制码当前挂在哪条 QUIC 连接上，用于发 Incoming 与收掉
 	// 同一台主机的旧连接：浏览器直接关标签或切换网络时，旧连接可能残留到空闲超时。
@@ -245,6 +247,9 @@ func (s *Server) OnSecret(fn func(hostID uint32, secret [16]byte)) { s.onSecret 
 // OnRegister 设置「新被控端接入」的回调，用来写审计。
 func (s *Server) OnRegister(fn func(p Pending)) { s.onRegister = fn }
 
+// OnOnline 设置「被控端每次接入」的回调，用来刷新最近在线时间。
+func (s *Server) OnOnline(fn func(code uint32, name, os string, lastSeen int64)) { s.onOnline = fn }
+
 // Start 启动接受连接与清理过期记录的循环。
 func (s *Server) Start() {
 	go s.accept()
@@ -348,7 +353,11 @@ func (s *Server) accept() {
 
 // serve 在一条 QUIC 连接上完成信令握手，之后守着信令流处理 Release / Rekey。
 func (s *Server) serve(conn *quic.Conn) {
-	defer conn.CloseWithError(0, "")
+	defer func() {
+		// 断开原因对排障很重要：空闲超时、被对端关掉、应用层错误各不相同。
+		log.Printf("性能模式：被控端连接结束（%s）: %v", conn.RemoteAddr(), conn.Context().Err())
+		_ = conn.CloseWithError(0, "")
+	}()
 	ip := remoteIP(conn.RemoteAddr())
 
 	ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
@@ -398,6 +407,11 @@ func (s *Server) serve(conn *quic.Conn) {
 			FirstSeen: p.firstSeen, LastSeen: p.lastSeen,
 		})
 	}
+	// 每次接入都刷一次最近在线：批准之后被控端会重连，之后每次重启或掉线
+	// 重连都走这里，否则界面上的「最近在线」会停在批准那一刻。
+	if s.onOnline != nil {
+		s.onOnline(p.code, p.name, p.os, p.lastSeen)
+	}
 	_ = st.SetDeadline(time.Time{})
 
 	hc := &hostConn{
@@ -420,6 +434,7 @@ func (s *Server) serve(conn *quic.Conn) {
 	for {
 		frame, err := readFrame(st, maxSignalMsg)
 		if err != nil {
+			log.Printf("性能模式：信令流断开（%s，控制码 %d）: %v", ip, p.code, err)
 			return
 		}
 		m, err := decodeClientMsg(frame)

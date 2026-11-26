@@ -208,3 +208,42 @@ Confirm         = a0                                 # 空映射
 控制码（= 主机 id）与密钥回来时，`registry.claim` 用 `OnAdopt` 查一次数据库，
 对得上就直接放回「已批准」状态，管理员不必重新批准。被控端换控制码走 `Rekey`
 时同步更新这份密钥。
+
+## 与真实被控端的联调结果（Airhand 0.4.0，2026-11-26）
+
+被控端装在本机，`config.toml` 指向 `127.0.0.1:14433`，与 `deskgw` 走真实 QUIC。
+
+**被控端必须具备的三项配置**
+
+```toml
+server = "127.0.0.1:14433"   # UDP
+server_fp = ""               # 首次连接记下服务器证书，之后变了就拒绝
+[[paired]]                   # 必须是顶层数组表
+key = "<后台显示的控制端公钥>"
+name = "deskgw"
+since = 0
+```
+
+- `[[paired]]` 写成 `[host]` 下的子表（`[[host.paired]]`）**不会被读取**：被控端日志仍是
+  `paired=0`，握手会回 `PairingRequired`。顶层写法才得到 `paired=1` / `admission=Known`。
+- 首次连上后被控端自己会写 `[server_trust]`（`server` + `fp`），之后换证书会拒绝连接。
+- 改了 `server` / `server_fp` / `[[paired]]` 都要重启 Airhand（托盘退出再打开）。
+
+**已验证**
+
+| 项 | 结果 |
+| --- | --- |
+| `Register`（含 `reclaim`） | 真实被控端首帧被正确解析，出现在待批准列表 |
+| 批准 → 断连 → 带旧码重连 | 服务端用 `alias` + `perf_secret` 认回，控制码变成 `hosts.id` |
+| Noise XX（首次） | 握手成功，安全码在两端一致，公钥写入 `hosts.perf_key` |
+| Noise IK（之后） | 同样成功，被控端日志仍为 `admission=Known` |
+| 控制通道下行 | `HostMsg::Hello` 解出主机名、系统、`0.4.0`、显示器、H.264 编码器 |
+| 控制通道上行 | `ControllerMsg::Audio{enabled:true}` 让被控端启动音频采集 |
+| 数据报 | `Ping{t}` → `Pong{t}`，密钥与计数 0 起点正确 |
+| 画面流 | `lane=2` 单向流到达并以结束标志收尾（未解码） |
+
+安全码在三次会话里分别是 `497-256`、`225-902`、`305-843`，路由器 `ready` 与被控端
+日志逐字相同 —— 这是握手哈希与派生一致的最直接证据。
+
+被控端在路由器 `CancelWrite` 时会记一条 `stream failed: ... stream reset by peer` 的
+WARN，属于正常收尾（我们主动取消流），不影响后续会话。
