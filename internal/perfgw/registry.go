@@ -8,8 +8,14 @@ import (
 	"time"
 )
 
-// errNoCode 表示待批准的控制码已经分不出来（实际上不可能发生）。
-var errNoCode = errors.New("控制码已用尽")
+var (
+	// errNoCode 表示待批准的控制码已经分不出来（实际上不可能发生）。
+	errNoCode = errors.New("控制码已用尽")
+	// errNoPending 表示这个控制码不在待批准列表里（可能已经批准过，或者已经离线太久）。
+	errNoPending = errors.New("没有这条待批准记录")
+	// errHostIDUsed 表示要换成的主机 id 已经被别的记录占着。
+	errHostIDUsed = errors.New("主机 id 已被占用")
+)
 
 // pendingCodeBase 是待批准被控端使用的控制码起点。hosts.id 从 1 开始自增，
 // 两者不会撞在一起。批准之后被控端重新注册时换成真正的主机 id。
@@ -28,6 +34,9 @@ type pending struct {
 	lastSeen  int64
 	secret    [16]byte
 	online    bool
+	// approved 表示已经批准、控制码换成了 hosts.id。记录留着是为了让被控端
+	// 带着旧控制码重连时还能认出它；它不再出现在待批准列表里。
+	approved bool
 }
 
 // registry 保存在线被控端的待批准记录。这些记录只在内存里：被控端断线之后
@@ -35,11 +44,18 @@ type pending struct {
 type registry struct {
 	mu      sync.Mutex
 	entries map[uint32]*pending
-	next    uint32
+	// alias 是旧控制码到新控制码的映射：批准之后被控端还没收到新控制码，
+	// 它下次注册带的还是旧的那个。
+	alias map[uint32]uint32
+	next  uint32
 }
 
 func newRegistry() *registry {
-	return &registry{entries: map[uint32]*pending{}, next: pendingCodeBase}
+	return &registry{
+		entries: map[uint32]*pending{},
+		alias:   map[uint32]uint32{},
+		next:    pendingCodeBase,
+	}
 }
 
 // claim 按上一次的控制码与密钥找回记录；对不上就新分配一个控制码。
@@ -50,7 +66,11 @@ func (g *registry) claim(rc *reclaim, name, os, ip string, now int64) (*pending,
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if rc != nil {
-		if p, ok := g.entries[rc.code]; ok && p.secret == rc.secret {
+		code := rc.code
+		if a, ok := g.alias[code]; ok {
+			code = a
+		}
+		if p, ok := g.entries[code]; ok && p.secret == rc.secret {
 			p.name, p.os, p.ip = name, os, ip
 			p.lastSeen = now
 			p.online = true
@@ -103,7 +123,56 @@ func (g *registry) setSecret(code uint32, secret [16]byte) {
 func (g *registry) drop(code uint32) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.dropLocked(code)
+}
+
+// dropLocked 删掉记录以及指向它的别名。调用方已持有锁。
+func (g *registry) dropLocked(code uint32) {
 	delete(g.entries, code)
+	for from, to := range g.alias {
+		if to == code {
+			delete(g.alias, from)
+		}
+	}
+}
+
+// approve 把待批准记录换成正式主机：控制码改成 hosts.id，密钥不变，
+// 旧控制码留作别名。调用方随后要断开这条连接，让被控端带着旧控制码重连、
+// 从 Registered 里拿到新控制码。
+func (g *registry) approve(code, hostID uint32) error {
+	if hostID == 0 || hostID >= pendingCodeBase {
+		return errNoCode
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	p, ok := g.entries[code]
+	if !ok || p.approved {
+		return errNoPending
+	}
+	if other, used := g.entries[hostID]; used && other != p {
+		return errHostIDUsed
+	}
+	delete(g.entries, code)
+	p.code = hostID
+	p.approved = true
+	p.online = false
+	g.entries[hostID] = p
+	g.alias[code] = hostID
+	return nil
+}
+
+// get 按控制码取一条记录（用来在批准前读出名称、系统与来源地址）。
+func (g *registry) get(code uint32) (pending, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if a, ok := g.alias[code]; ok {
+		code = a
+	}
+	p, ok := g.entries[code]
+	if !ok {
+		return pending{}, false
+	}
+	return *p, true
 }
 
 // setOnline 记录这个控制码当前是否还有连接。离线记录保留一段时间，
@@ -126,7 +195,7 @@ func (g *registry) reap(now, ttl int64) int {
 	n := 0
 	for code, p := range g.entries {
 		if !p.online && now-p.lastSeen > ttl {
-			delete(g.entries, code)
+			g.dropLocked(code)
 			n++
 		}
 	}
@@ -138,6 +207,9 @@ func (g *registry) list() []pending {
 	g.mu.Lock()
 	out := make([]pending, 0, len(g.entries))
 	for _, p := range g.entries {
+		if p.approved {
+			continue
+		}
 		out = append(out, *p)
 	}
 	g.mu.Unlock()

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -53,6 +54,9 @@ type Server struct {
 	stop chan struct{}
 	once sync.Once
 	sid  atomic.Uint64
+	// onPeer 在第一次（Noise XX）握手学到被控端公钥时被调用，用来记进数据库。
+	// 必须在 Start 之前设置。
+	onPeer func(code uint32, pub []byte)
 
 	// conns 记录每个控制码当前挂在哪条 QUIC 连接上，用于发 Incoming 与收掉
 	// 同一台主机的旧连接：浏览器直接关标签或切换网络时，旧连接可能残留到空闲超时。
@@ -131,6 +135,10 @@ func (s *Server) Identity() string { return identityPublic(s.id) }
 // Listen 返回实际的监听地址。
 func (s *Server) Listen() string { return s.cfg.PerfListen }
 
+// OnPeerKey 设置「学到被控端公钥」的回调。code 是主机 id（批准之后控制码
+// 就等于它）。必须在 Start 之前调用。
+func (s *Server) OnPeerKey(fn func(code uint32, pub []byte)) { s.onPeer = fn }
+
 // Start 启动接受连接与清理过期记录的循环。
 func (s *Server) Start() {
 	go s.accept()
@@ -164,6 +172,38 @@ func (s *Server) Pending() []Pending {
 		})
 	}
 	return out
+}
+
+// PendingByCode 按控制码取一条待批准记录。
+func (s *Server) PendingByCode(code uint32) (Pending, bool) {
+	p, ok := s.reg.get(code)
+	if !ok || p.approved {
+		return Pending{}, false
+	}
+	return Pending{
+		Code: p.code, Name: p.name, OS: p.os, IP: p.ip,
+		FirstSeen: p.firstSeen, LastSeen: p.lastSeen,
+	}, true
+}
+
+// Approve 把待批准的被控端换成正式主机：控制码改成 hosts.id，然后断开连接。
+// 被控端会带着旧控制码重连，从 Registered 里拿到新的控制码并保存下来。
+func (s *Server) Approve(code uint32, hostID int64) error {
+	if hostID <= 0 || hostID > math.MaxUint32 {
+		return errHostIDUsed
+	}
+	if err := s.reg.approve(code, uint32(hostID)); err != nil {
+		return err
+	}
+	s.cmu.Lock()
+	hc := s.conns[code]
+	s.cmu.Unlock()
+	if hc != nil {
+		// 断开是让被控端重新注册、拿到新控制码的最省事的办法；
+		// 被控端自己会重连（它本来就要在控制码变了之后重连）。
+		_ = hc.conn.CloseWithError(0, "approved")
+	}
+	return nil
 }
 
 // Pending 是一条待批准记录。

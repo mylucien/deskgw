@@ -241,3 +241,30 @@ func b(v bool) int {
 func Resolve(h Host) string {
 	return net.JoinHostPort(h.Address, fmt.Sprint(h.RDPPort))
 }
+
+// ---- 性能模式字段 ---------------------------------------------------------
+
+// SetPerfMeta 记录被控端自己报的名称、系统与最近在线时间。批准时用名称
+// 作为新建主机的默认名，之后每次接入都可以刷新。
+func SetPerfMeta(db *sql.DB, id int64, name, os string, lastSeen int64) error {
+	_, err := db.Exec(`UPDATE hosts SET perf_name=?, perf_os=?, perf_last_seen=? WHERE id=?`,
+		name, os, lastSeen, id)
+	return err
+}
+
+// PerfKey 返回记录下来的被控端公钥（X25519，32 字节）。没有记录时返回 nil。
+func PerfKey(db *sql.DB, id int64) ([]byte, error) {
+	var key []byte
+	err := db.QueryRow(`SELECT perf_key FROM hosts WHERE id=?`, id).Scan(&key)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return key, err
+}
+
+// SetPerfKey 记下被控端的公钥。之后这个会话就走 Noise IK，公钥一变就要求
+// 重新批准（调用方负责比对）。
+func SetPerfKey(db *sql.DB, id int64, key []byte) error {
+	_, err := db.Exec(`UPDATE hosts SET perf_key=? WHERE id=?`, key, id)
+	return err
+}

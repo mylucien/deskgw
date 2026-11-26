@@ -29,6 +29,7 @@ import (
 	"github.com/mylucien/deskgw/internal/audit"
 	"github.com/mylucien/deskgw/internal/auth"
 	"github.com/mylucien/deskgw/internal/config"
+	"github.com/mylucien/deskgw/internal/host"
 	"github.com/mylucien/deskgw/internal/perfgw"
 	"github.com/mylucien/deskgw/internal/store"
 	"github.com/mylucien/deskgw/internal/user"
@@ -70,6 +71,12 @@ func run(cfg config.Config) error {
 			log.Printf("警告: 性能模式未启动: %v", err)
 		} else {
 			perf = perfSrv
+			// 第一次握手学到的被控端公钥记下来，之后走 Noise IK。
+			perf.OnPeerKey(func(code uint32, pub []byte) {
+				if err := host.SetPerfKey(st.DB, int64(code), pub); err != nil {
+					log.Printf("性能模式：记录被控端公钥失败（主机 %d）: %v", code, err)
+				}
+			})
 			perf.Start()
 			defer perf.Close()
 			log.Printf("性能模式已启动: %s（被控端的 server_fp 填 %s，[[paired]].key 填 %s）",

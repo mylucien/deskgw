@@ -59,6 +59,8 @@ var (
 	errSession = errors.New("会话头不属于这个会话")
 	// errHostOffline 表示要连的被控端现在不在线。
 	errHostOffline = errors.New("被控端不在线")
+	// errNotApproved 表示这台被控端还没批准，不允许任何用户连上去。
+	errNotApproved = errors.New("被控端还没有批准")
 )
 
 // sessionHeader 写出一条单向流开头的 9 字节会话头。
@@ -269,6 +271,10 @@ func (s *Server) StartSession(code uint32, peer sessionPeer, intro controllerInt
 	if hc == nil {
 		return nil, errHostOffline
 	}
+	// 批准之前任何用户都不能用：控制码还是待批准区间的，直接拒绝。
+	if p, ok := s.reg.get(code); !ok || !p.approved {
+		return nil, errNotApproved
+	}
 	observed, ok := hc.conn.RemoteAddr().(*net.UDPAddr)
 	if !ok {
 		return nil, errors.New("被控端地址不可用")
@@ -293,7 +299,8 @@ func (s *Server) StartSession(code uint32, peer sessionPeer, intro controllerInt
 	}()
 
 	sid := s.sid.Add(1)
-	keys, err := startSession(sid, newHandshake(s.id, peerKey, intro), peer, observed, sessionWire{
+	hs := newHandshake(s.id, peerKey, intro)
+	keys, err := startSession(sid, hs, peer, observed, sessionWire{
 		signal:  hc.sendSignal,
 		ctrlOut: ctrl,
 		accept: func() (io.Reader, func(), error) {
@@ -311,6 +318,11 @@ func (s *Server) StartSession(code uint32, peer sessionPeer, intro controllerInt
 		return nil, err
 	}
 	done = true
+	// 第一次（XX）握手顺手学到被控端公钥：记进 hosts.perf_key，下次就走 IK。
+	// 公钥变了说明被控端重装过或者有人在冒充，由调用方决定要不要重新批准。
+	if peerKey == nil && s.onPeer != nil && hs.noise.peerKey != nil {
+		s.onPeer(code, hs.noise.peerKey.Bytes())
+	}
 	log.Printf("性能模式：会话 %d 建立（%s，安全码 %s）", sid, hc.name, keys.safety)
 	return &session{id: sid, host: hc, keys: keys, ctrl: ctrl}, nil
 }

@@ -195,3 +195,53 @@ func TestRegistryReap(t *testing.T) {
 		t.Fatalf("还剩 %d 条", n)
 	}
 }
+
+// TestRegistryApprove 批准之后控制码换成主机 id：待批准列表里不再出现，
+// 被控端带着旧控制码重连时仍能认出来（它这时还没收到新控制码）。
+func TestRegistryApprove(t *testing.T) {
+	g := newRegistry()
+	now := time.Now().Unix()
+	p, err := g.claim(nil, "PC1", "Windows 11", "192.168.1.20", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.approve(p.code, 7); err != nil {
+		t.Fatalf("批准: %v", err)
+	}
+	if list := g.list(); len(list) != 0 {
+		t.Fatalf("批准之后不该再出现在待批准列表里: %+v", list)
+	}
+	if _, ok := g.get(p.code); !ok {
+		t.Fatal("批准之后按旧控制码还应当查得到（别名）")
+	}
+
+	// 被控端还没收到新控制码：带旧的来重连，应当拿到主机 id。
+	q, err := g.claim(&reclaim{code: p.code, secret: p.secret}, "PC1", "Windows 11", "192.168.1.20", now+5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.code != 7 {
+		t.Fatalf("重连应当拿到主机 id 7，得到 %d", q.code)
+	}
+	// 拿到新控制码之后再重连。
+	q, err = g.claim(&reclaim{code: 7, secret: p.secret}, "PC1", "Windows 11", "192.168.1.20", now+10)
+	if err != nil || q.code != 7 {
+		t.Fatalf("用新控制码重连失败: %+v %v", q, err)
+	}
+	// 密钥不对就不认，重新走待批准。
+	q, err = g.claim(&reclaim{code: 7, secret: [16]byte{1}}, "PC1", "Windows 11", "192.168.1.20", now+15)
+	if err != nil || q.code < pendingCodeBase {
+		t.Fatalf("密钥不对时应当重新分配待批准控制码: %d %v", q.code, err)
+	}
+
+	// 重复批准、批准不存在的控制码、拿主机 id 当新控制码都要拒绝。
+	if err := g.approve(p.code, 8); !errors.Is(err, errNoPending) {
+		t.Fatalf("重复批准应当报 errNoPending，得到 %v", err)
+	}
+	if err := g.approve(0x7fff_ffff, 8); !errors.Is(err, errNoPending) {
+		t.Fatalf("不存在的控制码应当报 errNoPending，得到 %v", err)
+	}
+	if err := g.approve(7, pendingCodeBase); !errors.Is(err, errNoCode) {
+		t.Fatalf("主机 id 落在待批准区间应当报 errNoCode，得到 %v", err)
+	}
+}

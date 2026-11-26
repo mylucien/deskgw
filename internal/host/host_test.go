@@ -152,3 +152,54 @@ func TestResolveJoinsPort(t *testing.T) {
 		t.Fatalf("Resolve 结果不符: %s", got)
 	}
 }
+
+// TestPerfFields 性能模式的名称、系统、最近在线与公钥要能存能取。
+func TestPerfFields(t *testing.T) {
+	st := openDB(t)
+	h := base()
+	h.Modes = "perf"
+	if err := host.Create(st.DB, &h); err != nil {
+		t.Fatal(err)
+	}
+	// 还没接入过：公钥是空的。
+	key, err := host.PerfKey(st.DB, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != nil {
+		t.Fatalf("没记录过公钥时应当是 nil，得到 %x", key)
+	}
+
+	if err := host.SetPerfMeta(st.DB, h.ID, "PC-01", "Windows 11", 1700000000); err != nil {
+		t.Fatal(err)
+	}
+	got, err := host.Get(st.DB, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PerfName != "PC-01" || got.PerfOS != "Windows 11" || got.LastSeen != 1700000000 {
+		t.Fatalf("性能模式字段没存上: %+v", got)
+	}
+
+	pub := make([]byte, 32)
+	pub[0], pub[31] = 0xaa, 0xbb
+	if err := host.SetPerfKey(st.DB, h.ID, pub); err != nil {
+		t.Fatal(err)
+	}
+	key, err = host.PerfKey(st.DB, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(key) != 32 || key[0] != 0xaa || key[31] != 0xbb {
+		t.Fatalf("公钥没存上: %x", key)
+	}
+
+	// 改资料不能把公钥和性能模式字段冲掉。
+	got.Name = "改名后"
+	if err := host.Update(st.DB, h.ID, got); err != nil {
+		t.Fatal(err)
+	}
+	if key, _ := host.PerfKey(st.DB, h.ID); len(key) != 32 {
+		t.Fatalf("Update 把公钥清掉了: %x", key)
+	}
+}

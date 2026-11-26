@@ -109,18 +109,43 @@ since = 0</pre>
         </div>
         <h4>待批准的被控端</h4>
         <table>
-          <thead><tr><th>控制码</th><th>名称</th><th>系统</th><th>来源 IP</th><th>首次接入</th><th>最近在线</th></tr></thead>
+          <thead><tr><th>控制码</th><th>名称</th><th>系统</th><th>来源 IP</th><th>首次接入</th><th>最近在线</th><th></th></tr></thead>
           <tbody>
             <tr v-for="p in perf.hosts" :key="p.code">
               <td>{{ p.code }}</td><td>{{ p.name || '—' }}</td><td>{{ p.os || '—' }}</td>
               <td>{{ p.ip }}</td>
               <td>{{ new Date(p.first_seen * 1000).toLocaleString() }}</td>
               <td>{{ new Date(p.last_seen * 1000).toLocaleString() }}</td>
+              <td><button @click="startApprove(p)">批准</button></td>
             </tr>
-            <tr v-if="!perf.hosts.length"><td colspan="6" class="muted small">还没有被控端接入。</td></tr>
+            <tr v-if="!perf.hosts.length"><td colspan="7" class="muted small">还没有被控端接入。</td></tr>
           </tbody>
         </table>
-        <p class="muted small">这里只列出接入的设备，批准（核对安全码、记录被控端公钥、换成主机 id）在下一版接入。</p>
+        <div v-if="approve" class="card">
+          <h4>批准 {{ approve.name || approve.ip }}</h4>
+          <p class="muted small">批准后这台被控端会拿到新的控制码（等于主机 id）并重连。
+            它第一次真正连上来时，路由器记下它的公钥，之后就走更快的 Noise IK。</p>
+          <div class="form-grid">
+            <label>处理方式<select v-model="approveForm.mode">
+              <option value="new">新建主机</option>
+              <option value="link">关联已有主机</option>
+            </select></label>
+            <template v-if="approveForm.mode === 'new'">
+              <label>名称<input v-model="approveForm.name" placeholder="留空用被控端自己报的名称" /></label>
+              <label>分组<input v-model="approveForm.group_name" /></label>
+            </template>
+            <label v-else>已有主机<select v-model.number="approveForm.host_id">
+              <option :value="0" disabled>选择主机</option>
+              <option v-for="h in hosts" :key="h.id" :value="h.id">{{ h.name }}（{{ h.address }}）</option>
+            </select></label>
+            <div class="full actions">
+              <button class="primary" @click="submitApprove">确认批准</button>
+              <button @click="approve = null">取消</button>
+            </div>
+          </div>
+        </div>
+        <p class="muted small">待批准列表只记在内存里：网关重启或者被控端离线超过 10 分钟，记录就没了
+          （被控端会自己重新接入）。</p>
       </template>
       <p v-else class="muted small">性能模式没有启用。把 <code>/etc/config/deskgw</code> 里的
         <code>perf_enabled</code> 设为 1，重启服务后生效。</p>
@@ -181,6 +206,8 @@ const audit = ref<any[]>([])
 const auditQuery = ref('')
 const sessions = ref<{ web_sessions: number; sessions: any[] }>({ web_sessions: 0, sessions: [] })
 const status = ref('')
+const approve = ref<any>(null)
+const approveForm = reactive({ mode: 'new', host_id: 0, name: '', group_name: '' })
 const perf = ref<{
   enabled: boolean; listen: string; fingerprint: string; identity: string; hosts: any[]
 }>({ enabled: false, listen: '', fingerprint: '', identity: '', hosts: [] })
@@ -236,6 +263,30 @@ async function load() {
     settings.max_upload_mb = Number(cfg.max_upload_mb || 2048)
     await loadPerf()
     await loadAudit()
+  } catch (e: any) { error.value = e.message }
+}
+function startApprove(p: any) {
+  approve.value = p
+  approveForm.mode = 'new'
+  approveForm.host_id = 0
+  approveForm.name = p.name || ''
+  approveForm.group_name = ''
+}
+async function submitApprove() {
+  if (!approve.value) return
+  const body: any = {}
+  if (approveForm.mode === 'link') {
+    if (!approveForm.host_id) { error.value = '请选择一台已有主机'; return }
+    body.host_id = approveForm.host_id
+  } else {
+    body.name = approveForm.name
+    body.group_name = approveForm.group_name
+  }
+  try {
+    await post(`/admin/perf/${approve.value.code}/approve`, body)
+    approve.value = null
+    error.value = ''
+    await load()
   } catch (e: any) { error.value = e.message }
 }
 async function loadPerf() {
