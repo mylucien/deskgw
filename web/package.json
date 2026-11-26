@@ -1,11 +1,12 @@
 {
   "name": "deskgw-web",
-  "version": "0.3.24",
+  "version": "0.3.25",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test:perf": "esbuild test/perf.test.mjs --bundle --format=esm --platform=node --outfile=test/out.mjs --log-level=warning && node test/out.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

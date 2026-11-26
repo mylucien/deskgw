@@ -156,12 +156,9 @@ Confirm         = a0                                 # 空映射
 
 ## 仍待实机验证
 
-- 真实被控端连上来走完 `Incoming` → XX → `Confirm`，看托盘是否出现控制端。
-- 被控端用 `Pattern::Known`（Noise IK）时的字节一致性 —— 黄金向量已对上，
-  还差一次真机联调。
-- `ReplayWindow`（128 位窗口）与计数起点：控制通道两个方向各先用掉计数 0
-  （`Confirm` 与被控端的决定），浏览器侧收发都从 1 开始。
-- CBOR 用真实被控端抓包再对一遍（当前只有上游仓库的黄金字节）。
+- 空闲保活：控制通道没有消息时，靠控制数据报的 `Ping` 与 QUIC keepalive 撑住长会话。
+- 被控端托盘「更换控制码」后，旧的 `perf_secret` 与 `[[paired]]` 的清理流程。
+- `perf.enabled` 目前只在启动时读，后台改这项要重启网关。
 
 ## 浏览器侧转发协议（已实现）
 
@@ -247,3 +244,49 @@ since = 0
 
 被控端在路由器 `CancelWrite` 时会记一条 `stream failed: ... stream reset by peer` 的
 WARN，属于正常收尾（我们主动取消流），不影响后续会话。
+
+## 浏览器控制端（已实现）
+
+代码在 `web/src/perf/`：
+
+| 文件 | 职责 |
+| --- | --- |
+| `wire.ts` | 导入会话密钥、AES-GCM 密封/解封、媒体包头、SPS → `avc1.PPCCLL` |
+| `cbor.ts` | 用到的 CBOR 子集（整数、字节串、文本、数组、映射、f32） |
+| `messages.ts` | `HostMsg` 解析；`RequestKeyframe`、`Ack`、`Ping`、`Echo` 的编码 |
+| `worker.ts` | 按流序号重组、控制通道顺序解密、WebCodecs 解码、Ack/Ping/关键帧请求 |
+| `client.ts` | WebSocket 与 Worker 之间的桥，密钥只在 `ready` 之后交给 Worker |
+
+要点：
+
+- **nonce 是 12 字节**：前 4 字节为 0，后 8 字节是小端计数，与
+  `handshake.go` 的 `cipher.NewGCM` 一致。计数是 u64，JS 侧用 `BigInt` 读写，
+  不能用 `>>>` 截断（会丢高位）。
+- 控制通道是一条常驻流，按 u32 长度前缀切帧、串行解密；画面每帧一条流，
+  按网关分配的流序号重组，密钥取 `keys.video[通道号 - 2]`。
+- 每收到一帧就发 `Ack`（`seq`、到达时刻、`stream`），每秒发一次 `Ping` 并
+  重发最近的 `Ack`（数据报会丢）；缺帧或解码器报错时发 `RequestKeyframe`。
+- 画面在 Worker 里解成 `VideoFrame` 后转移给主线程，主线程画到 canvas 上并
+  立即 `close()`；主线程不接触密钥。
+- 只解 H.264（Annex-B）。codec 字符串从关键帧里第一段 SPS 的前三个字节拼出来，
+  H.265/AV1 只提示不支持。
+- `CursorImage` 与 `Clipboard` 走大块通道，网关按设计丢弃，所以浏览器只处理
+  `Cursor` 的可见性：`shown` 用本地光标，`hidden` / `inFrame` 时隐藏本地光标。
+
+实测（2026-11-27，本机，Chrome 稳定版）：
+
+| 项 | 结果 |
+| --- | --- |
+| 控制通道 | Hello 解出主机名、系统、`0.4.0`、显示器、编码器 |
+| 画面 | 1920×1080，30–31 fps，静态桌面 0.4–0.8 Mbps，RTT 1–12 ms |
+| 连续 8 秒 | 无解码错误、无丢帧、会话不中断 |
+| 安全码 | 每次会话与网关日志逐字一致 |
+
+离线核对（`.perf/tests/perf.test.mjs`）覆盖：Go 生成的密封单元能在浏览器侧解开、
+再封回去字节一致；`v10.rs` 的 CBOR 黄金字节；媒体包头与 SPS。测试入口：
+
+```
+cd .perf/tests
+../deskgw/web/node_modules/.bin/esbuild perf.test.mjs --bundle --format=esm --platform=node --outfile=out.mjs
+node out.mjs
+```

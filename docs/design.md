@@ -373,13 +373,14 @@ UCI：`perf_enabled`、`perf_listen`（默认 `0.0.0.0:4433`，建议绑定 LAN 
 
 | 模块 | 职责 |
 | --- | --- |
-| `link.ts` | 与路由器的 WSS：票据、JSON 消息、二进制转发协议（4.10）、心跳；连接断开即会话结束，不做会话级重连 |
-| `keys.ts` | 导入会话密钥（WebCrypto `importKey`，AES-GCM）；发送端计数与加密；接收端的顺序模式（控制通道）和滑动窗口模式（视频、数据报） |
-| `frames.ts` | 按流序号重组下行数据块，按长度前缀切成密封单元（前缀格式以 `framing.rs` 为准） |
+| `client.ts` | 与路由器的 WSS：票据、JSON 消息、二进制转发协议（4.10）、心跳；连接断开即会话结束，不做会话级重连。`ready` 之后才把密钥交给 Worker |
+| `wire.ts` | 导入会话密钥（WebCrypto `importKey`，AES-GCM）；密封单元的解封与封包（12 字节 nonce，计数在末尾）；媒体包头与 SPS → codec 字符串 |
 | `cbor.ts` | 用到的消息的 CBOR 子集（带编号字段）：被控端消息、控制端消息、数据报 |
-| `session.ts` | 控制通道状态机（`Hello`、`Displays`、`Encoder` 等）、输入、`Settings`、`RequestKeyframe`、`View`、`Ping` / `Pong`、`Ack`、`Lost`、`Report`、失联检测 |
-| `media.ts` | 视频包按帧组包后交给解码，检测序号缺口 |
-| `backend.ts` | 向界面层暴露与现有后端相同的接口（需先核对 `lib/backend/` 的接口形状） |
+| `messages.ts` | `HostMsg` 解析；`RequestKeyframe`、`Ack`、`Ping`、`Echo` 的编码 |
+| `worker.ts` | 按流序号重组下行数据块、控制通道顺序解密、WebCodecs 解码、`Ack` 与关键帧请求 |
+| `web/src/views/PerfView.vue` | 界面：画布、安全码、状态栏（分辨率、帧率、码率、RTT）、错误提示 |
+
+键鼠输入、画质设置与 `Report` 还没接；`Lost` 用 `RequestKeyframe` 代替（每帧一条流，缺帧由本端判断）。
 
 **解密与性能**
 

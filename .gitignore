@@ -17,3 +17,6 @@ web/src/wasm/pkg/
 __pycache__/
 *.pyc
 .DS_Store
+
+# 离线核对的打包产物
+web/test/out.mjs
