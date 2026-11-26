@@ -125,11 +125,12 @@ func TestEncodeRegistered(t *testing.T) {
 }
 
 func TestEncodeRekeyed(t *testing.T) {
+	// 注意方向：Rekey 是被控端发的（变体 4），Rekeyed 是服务端回的（变体 5）。
 	secret := [16]byte{}
 	for i := range secret {
 		secret[i] = 7
 	}
-	want := "82048150" + strings.Repeat("07", 16)
+	want := "82058150" + strings.Repeat("07", 16)
 	if got := hex.EncodeToString(encodeRekeyed(secret)); got != want {
 		t.Fatalf("得到 %s", got)
 	}

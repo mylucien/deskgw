@@ -44,6 +44,9 @@ func newRegistry() *registry {
 
 // claim 按上一次的控制码与密钥找回记录；对不上就新分配一个控制码。
 func (g *registry) claim(rc *reclaim, name, os, ip string, now int64) (*pending, error) {
+	// 名称与系统由对端填写，最长可以到一条信令帧的上限。截断到 64 个字符：
+	// 界面显示足够，也不至于让一批未批准的连接把路由器的内存占满。
+	name, os = clip(name, 64), clip(os, 64)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if rc != nil {
@@ -154,4 +157,16 @@ func newSecret() ([16]byte, error) {
 		return s, err
 	}
 	return s, nil
+}
+
+// clip 把字符串按字符（不是字节）截断到 n 个。
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }
