@@ -68,6 +68,9 @@ check('RequestKeyframe(5)', toHex(encodeRequestKeyframe(5)), '82048105')
 check('Ping(5)', toHex(encodePing(5)), '82008105')
 check('Ack(99,1000)', toHex(encodeAck(99, 1000)), '82018218631903e8')
 check('Input(ReleaseAll)', toHex(encodeInput(5, [{ kind: 'releaseAll' }])), '8201820581820680')
+// InputEvent::Text：变体 5，字段是单个字符串；被控端按 Unicode 注入，中文、emoji 都走这条。
+check('Input(Text 你好)', toHex(encodeInput(5, [{ kind: 'text', text: '你好' }])), '820182058182058166e4bda0e5a5bd')
+check('Input(Text abc)', toHex(encodeInput(5, [{ kind: 'text', text: 'abc' }])), '820182058182058163616263')
 
 // ---- 媒体包头 ----
 const pkt = new Uint8Array(30)

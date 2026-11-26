@@ -23,7 +23,7 @@
       <canvas
         ref="canvas"
         tabindex="0"
-        title="点击画面后可直接用键盘和鼠标操作"
+        title="点击画面后可直接用键盘和鼠标操作，支持中文输入法"
         :class="{ idle: !hasFrame }"
         :style="{ cursor: cursorStyle }"
         @pointerdown="onPointerDown"
@@ -33,6 +33,25 @@
         @wheel.prevent="onWheel"
         @contextmenu.prevent
       ></canvas>
+
+      <!--
+        输入代理：画面本身收不到输入法组字，所以用这个不可见的 textarea 接住。
+        可打印字符不拦默认行为，交给它；上屏的文本再作为 ControllerMsg 的 Text 发出。
+      -->
+      <textarea
+        ref="ime"
+        class="ime"
+        rows="1"
+        tabindex="-1"
+        autocomplete="off"
+        autocorrect="off"
+        autocapitalize="off"
+        spellcheck="false"
+        aria-hidden="true"
+        @input="onImeInput"
+        @compositionend="onCompositionEnd"
+        @blur="onImeBlur"
+      ></textarea>
 
       <div v-if="state !== 'ready' || !hasFrame" class="overlay">
         <div class="overlay-card">
@@ -82,6 +101,7 @@ type State = 'connecting' | 'ready' | 'error' | 'ended'
 const router = useRouter()
 const stage = ref<HTMLDivElement | null>(null)
 const canvas = ref<HTMLCanvasElement | null>(null)
+const ime = ref<HTMLTextAreaElement | null>(null)
 
 const state = ref<State>('connecting')
 const ready = ref<PerfReady | null>(null)
@@ -167,7 +187,7 @@ function point(ev: { clientX: number; clientY: number }) {
 const webButton: Record<number, number> = { 0: 0, 2: 1, 1: 2, 3: 3, 4: 4 }
 
 function onPointerDown(ev: PointerEvent) {
-  canvas.value?.focus()
+  focusIme(ev)
   canvas.value?.setPointerCapture?.(ev.pointerId)
   const p = point(ev)
   if (p && cursorMode !== 0) pushMove({ kind: 'move', x: p.x, y: p.y })
@@ -212,26 +232,100 @@ function onWheel(ev: WheelEvent) {
   if (dx || dy) push({ kind: 'wheel', dx, dy })
 }
 
+/** 这些键不走文本，直接按物理键发给被控端。 */
+const NAMED_KEYS = new Set([
+  'Escape', 'Tab', 'Enter', 'Backspace', 'Delete', 'Insert',
+  'Home', 'End', 'PageUp', 'PageDown',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'ContextMenu',
+  'Pause', 'ScrollLock', 'NumLock', 'PrintScreen',
+])
+
+/** 带修饰键的组合、功能键、编辑键走物理键；其余可打印字符交给输入代理。 */
+function isPhysicalKey(ev: KeyboardEvent): boolean {
+  if (ev.ctrlKey || ev.altKey || ev.metaKey) return true
+  if (/^F\d{1,2}$/.test(ev.key)) return true
+  return NAMED_KEYS.has(ev.key)
+}
+
+// 按下时发过 Key 的键：抬起时必须发，哪怕这时修饰键已经松开。
+const heldKeys = new Set<string>()
+
 function onKey(ev: KeyboardEvent, down: boolean) {
   if (state.value !== 'ready') return
   const el = ev.target as HTMLElement | null
   const tag = el?.tagName
-  // 页面上的输入框、按钮、可编辑区还给自己；画面本身没有焦点也照收，
-  // 免得用户必须先点一下才能打字。
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' || el?.isContentEditable) return
-  // 输入法组字期间不干预，否则候选框会失灵（文本输入还没接，见文档）。
+  // 页面上的输入框、按钮、可编辑区还给自己；隐藏的输入代理除外，它是画面的嘴。
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'BUTTON' || el?.isContentEditable) return
+  if (tag === 'TEXTAREA' && el !== ime.value) return
+  // 输入法组字期间整段交给输入法：不上屏、也不拦默认行为。
   if (ev.isComposing) return
   // 刷新、全屏、开发者工具交还给浏览器。
   if (ev.key === 'F5' || ev.key === 'F11' || ev.key === 'F12') return
-  const code = ev.code
-  if (!code) return
-  push({ kind: 'key', code, down })
+  // 输入法接管的键（Chrome 里是 Process / Unidentified）：不拦，让它启动组字。
+  if (ev.key === 'Process' || ev.key === 'Unidentified') return
+
+  if (!down) {
+    if (ev.code && heldKeys.delete(ev.code)) {
+      push({ kind: 'key', code: ev.code, down: false })
+      ev.preventDefault()
+    }
+    return
+  }
+  if (!isPhysicalKey(ev)) return
+  if (!ev.code) return
+  heldKeys.add(ev.code)
+  push({ kind: 'key', code: ev.code, down: true })
   ev.preventDefault()
+}
+
+/** 把输入代理挪到指针处（输入法候选框跟着走）并聚焦。 */
+function focusIme(ev?: { clientX: number; clientY: number }) {
+  const el = ime.value
+  const box = stage.value
+  if (!el || !box) return
+  if (ev) {
+    const r = box.getBoundingClientRect()
+    const x = Math.min(Math.max(ev.clientX - r.left, 0), r.width - 1)
+    const y = Math.min(Math.max(ev.clientY - r.top, 0), r.height - 1)
+    el.style.left = x + 'px'
+    el.style.top = y + 'px'
+  }
+  if (document.activeElement !== el) el.focus({ preventScroll: true })
+}
+
+/** 上屏的文本（含输入法、粘贴）走 ControllerMsg 的 Text，交给被控端按 Unicode 注入。 */
+function onImeInput(ev: Event) {
+  const el = ime.value
+  if (!el) return
+  // 组字中间态，等 composition 结束后那一次 input。
+  if ((ev as InputEvent).isComposing) return
+  const text = el.value
+  if (!text) return
+  el.value = ''
+  push({ kind: 'text', text })
+}
+
+function onCompositionEnd() {
+  // 兜底：个别输入法结束后不再派发 input，这里补一次（已经处理过则为空）。
+  const el = ime.value
+  if (!el) return
+  queueMicrotask(() => {
+    const text = el.value
+    if (!text) return
+    el.value = ''
+    push({ kind: 'text', text })
+  })
+}
+
+function onImeBlur() {
+  if (ime.value) ime.value.value = ''
 }
 
 /** 失焦或页面隐藏时松开所有按键，免得打字机效应。 */
 function releaseAll() {
   if (!conn) return
+  heldKeys.clear()
   pending.push({ kind: 'releaseAll' })
   flushInput()
 }
@@ -301,7 +395,7 @@ function connect() {
     onReady: (r) => {
       ready.value = r
       state.value = 'ready'
-      nextTick(() => canvas.value?.focus())
+      nextTick(() => focusIme())
     },
     onEvent,
     onVideo,
@@ -349,6 +443,7 @@ function leave() {
 }
 
 onMounted(() => {
+  nextTick(() => focusIme())
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
   window.addEventListener('blur', onBlur)
@@ -416,6 +511,28 @@ onBeforeUnmount(() => {
   -webkit-user-select: none;
 }
 .stage canvas.idle { opacity: 0; }
+
+/* 输入代理：看不见、点不到，只用来接输入法；候选框跟着它走。 */
+.stage .ime {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  opacity: .01;
+  resize: none;
+  overflow: hidden;
+  font-size: 16px;
+  line-height: 16px;
+  color: transparent;
+  background: transparent;
+  caret-color: transparent;
+  pointer-events: none;
+  z-index: 2;
+}
 
 .overlay {
   position: absolute;
