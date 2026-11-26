@@ -31,7 +31,10 @@
         <div class="host-actions">
           <button class="primary" :disabled="!h.enabled || !modes(h.modes).includes('rdp')"
             @click="openDialog(h)">连接（RDP）</button>
-          <button v-if="modes(h.modes).includes('perf')" disabled title="性能模式在 M8 提供">性能模式</button>
+          <button v-if="modes(h.modes).includes('perf')"
+            :disabled="!h.enabled || perfBusy === h.id"
+            :title="h.enabled ? '端到端加密连接，路由器看不到画面' : '主机已停用'"
+            @click="startPerf(h)">{{ perfBusy === h.id ? '准备中…' : '性能模式' }}</button>
         </div>
       </article>
     </div>
@@ -62,6 +65,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { get, post } from '../api'
 import { openTab, workspace, MAX_TABS } from '../sessionTabs'
+import { openPerf } from '../perf'
 
 interface Host {
   id: number; name: string; address: string; rdp_port: number
@@ -79,6 +83,7 @@ const target = ref<Host | null>(null)
 const submitting = ref(false)
 const dialogError = ref('')
 const form = reactive({ username: '', password: '', domain: '' })
+const perfBusy = ref(0)
 
 const filtered = computed(() => {
   const q = query.value.trim().toLowerCase()
@@ -128,6 +133,22 @@ async function submit() {
     dialogError.value = e.message || '连接失败'
   } finally {
     submitting.value = false
+  }
+}
+
+// 性能模式：签一张一次性票据，会话信息放内存里交给 /perf 页面。
+async function startPerf(h: Host) {
+  if (perfBusy.value) return
+  perfBusy.value = h.id
+  error.value = ''
+  try {
+    const t = await post<SessionTicket>('/perf/ticket', { host_id: h.id })
+    openPerf({ hostName: h.name, hostId: h.id, sessionId: t.session_id, wsPath: t.ws_path })
+    router.push({ name: 'perf' })
+  } catch (e: any) {
+    error.value = e.message || '无法打开性能模式'
+  } finally {
+    perfBusy.value = 0
   }
 }
 

@@ -176,9 +176,11 @@ since = 0</pre>
       <form class="form-grid card" @submit.prevent="saveSettings">
         <label>会话空闲超时（分钟）<input v-model.number="settings.session_idle_min" type="number" min="1" /></label>
         <label>单文件上传上限（MB）<input v-model.number="settings.max_upload_mb" type="number" min="1" /></label>
+        <label>性能模式并发会话上限<input v-model.number="settings.perf_max_sessions" type="number" min="1" max="32" /></label>
+        <label>每台主机同时会话数<input v-model.number="settings.perf_max_per_host" type="number" min="1" max="32" /></label>
         <div class="full"><button class="primary" type="submit">保存</button></div>
       </form>
-      <p class="muted small">保存后立即生效。未保存过时，默认值来自 UCI 配置的对应选项。性能模式的开关与监听地址在路由器的 UCI 配置里，并发上限在下一版开放。</p>
+      <p class="muted small">保存后立即生效。未保存过时，默认值来自 UCI 配置的对应选项。性能模式的开关与监听地址在路由器的 UCI 配置里，改完要重启网关。</p>
     </section>
 
     <section v-else class="panel">
@@ -224,7 +226,10 @@ const perfServer = computed(() => {
   }
   return l
 })
-const settings = reactive({ session_idle_min: 30, max_upload_mb: 2048 })
+const settings = reactive({
+  session_idle_min: 30, max_upload_mb: 2048,
+  perf_max_sessions: 2, perf_max_per_host: 1,
+})
 const userForm = ref<any>(null)
 const hostForm = ref<any>(null)
 // 新增与编辑分开判断：不能再用 id 是否存在来判断，
@@ -261,6 +266,8 @@ async function load() {
     const cfg = await get<Record<string, string>>('/admin/settings')
     settings.session_idle_min = Number(cfg.session_idle_min || 30)
     settings.max_upload_mb = Number(cfg.max_upload_mb || 2048)
+    settings.perf_max_sessions = Number(cfg['perf.max_sessions'] || 2)
+    settings.perf_max_per_host = Number(cfg['perf.max_per_host'] || 1)
     await loadPerf()
     await loadAudit()
   } catch (e: any) { error.value = e.message }
@@ -351,6 +358,8 @@ async function saveSettings() {
     await put('/admin/settings', {
       session_idle_min: String(settings.session_idle_min),
       max_upload_mb: String(settings.max_upload_mb),
+      'perf.max_sessions': String(settings.perf_max_sessions),
+      'perf.max_per_host': String(settings.perf_max_per_host),
     })
     error.value = ''
   } catch (e: any) { error.value = e.message }
