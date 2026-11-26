@@ -6,7 +6,8 @@
 
 import { avcCodecString, importKeyBundle, openSealed, parseMediaHeader, sealUnit } from './wire'
 import type { SessionKeys } from './wire'
-import { decodeHostDatagram, decodeHostMsg, encodeAck, encodeEcho, encodePing, encodeRequestKeyframe } from './messages'
+import { decodeHostDatagram, decodeHostMsg, encodeAck, encodeEcho, encodeInput, encodePing, encodeRequestKeyframe } from './messages'
+import type { InputEvent } from './messages'
 
 const VD = (self as any).VideoDecoder
 const post = (msg: any, transfer?: Transferable[]) => (self as any).postMessage(msg, transfer || [])
@@ -67,6 +68,7 @@ self.onmessage = (ev: MessageEvent) => {
   if (!m || typeof m !== 'object') return
   if (m.type === 'start') void start(m.keys)
   else if (m.type === 'frame') onBinary(new Uint8Array(m.data as ArrayBuffer))
+  else if (m.type === 'input') sendControl(encodeInput(m.t, m.events as InputEvent[]))
   else if (m.type === 'stop') stop()
 }
 

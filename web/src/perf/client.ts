@@ -3,7 +3,7 @@
 // 票据只能用一次，wsPath 由后端签发；ready 里的密钥在内存里交给 Worker，
 // 主线程不保留。
 
-import type { HostEvent } from './messages'
+import type { HostEvent, InputEvent } from './messages'
 
 export interface PerfReady {
   type: 'ready'
@@ -33,6 +33,8 @@ export interface PerfHandlers {
 }
 
 export interface PerfConnection {
+  /** 发一批输入事件；t 是这些事件在控制端时钟上的时刻（微秒）。 */
+  sendInput(events: InputEvent[], t: number): void
   close(): void
 }
 
@@ -134,5 +136,10 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }))
   }, 30_000)
 
-  return { close: shutdown }
+  return {
+    sendInput(events: InputEvent[], t: number) {
+      if (workerReady && worker) worker.postMessage({ type: 'input', events, t })
+    },
+    close: shutdown,
+  }
 }

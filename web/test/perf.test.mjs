@@ -9,7 +9,7 @@
 
 import { importKeyBundle, openSealed, sealUnit, unitCounter, parseMediaHeader, avcCodecString } from '../src/perf/wire'
 import { CborWriter } from '../src/perf/cbor'
-import { decodeHostMsg, encodeAck, encodePing, encodeRequestKeyframe } from '../src/perf/messages'
+import { decodeHostMsg, encodeAck, encodeInput, encodePing, encodeRequestKeyframe } from '../src/perf/messages'
 
 let failed = 0
 function check(name, got, want) {
@@ -67,6 +67,7 @@ check('Hello 显示器', helloEv.displays, [{ index: 0, name: 'Dis', x: 1, y: 2,
 check('RequestKeyframe(5)', toHex(encodeRequestKeyframe(5)), '82048105')
 check('Ping(5)', toHex(encodePing(5)), '82008105')
 check('Ack(99,1000)', toHex(encodeAck(99, 1000)), '82018218631903e8')
+check('Input(ReleaseAll)', toHex(encodeInput(5, [{ kind: 'releaseAll' }])), '8201820581820680')
 
 // ---- 媒体包头 ----
 const pkt = new Uint8Array(30)

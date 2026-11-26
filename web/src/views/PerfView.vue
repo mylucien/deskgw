@@ -20,7 +20,19 @@
     </div>
 
     <div class="stage" ref="stage">
-      <canvas ref="canvas" :class="{ idle: !hasFrame }" :style="{ cursor: cursorStyle }"></canvas>
+      <canvas
+        ref="canvas"
+        tabindex="0"
+        title="点击画面后可直接用键盘和鼠标操作"
+        :class="{ idle: !hasFrame }"
+        :style="{ cursor: cursorStyle }"
+        @pointerdown="onPointerDown"
+        @pointerup="onPointerUp"
+        @pointercancel="onPointerUp"
+        @pointermove="onPointerMove"
+        @wheel.prevent="onWheel"
+        @contextmenu.prevent
+      ></canvas>
 
       <div v-if="state !== 'ready' || !hasFrame" class="overlay">
         <div class="overlay-card">
@@ -58,12 +70,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { perfSession, closePerf } from '../perf'
 import { connectPerf } from '../perf/client'
 import type { PerfConnection, PerfReady, PerfStats } from '../perf/client'
-import type { HostEvent } from '../perf/messages'
+import type { HostEvent, InputEvent } from '../perf/messages'
 
 type State = 'connecting' | 'ready' | 'error' | 'ended'
 
@@ -108,6 +120,136 @@ function setBanner(text: string) {
   bannerTimer = window.setTimeout(() => (banner.value = ''), 8000)
 }
 
+// ---- 键鼠输入 -------------------------------------------------------------
+//
+// 鼠标用归一化坐标（0..1，相对第 0 路画面），键盘用 KeyboardEvent.code。
+// 事件先攒一帧再发：鼠标移动只留最后一个，点击、滚轮、按键保持先后。
+
+let pending: InputEvent[] = []
+let raf = 0
+let cursorVisible = true
+
+function flushInput() {
+  raf = 0
+  if (!pending.length) return
+  const events = pending
+  pending = []
+  conn?.sendInput(events, Math.round(performance.now() * 1000))
+}
+
+function push(ev: InputEvent) {
+  pending.push(ev)
+  if (!raf) raf = requestAnimationFrame(flushInput)
+}
+
+function pushMove(ev: InputEvent) {
+  const last = pending[pending.length - 1]
+  if (last && last.kind === 'move') pending[pending.length - 1] = ev
+  else pending.push(ev)
+  if (!raf) raf = requestAnimationFrame(flushInput)
+}
+
+/** 指针在画布上的位置，归一化到 0..1；拖到画布外时夹住。 */
+function point(ev: { clientX: number; clientY: number }) {
+  const c = canvas.value
+  if (!c) return null
+  const r = c.getBoundingClientRect()
+  if (!r.width || !r.height) return null
+  return {
+    x: Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
+    y: Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)),
+  }
+}
+
+// 浏览器与协议对鼠标键的编号不同：中键在浏览器是 1、协议里是 2。
+const webButton: Record<number, number> = { 0: 0, 2: 1, 1: 2, 3: 3, 4: 4 }
+
+function onPointerDown(ev: PointerEvent) {
+  canvas.value?.focus()
+  canvas.value?.setPointerCapture?.(ev.pointerId)
+  const p = point(ev)
+  if (p && cursorVisible) pushMove({ kind: 'move', x: p.x, y: p.y })
+  const b = webButton[ev.button]
+  if (b !== undefined) {
+    push({ kind: 'button', button: b, down: true })
+    ev.preventDefault()
+  }
+}
+
+function onPointerUp(ev: PointerEvent) {
+  const b = webButton[ev.button]
+  if (b !== undefined) push({ kind: 'button', button: b, down: false })
+  try {
+    canvas.value?.releasePointerCapture?.(ev.pointerId)
+  } catch {
+    /* 没捕获过 */
+  }
+}
+
+function onPointerMove(ev: PointerEvent) {
+  if (!cursorVisible) {
+    // 被控端把光标藏起来了（游戏里转视角）：改发相对移动。
+    const dx = Math.round(ev.movementX)
+    const dy = Math.round(ev.movementY)
+    if (dx || dy) push({ kind: 'delta', dx, dy })
+    return
+  }
+  const p = point(ev)
+  if (p) pushMove({ kind: 'move', x: p.x, y: p.y })
+}
+
+/** 一格滚轮是 120：像素模式按 100px 一格折算，行、页按浏览器给的倍数。 */
+function wheelStep(v: number, mode: number) {
+  const raw = mode === 0 ? (v / 100) * 120 : v * (mode === 1 ? 120 : 1200)
+  return Math.max(-2400, Math.min(2400, Math.round(raw)))
+}
+
+function onWheel(ev: WheelEvent) {
+  const dx = wheelStep(ev.deltaX, ev.deltaMode)
+  const dy = wheelStep(ev.deltaY, ev.deltaMode)
+  if (dx || dy) push({ kind: 'wheel', dx, dy })
+}
+
+function onKey(ev: KeyboardEvent, down: boolean) {
+  if (state.value !== 'ready') return
+  const el = ev.target as HTMLElement | null
+  const tag = el?.tagName
+  // 页面上的输入框、按钮、可编辑区还给自己；画面本身没有焦点也照收，
+  // 免得用户必须先点一下才能打字。
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' || el?.isContentEditable) return
+  // 输入法组字期间不干预，否则候选框会失灵（文本输入还没接，见文档）。
+  if (ev.isComposing) return
+  // 刷新、全屏、开发者工具交还给浏览器。
+  if (ev.key === 'F5' || ev.key === 'F11' || ev.key === 'F12') return
+  const code = ev.code
+  if (!code) return
+  push({ kind: 'key', code, down })
+  ev.preventDefault()
+}
+
+/** 失焦或页面隐藏时松开所有按键，免得打字机效应。 */
+function releaseAll() {
+  if (!conn) return
+  pending.push({ kind: 'releaseAll' })
+  flushInput()
+}
+
+function onBlur() {
+  releaseAll()
+}
+
+function onVisibility() {
+  if (document.hidden) releaseAll()
+}
+
+function onKeyDown(ev: KeyboardEvent) {
+  onKey(ev, true)
+}
+
+function onKeyUp(ev: KeyboardEvent) {
+  onKey(ev, false)
+}
+
 function onVideo(frame: VideoFrame) {
   const c = canvas.value
   if (!c) {
@@ -139,7 +281,8 @@ function onEvent(ev: HostEvent) {
     encoderName.value = `${ev.name}${ev.hardware ? '（硬件）' : ''}`
   } else if (ev.type === 'cursor') {
     // 1 = 显示着，用本地光标；0/2 = 已经画在画面里或者隐藏了。
-    cursorStyle.value = ev.visibility === 1 ? 'default' : 'none'
+    cursorVisible = ev.visibility === 1
+    cursorStyle.value = cursorVisible ? 'default' : 'none'
   } else if (ev.type === 'notice') {
     if (!ev.recovered && ev.text) setBanner(ev.text)
     else if (ev.recovered) banner.value = ''
@@ -154,6 +297,7 @@ function connect() {
     onReady: (r) => {
       ready.value = r
       state.value = 'ready'
+      nextTick(() => canvas.value?.focus())
     },
     onEvent,
     onVideo,
@@ -177,8 +321,15 @@ function connect() {
 
 function shutdown() {
   window.clearTimeout(bannerTimer)
+  // 先把按下的键松开再断，免得被控端留下按住的状态。
+  releaseAll()
+  if (raf) {
+    cancelAnimationFrame(raf)
+    raf = 0
+  }
   conn?.close()
   conn = null
+  pending = []
 }
 
 function hangup() {
@@ -193,8 +344,21 @@ function leave() {
   router.push({ name: 'hosts' })
 }
 
-onMounted(connect)
-onBeforeUnmount(shutdown)
+onMounted(() => {
+  window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('keyup', onKeyUp)
+  window.addEventListener('blur', onBlur)
+  document.addEventListener('visibilitychange', onVisibility)
+  connect()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('keyup', onKeyUp)
+  window.removeEventListener('blur', onBlur)
+  document.removeEventListener('visibilitychange', onVisibility)
+  shutdown()
+})
 </script>
 
 <style scoped>
@@ -243,6 +407,7 @@ onBeforeUnmount(shutdown)
   width: auto;
   height: auto;
   background: #000;
+  outline: none;
   user-select: none;
   -webkit-user-select: none;
 }

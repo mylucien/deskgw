@@ -149,6 +149,54 @@ export function decodeHostMsg(buf: Uint8Array): HostEvent | null {
 
 // ---- 发往被控端 -----------------------------------------------------------
 
+/** 输入事件。编号与 airhand_proto::session::InputEvent 一致。 */
+export type InputEvent =
+  | { kind: 'move'; x: number; y: number; stream?: number }
+  | { kind: 'delta'; dx: number; dy: number }
+  | { kind: 'button'; button: number; down: boolean }
+  | { kind: 'wheel'; dx: number; dy: number }
+  | { kind: 'key'; code: string; down: boolean }
+  | { kind: 'text'; text: string }
+  | { kind: 'releaseAll' }
+
+/**
+ * ControllerMsg::Input = [1, [t, [事件…]]]。
+ *
+ * t 是控制端的时钟（微秒，与 Ping 同一个时钟），被控端用它丢掉晚到太久的
+ * 输入；同一批里的事件按顺序执行，鼠标移动由被控端合并。
+ */
+export function encodeInput(t: number, events: InputEvent[]): Uint8Array {
+  const w = new CborWriter()
+  w.array(2).uint(1).array(2).uint(t).array(events.length)
+  for (const e of events) {
+    switch (e.kind) {
+      case 'move':
+        w.array(2).uint(0).array(e.stream ? 3 : 2).float32(e.x).float32(e.y)
+        if (e.stream) w.uint(e.stream)
+        break
+      case 'delta':
+        w.array(2).uint(1).array(2).int(e.dx).int(e.dy)
+        break
+      case 'button':
+        w.array(2).uint(2).array(2).uint(e.button).bool(e.down)
+        break
+      case 'wheel':
+        w.array(2).uint(3).array(2).int(e.dx).int(e.dy)
+        break
+      case 'key':
+        w.array(2).uint(4).array(2).text(e.code).bool(e.down)
+        break
+      case 'text':
+        w.array(2).uint(5).array(1).text(e.text)
+        break
+      case 'releaseAll':
+        w.array(2).uint(6).array(0)
+        break
+    }
+  }
+  return w.take()
+}
+
 /** ControllerMsg::RequestKeyframe = [4, [after, stream?]]。 */
 export function encodeRequestKeyframe(after: number, stream = 0): Uint8Array {
   const w = new CborWriter()
