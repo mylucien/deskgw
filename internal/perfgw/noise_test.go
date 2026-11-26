@@ -75,7 +75,7 @@ func TestNoiseXXInitiator(t *testing.T) {
 		t.Fatalf("学到被控端公钥不对: 得到 %s，期望 %s", got, vecHostStaticPub)
 	}
 
-	m3, err := h.writeMessage3(vecIntro)
+	m3, err := h.writeMessage3(hexBytes(t, vecIntro))
 	if err != nil {
 		t.Fatalf("第 3 条消息: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestNoiseIKInitiator(t *testing.T) {
 		x25519Pub(t, vecHostStaticPub), airhandPrologue(0))
 	h.setEphemeral(x25519Priv(t, vecCtrlEphPriv))
 
-	m1, err := h.writeMessage1(nil)
+	m1, err := h.writeMessage1(hexBytes(t, vecIntro))
 	if err != nil {
 		t.Fatalf("第 1 条消息: %v", err)
 	}
