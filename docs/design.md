@@ -380,7 +380,7 @@ UCI：`perf_enabled`、`perf_listen`（默认 `0.0.0.0:4433`，建议绑定 LAN 
 | `worker.ts` | 按流序号重组下行数据块、控制通道顺序解密、WebCodecs 解码、`Ack` 与关键帧请求 |
 | `web/src/views/PerfView.vue` | 界面：画布、安全码、状态栏（分辨率、帧率、码率、RTT）、错误提示 |
 
-键鼠输入已接（归一化坐标 + `KeyboardEvent.code` + `ReleaseAll`）；画质设置、`Report`、文本/输入法还没接，`Lost` 用 `RequestKeyframe` 代替（每帧一条流，缺帧由本端判断）。
+键鼠输入已接并实测（归一化坐标、`KeyboardEvent.code`、`ReleaseAll`，光标三态按协议区分 `shown`／`inFrame`／`hidden`）；画质设置、`Report`、文本/输入法还没接，`Lost` 用 `RequestKeyframe` 代替（每帧一条流，缺帧由本端判断）。光标形状（`CursorImage`）受网关丢弃大块通道的限制，暂时只有一个箭头。
 
 **解密与性能**
 

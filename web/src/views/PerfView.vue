@@ -127,7 +127,9 @@ function setBanner(text: string) {
 
 let pending: InputEvent[] = []
 let raf = 0
-let cursorVisible = true
+// 被控端对光标的三种说法（协议 CursorVisibility）：0 隐藏（游戏里转视角）、
+// 1 显示且由控制端画、2 已经画在画面里。只有 0 才发相对移动，2 照常发绝对坐标。
+let cursorMode: 0 | 1 | 2 = 1
 
 function flushInput() {
   raf = 0
@@ -168,7 +170,7 @@ function onPointerDown(ev: PointerEvent) {
   canvas.value?.focus()
   canvas.value?.setPointerCapture?.(ev.pointerId)
   const p = point(ev)
-  if (p && cursorVisible) pushMove({ kind: 'move', x: p.x, y: p.y })
+  if (p && cursorMode !== 0) pushMove({ kind: 'move', x: p.x, y: p.y })
   const b = webButton[ev.button]
   if (b !== undefined) {
     push({ kind: 'button', button: b, down: true })
@@ -187,7 +189,7 @@ function onPointerUp(ev: PointerEvent) {
 }
 
 function onPointerMove(ev: PointerEvent) {
-  if (!cursorVisible) {
+  if (cursorMode === 0) {
     // 被控端把光标藏起来了（游戏里转视角）：改发相对移动。
     const dx = Math.round(ev.movementX)
     const dy = Math.round(ev.movementY)
@@ -280,9 +282,11 @@ function onEvent(ev: HostEvent) {
   if (ev.type === 'encoder') {
     encoderName.value = `${ev.name}${ev.hardware ? '（硬件）' : ''}`
   } else if (ev.type === 'cursor') {
-    // 1 = 显示着，用本地光标；0/2 = 已经画在画面里或者隐藏了。
-    cursorVisible = ev.visibility === 1
-    cursorStyle.value = cursorVisible ? 'default' : 'none'
+    // 1 = 显示着，用本地光标；2 = 被控端已经把光标画进画面，藏本地光标；
+    // 0 = 隐藏，藏本地光标并改发相对移动。
+    const v = ev.visibility
+    cursorMode = v === 1 ? 1 : v === 2 ? 2 : 0
+    cursorStyle.value = cursorMode === 1 ? 'default' : 'none'
   } else if (ev.type === 'notice') {
     if (!ev.recovered && ev.text) setBanner(ev.text)
     else if (ev.recovered) banner.value = ''
