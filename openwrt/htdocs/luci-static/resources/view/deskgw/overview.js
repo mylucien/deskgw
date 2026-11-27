@@ -46,6 +46,33 @@ return view.extend({
 		o.datatype = 'uinteger';
 		o.default = '2048';
 
+		s = m.section(form.NamedSection, 'main', 'deskgw', _('性能模式'),
+			_('接收 Airhand 被控端的 QUIC 连接。修改后点页面底部的「重启服务」生效。'));
+
+		o = s.option(form.Flag, 'perf_enabled', _('启用性能模式'),
+			_('默认关闭，不影响普通远程桌面。'));
+		o.default = '0';
+
+		o = s.option(form.Value, 'perf_listen', _('QUIC 监听地址'),
+			_('UDP 监听地址与端口，默认 0.0.0.0:4433。建议绑定 LAN 接口（如 192.168.1.1:4433），不要把 UDP 端口暴露到公网。'));
+		o.placeholder = '0.0.0.0:4433';
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'perf_cert', _('QUIC 证书'),
+			_('首次启动自动生成，一般不需要修改。'));
+		o.placeholder = '/etc/deskgw/perf.crt';
+		o.readonly = true;
+
+		o = s.option(form.Value, 'perf_key', _('QUIC 私钥'),
+			_('首次启动自动生成，一般不需要修改。'));
+		o.placeholder = '/etc/deskgw/perf.key';
+		o.readonly = true;
+
+		o = s.option(form.Value, 'perf_identity', _('控制端身份私钥'),
+			_('X25519 私钥，权限 600，首次启动自动生成。丢失或替换后，所有被控端都要重新预置配对，请纳入备份。'));
+		o.placeholder = '/etc/deskgw/perf_identity';
+		o.readonly = true;
+
 		s = m.section(form.NamedSection, 'main', 'deskgw', _('运维操作'));
 
 		o = s.option(form.Button, '_fp', _('查看证书指纹'));
