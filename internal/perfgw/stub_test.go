@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -226,6 +227,7 @@ func (h *stubResponder) finish() (i2r, r2i []byte, err error) {
 type stubKeys struct {
 	ctrl [2][keyLen]byte // [0] 收（i2r）、[1] 发（r2i）
 	dg   [2][keyLen]byte
+	bulk [2][keyLen]byte // 大块通道：剪贴板、光标图像
 }
 
 func stubDerive(hash, i2r, r2i []byte) *stubKeys {
@@ -237,6 +239,10 @@ func stubDerive(hash, i2r, r2i []byte) *stubKeys {
 		dg: [2][keyLen]byte{
 			deriveKey(hash, i2r, labelDatagram),
 			deriveKey(hash, r2i, labelDatagram),
+		},
+		bulk: [2][keyLen]byte{
+			deriveKey(hash, i2r, labelBulk),
+			deriveKey(hash, r2i, labelBulk),
 		},
 	}
 }
@@ -258,10 +264,12 @@ func openStub(key [keyLen]byte, want uint64, data []byte) ([]byte, error) {
 type stubSession struct {
 	sid  uint64
 	keys *stubKeys
+	conn *quic.Conn
 
-	mu     sync.Mutex
-	dgRecv uint64
-	dgSend uint64
+	mu       sync.Mutex
+	dgRecv   uint64
+	dgSend   uint64
+	bulkSend uint64
 }
 
 // ---- 假被控端 -------------------------------------------------------------
@@ -278,6 +286,8 @@ type stubHost struct {
 	code     uint32
 	secret   [16]byte
 	sessions map[uint64]*stubSession
+	// lanes 是连接级 accept 循环按会话号投递的流（控制流、大块流）。
+	lanes map[uint64]chan stubLane
 	// approved 收到正式控制码（= 主机 id）时写入。
 	approved chan uint32
 	// registered 每次注册成功（含重连）通知一次。
@@ -285,7 +295,9 @@ type stubHost struct {
 	// hellos / inputs / pongs 收集服务端转发过来的东西，供测试断言。
 	hellos chan []byte
 	inputs chan []byte
-	pongs  chan uint64
+	// bulks 是大块通道上收到的明文（剪贴板等），按到达顺序。
+	bulks chan []byte
+	pongs chan uint64
 	// errs 记录会话里的错误（测试结束时检查）。
 	errs chan error
 }
@@ -302,6 +314,7 @@ func newStubHost(addr, name, fingerprint string) (*stubHost, error) {
 		registered: make(chan struct{}, 8),
 		hellos:     make(chan []byte, 8),
 		inputs:     make(chan []byte, 16),
+		bulks:      make(chan []byte, 8),
 		pongs:      make(chan uint64, 8),
 		errs:       make(chan error, 16),
 	}, nil
@@ -348,9 +361,11 @@ func (h *stubHost) dialOnce(ctx context.Context) error {
 	h.mu.Lock()
 	h.conn = conn
 	h.sessions = map[uint64]*stubSession{}
+	h.lanes = map[uint64]chan stubLane{}
 	h.mu.Unlock()
 	defer conn.CloseWithError(0, "")
 	go h.routeDatagrams(ctx, conn)
+	go h.routeStreams(ctx, conn)
 
 	st, err := conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -430,7 +445,20 @@ func (h *stubHost) registerFrame() []byte {
 }
 
 // serveSession 走完一个会话的端到端握手，之后发 Hello、回 Pong。
+// stubLane 是连接级 accept 循环投递给某个会话的一条单向流（会话头已经读掉）。
+type stubLane struct {
+	rs   *quic.ReceiveStream
+	lane uint8
+}
+
 func (h *stubHost) serveSession(ctx context.Context, conn *quic.Conn, sid uint64, init []byte) {
+	lanes := make(chan stubLane, 8)
+	h.mu.Lock()
+	h.lanes[sid] = lanes
+	h.mu.Unlock()
+	// 注册要留到会话真正结束（readLanes 退出）再删：serveSession 启动完
+	// 几个读循环就返回了，后面的流还要靠这张表找过来。
+
 	pattern, noiseMsg, err := parseStubInit(init)
 	if err != nil {
 		h.report(err)
@@ -508,16 +536,23 @@ func (h *stubHost) serveSession(ctx context.Context, conn *quic.Conn, sid uint64
 	}
 
 	// 控制端的控制流：XX 时握手要用它读第 3 条，IK 时直接读 Confirm。
-	acceptCtx, cancel := context.WithTimeout(ctx, stepTimeout)
-	defer cancel()
-	in, err = conn.AcceptUniStream(acceptCtx)
-	if err != nil {
-		h.report(fmt.Errorf("等控制流: %w", err))
-		return
-	}
-	if err := readSessionHeader(in, sid, laneControl); err != nil {
-		h.report(err)
-		return
+	// 先到的其它通道（大块）留到握手之后处理。
+	var early []stubLane
+	deadline := time.After(stepTimeout)
+	for in == nil {
+		select {
+		case l := <-lanes:
+			if l.lane == laneControl {
+				in = l.rs
+			} else {
+				early = append(early, l)
+			}
+		case <-deadline:
+			h.report(fmt.Errorf("等控制流超时"))
+			return
+		case <-ctx.Done():
+			return
+		}
 	}
 	if pattern == patternFirst {
 		finish, err := readFrame(in, maxControlMsg)
@@ -571,8 +606,16 @@ func (h *stubHost) serveSession(ctx context.Context, conn *quic.Conn, sid uint64
 	}
 
 	go h.readControl(ctx, sid, in, keys)
+	for _, l := range early {
+		if l.lane == laneBulk {
+			go h.readBulk(l.rs, keys)
+		} else {
+			l.rs.CancelRead(0)
+		}
+	}
+	go h.readLanes(ctx, sid, lanes, keys)
 	h.mu.Lock()
-	h.sessions[sid] = &stubSession{sid: sid, keys: keys}
+	h.sessions[sid] = &stubSession{sid: sid, keys: keys, conn: conn}
 	h.mu.Unlock()
 }
 
@@ -600,6 +643,128 @@ func (h *stubHost) readControl(ctx context.Context, sid uint64, in *quic.Receive
 		default:
 		}
 	}
+}
+
+// routeStreams 是整条连接唯一的单向流接受者：读会话头，按会话号投递给对应
+// 会话。与控制流分开做，避免多个会话的 accept 互相抢流。
+func (h *stubHost) routeStreams(ctx context.Context, conn *quic.Conn) {
+	for {
+		st, err := conn.AcceptUniStream(ctx)
+		if err != nil {
+			return
+		}
+		var hdr [sessionHeaderLen]byte
+		// 读会话头要设超时：quic-go 的接收流在纯阻塞读上可能不唤醒（设了
+		// deadline 才会把已到的数据交给读者）。
+		_ = st.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if _, err := io.ReadFull(st, hdr[:]); err != nil {
+			continue
+		}
+		sid, lane, err := decodeSessionHeader(hdr[:])
+		if err != nil {
+			st.CancelRead(0)
+			continue
+		}
+		// 会话可能还没登记（Incoming 与流是前后脚到的）。
+		var ch chan stubLane
+		for i := 0; i < 50; i++ {
+			h.mu.Lock()
+			ch = h.lanes[sid]
+			h.mu.Unlock()
+			if ch != nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if ch == nil {
+			st.CancelRead(0)
+			continue
+		}
+		select {
+		case ch <- stubLane{rs: st, lane: lane}:
+		default:
+			st.CancelRead(0)
+		}
+	}
+}
+
+// readLanes 收本会话后续开的大块流。
+func (h *stubHost) readLanes(ctx context.Context, sid uint64, lanes chan stubLane, keys *stubKeys) {
+	defer func() {
+		h.mu.Lock()
+		delete(h.lanes, sid)
+		h.mu.Unlock()
+	}()
+	for {
+		select {
+		case l := <-lanes:
+			if l.lane == laneBulk {
+				go h.readBulk(l.rs, keys)
+			} else {
+				l.rs.CancelRead(0)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// readBulk 读一条大块流上的长度前缀帧并解密，交给测试。
+func (h *stubHost) readBulk(st *quic.ReceiveStream, keys *stubKeys) {
+	var n uint64
+	for {
+		_ = st.SetReadDeadline(time.Now().Add(60 * time.Second))
+		frame, err := readFrame(st, maxBulkMsg)
+		if err != nil {
+			return
+		}
+		plain, err := openStub(keys.bulk[0], n, frame)
+		if err != nil {
+			h.report(fmt.Errorf("解开上行大块帧（计数 %d）: %w", n, err))
+			return
+		}
+		n++
+		select {
+		case h.bulks <- plain:
+		default:
+		}
+	}
+}
+
+// sendBulk 让假被控端在一条新的大块流上发一条消息（剪贴板），发给当前唯一的会话。
+func (h *stubHost) sendBulk(ctx context.Context, plain []byte) error {
+	h.mu.Lock()
+	var s *stubSession
+	// 取会话号最大的那条：前面的会话可能还没从表里清掉，它的连接已经关了。
+	for sid, v := range h.sessions {
+		if s == nil || sid > s.sid {
+			s = v
+		}
+	}
+	h.mu.Unlock()
+	if s == nil {
+		return fmt.Errorf("没有活跃会话")
+	}
+	sid := s.sid
+	st, err := s.conn.OpenUniStreamSync(ctx)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	body := seal(s.keys.bulk[1], s.bulkSend, plain)
+	s.bulkSend++
+	s.mu.Unlock()
+	// 会话头、长度前缀、正文一次写完：分几次小写在 quic-go 上对端读不齐。
+	var prefix [4]byte
+	binary.LittleEndian.PutUint32(prefix[:], uint32(len(body)))
+	buf := make([]byte, 0, sessionHeaderLen+4+len(body))
+	buf = append(buf, sessionHeader(sid, laneBulk)...)
+	buf = append(buf, prefix[:]...)
+	buf = append(buf, body...)
+	if _, err := st.Write(buf); err != nil {
+		return err
+	}
+	return st.Close()
 }
 
 // routeDatagrams 是整条连接唯一的数据报读者：按会话号交给对应会话，

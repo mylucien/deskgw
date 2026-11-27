@@ -278,6 +278,8 @@ type sessionKeys struct {
 	control [2][keyLen]byte
 	// datagram 是控制数据报，[0] 发、[1] 收。
 	datagram [2][keyLen]byte
+	// bulk 是大块通道（剪贴板、光标图像），[0] 发、[1] 收。计数从 0 开始。
+	bulk [2][keyLen]byte
 	// video 是各路口径的接收密钥，只收不发。
 	video [][keyLen]byte
 }
@@ -290,6 +292,9 @@ func (s *sessionKeys) wipe() {
 	}
 	for i := range s.datagram {
 		s.datagram[i] = [keyLen]byte{}
+	}
+	for i := range s.bulk {
+		s.bulk[i] = [keyLen]byte{}
 	}
 	for i := range s.video {
 		s.video[i] = [keyLen]byte{}
@@ -305,6 +310,8 @@ func deriveSessionKeys(handshakeHash, i2r, r2i []byte) *sessionKeys {
 	sk.control[1] = deriveKey(handshakeHash, r2i, labelControl)
 	sk.datagram[0] = deriveKey(handshakeHash, i2r, labelDatagram)
 	sk.datagram[1] = deriveKey(handshakeHash, r2i, labelDatagram)
+	sk.bulk[0] = deriveKey(handshakeHash, i2r, labelBulk)
+	sk.bulk[1] = deriveKey(handshakeHash, r2i, labelBulk)
 	for s := 0; s < videoStreams; s++ {
 		sk.video = append(sk.video, deriveKey(handshakeHash, r2i, videoLabel(s)))
 	}

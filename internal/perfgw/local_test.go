@@ -191,16 +191,70 @@ func TestLocalRelay(t *testing.T) {
 		t.Fatal("被控端没有收到 Ping")
 	}
 
-	frame := readDown(t, ws2, frameDownDatagram)
-	if len(frame) < datagramHeader+sealOverhead {
-		t.Fatalf("下行数据报太短: %x", frame)
+	// Pong 也是下行数据报，先收掉：readDownLane 会跳过不匹配的帧，留着会被吞掉。
+	pongFrame := readDown(t, ws2, frameDownDatagram)
+	if len(pongFrame) < datagramHeader+sealOverhead {
+		t.Fatalf("下行数据报太短: %x", pongFrame)
 	}
-	pong, err := openStub(mustKey(t, keys2.DatagramRecv), 0, frame[datagramHeader:])
+	pong, err := openStub(mustKey(t, keys2.DatagramRecv), 0, pongFrame[datagramHeader:])
 	if err != nil {
 		t.Fatalf("解开 Pong: %v", err)
 	}
 	if string(pong) != string(ping.b) {
 		t.Fatalf("Pong 与 Ping 不一致: %x / %x", pong, ping.b)
+	}
+
+	// ---- 大块通道：剪贴板 ----
+	// 上行：浏览器发 ControllerMsg::Clipboard（变体 7），被控端应当原样收到明文。
+	var clip cbWriter
+	clip.array(2)
+	clip.uint(7)
+	clip.array(1)
+	clip.text("从浏览器来")
+	clipSealed := seal(mustKey(t, keys2.BulkSend), 0, clip.b)
+	upBulk := make([]byte, upHeader, upHeader+4+len(clipSealed))
+	upBulk[0] = frameUpStream
+	upBulk[1] = laneBulk
+	upBulk = binary.LittleEndian.AppendUint32(upBulk, uint32(len(clipSealed)))
+	upBulk = append(upBulk, clipSealed...)
+	if err := ws2.WriteMessage(websocket.BinaryMessage, upBulk); err != nil {
+		t.Fatalf("发送上行剪贴板: %v", err)
+	}
+	select {
+	case got := <-host.bulks:
+		if string(got) != string(clip.b) {
+			t.Fatalf("被控端收到的大块消息不对: %x", got)
+		}
+	case err := <-host.errs:
+		t.Fatalf("被控端报错: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("被控端没有收到上行剪贴板")
+	}
+
+	// 下行：被控端推一条 HostMsg::Clipboard（变体 8），浏览器应当收到同样的密文。
+	var hostClip cbWriter
+	hostClip.array(2)
+	hostClip.uint(8)
+	hostClip.array(1)
+	hostClip.text("被控端剪贴板")
+	if err := host.sendBulk(context.Background(), hostClip.b); err != nil {
+		t.Fatalf("被控端发剪贴板: %v", err)
+	}
+	downBulk := readDownLane(t, ws2, laneBulk)
+	if len(downBulk) < downHeader+4 {
+		t.Fatalf("下行大块帧太短: %x", downBulk)
+	}
+	if downBulk[1] != laneBulk {
+		t.Fatalf("下行大块帧的通道号不对: %d", downBulk[1])
+	}
+	body := downBulk[downHeader:]
+	n := binary.LittleEndian.Uint32(body[:4])
+	plain, err := openStub(mustKey(t, keys2.BulkRecv), 0, body[4:4+n])
+	if err != nil {
+		t.Fatalf("解开下行剪贴板: %v", err)
+	}
+	if string(plain) != string(hostClip.b) {
+		t.Fatalf("下行剪贴板内容不对: %x / %x", plain, hostClip.b)
 	}
 }
 
@@ -270,6 +324,24 @@ func readHello(t *testing.T, ws *websocket.Conn, keys keyBundle) []byte {
 }
 
 // readDown 读一条指定类型的下行二进制帧，跳过文本消息（ended / pong 之类）。
+// readDownLane 读到指定通道的下行流帧为止（视频帧也是同一种类型）。
+func readDownLane(t *testing.T, ws *websocket.Conn, lane uint8) []byte {
+	t.Helper()
+	_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		mt, data, err := ws.ReadMessage()
+		if err != nil {
+			t.Fatalf("读下行帧: %v", err)
+		}
+		if mt != websocket.BinaryMessage || len(data) < downHeader {
+			continue
+		}
+		if data[0] == frameDownStream && data[1] == lane {
+			return data
+		}
+	}
+}
+
 func readDown(t *testing.T, ws *websocket.Conn, want byte) []byte {
 	t.Helper()
 	_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))

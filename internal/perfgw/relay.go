@@ -238,6 +238,11 @@ type relay struct {
 
 	mu      sync.Mutex
 	streams map[*quic.ReceiveStream]struct{}
+
+	// bulk 是本端往被控端的大块通道，第一次要发剪贴板时才开（单向流，
+	// 会话头只在开头写一次）。之后一直是这条流。
+	bulkMu sync.Mutex
+	bulk   *quic.SendStream
 }
 
 func newRelay(sess *session, ws *websocket.Conn, lim *rateLimiter) *relay {
@@ -307,6 +312,12 @@ func (r *relay) cancelReads() {
 	}
 	r.streams = map[*quic.ReceiveStream]struct{}{}
 	r.mu.Unlock()
+	r.bulkMu.Lock()
+	if r.bulk != nil {
+		r.bulk.CancelWrite(0)
+		r.bulk = nil
+	}
+	r.bulkMu.Unlock()
 }
 
 // ---- 被控端 → 浏览器 -------------------------------------------------------
@@ -318,17 +329,23 @@ func (r *relay) readControl() {
 }
 
 // acceptStreams 处理被控端后续开的单向流。每帧画面一条流，大块通道常驻
-// 但要丢弃；分拣已经由 hostConn.demux 按会话号做完，这里只按通道分流。
+// 一条（剪贴板、光标图像）；分拣已经由 hostConn.demux 按会话号做完，
+// 这里只按通道分流。
 func (r *relay) acceptStreams(ctx context.Context) {
 	for {
 		select {
 		case st := <-r.sess.streams:
 			switch {
 			case st.lane == laneBulk:
-				// 大块通道只由被控端推文件相关的内容，性能模式不用，读了就丢。
+				// 剪贴板、光标图像：一条流挂整个会话，不能丢（丢了浏览器会
+				// 一直等长度前缀后面那半截），也不能设读超时。
+				// quic-go v0.66 的接收流要设过 deadline 才会把已到的数据交给
+				// 阻塞的读者：给一个很长的期限，相当于"不超时"。
+				_ = st.rs.SetReadDeadline(time.Now().Add(24 * time.Hour))
+				r.track(st.rs)
 				go func() {
-					defer st.rs.CancelRead(0)
-					_, _ = io.Copy(io.Discard, st.rs)
+					defer r.untrack(st.rs)
+					r.forward(st.rs, laneBulk, r.seq.Add(1), false)
 				}()
 			case st.lane >= laneVideo0 && st.lane < laneFile:
 				r.track(st.rs)
@@ -394,7 +411,8 @@ func (r *relay) pushStream(lane uint8, seq uint32, flags uint8, data []byte, dro
 	binary.LittleEndian.PutUint32(f[2:6], seq)
 	f[6] = flags
 	copy(f[downHeader:], data)
-	return r.sink.push(outFrame{data: f}, droppable)
+	ok := r.sink.push(outFrame{data: f}, droppable)
+	return ok
 }
 
 // readDatagrams 转发控制数据报（Ping/Pong、Ack、Lost、Report 都在里面）。
@@ -422,12 +440,19 @@ func (r *relay) readDatagrams(ctx context.Context) {
 
 // ---- 浏览器 → 被控端 -------------------------------------------------------
 
-// upStream 把浏览器的一块密文写进控制通道。会话头在握手时已经写过，这里
-// 只接数据；浏览器无法指定会话号，也就无法写进别的会话。
+// upStream 把浏览器的一块密文写进对应的上行通道。控制通道的会话头在握手时
+// 已经写过，大块通道按需开流；浏览器无法指定会话号，也就无法写进别的会话。
 func (r *relay) upStream(lane uint8, data []byte) error {
-	if lane != laneControl {
-		return errUpLane
+	switch lane {
+	case laneControl:
+		return r.upControl(data)
+	case laneBulk:
+		return r.upBulk(data)
 	}
+	return errUpLane
+}
+
+func (r *relay) upControl(data []byte) error {
 	if len(data) == 0 || len(data) > maxControlMsg {
 		return errUpSize
 	}
@@ -437,6 +462,46 @@ func (r *relay) upStream(lane uint8, data []byte) error {
 	_ = r.sess.ctrl.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if _, err := r.sess.ctrl.Write(data); err != nil {
 		r.stop("写入被控端失败")
+		return err
+	}
+	return nil
+}
+
+// upBulk 写大块通道。第一条消息时开一条单向流并写上会话头，之后复用。
+func (r *relay) upBulk(data []byte) error {
+	if len(data) == 0 || len(data) > maxBulkMsg {
+		return errUpSize
+	}
+	if !r.lim.allow() {
+		return errRate
+	}
+	r.bulkMu.Lock()
+	defer r.bulkMu.Unlock()
+	if r.bulk == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), stepTimeout)
+		st, err := r.conn.OpenUniStreamSync(ctx)
+		cancel()
+		if err != nil {
+			r.stop("打开大块通道失败")
+			return err
+		}
+		r.bulk = st
+		// 会话头与第一条消息一起写：分两次小写时对端只 accept 到流、读不到数据。
+		buf := make([]byte, 0, sessionHeaderLen+len(data))
+		buf = append(buf, sessionHeader(r.sid, laneBulk)...)
+		buf = append(buf, data...)
+		_ = st.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if _, err := st.Write(buf); err != nil {
+			log.Printf("写大块通道失败: %v", err)
+			r.stop("写入大块通道失败")
+			return err
+		}
+		return nil
+	}
+	_ = r.bulk.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if _, err := r.bulk.Write(data); err != nil {
+		r.stop("写入大块通道失败")
+		r.bulk = nil
 		return err
 	}
 	return nil

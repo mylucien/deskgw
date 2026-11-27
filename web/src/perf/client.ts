@@ -35,6 +35,8 @@ export interface PerfHandlers {
 export interface PerfConnection {
   /** 发一批输入事件；t 是这些事件在控制端时钟上的时刻（微秒）。 */
   sendInput(events: InputEvent[], t: number): void
+  /** 把一段文本推到被控端的剪贴板（大块通道）。 */
+  sendClipboard(text: string): void
   close(): void
 }
 
@@ -137,6 +139,9 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
   }, 30_000)
 
   return {
+    sendClipboard(text: string) {
+      if (worker && workerReady && text) worker.postMessage({ type: 'clipboard', text })
+    },
     sendInput(events: InputEvent[], t: number) {
       if (workerReady && worker) worker.postMessage({ type: 'input', events, t })
     },

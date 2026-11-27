@@ -9,7 +9,7 @@
 
 import { importKeyBundle, openSealed, sealUnit, unitCounter, parseMediaHeader, avcCodecString } from '../src/perf/wire'
 import { CborWriter } from '../src/perf/cbor'
-import { decodeHostMsg, encodeAck, encodeInput, encodePing, encodeRequestKeyframe } from '../src/perf/messages'
+import { decodeHostMsg, encodeAck, encodeClipboard, encodeInput, encodePing, encodeRequestKeyframe } from '../src/perf/messages'
 
 let failed = 0
 function check(name, got, want) {
@@ -31,8 +31,10 @@ const SEALED = '749d93290d0fbf21e71f9a3283920d9f2a524bd8066b783c265fbf0807060504
 
 const keys = await importKeyBundle({
   control_send: KEY, control_recv: KEY, datagram_send: KEY, datagram_recv: KEY, video: [KEY],
+  bulk_send: KEY, bulk_recv: KEY,
   control_send_counter: 1, control_recv_counter: 1,
   datagram_send_counter: 0, datagram_recv_counter: 0,
+  bulk_send_counter: 0, bulk_recv_counter: 0,
 })
 
 // ---- 密封单元 ----
@@ -71,6 +73,13 @@ check('Input(ReleaseAll)', toHex(encodeInput(5, [{ kind: 'releaseAll' }])), '820
 // InputEvent::Text：变体 5，字段是单个字符串；被控端按 Unicode 注入，中文、emoji 都走这条。
 check('Input(Text 你好)', toHex(encodeInput(5, [{ kind: 'text', text: '你好' }])), '820182058182058166e4bda0e5a5bd')
 check('Input(Text abc)', toHex(encodeInput(5, [{ kind: 'text', text: 'abc' }])), '820182058182058163616263')
+
+// ---- CBOR：剪贴板（大块通道） ----
+// ControllerMsg::Clipboard 是单字段变体 7，HostMsg::Clipboard 是变体 8。
+check('Clipboard 上行', toHex(encodeClipboard('abc')), '82078163616263')
+const clipBuf = new CborWriter().array(2).uint(8).array(1).text('远端剪贴板').take()
+const clipEv = decodeHostMsg(clipBuf)
+check('Clipboard 下行', [clipEv.type, clipEv.text], ['clipboard', '远端剪贴板'])
 
 // ---- 媒体包头 ----
 const pkt = new Uint8Array(30)

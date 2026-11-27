@@ -31,6 +31,7 @@ export type HostEvent =
   | { type: 'encoder'; codec: number; name: string; hardware: boolean; width: number; height: number; stream: number }
   | { type: 'cursor'; visibility: number; slot: number; generation: number }
   | { type: 'notice'; text: string; recovered: boolean }
+  | { type: 'clipboard'; text: string }
   | { type: 'bye'; reason: number }
   | { type: 'other'; variant: number }
 
@@ -140,6 +141,9 @@ export function decodeHostMsg(buf: Uint8Array): HostEvent | null {
         generation: num(shape[1], -1),
       }
     }
+    case 8:
+      // 被控端剪贴板变了：大块通道上的单字段变体 [8, ["文本"]]。
+      return { type: 'clipboard', text: str(fields[0]) }
     case 9:
       return { type: 'bye', reason: num(fields[0]) }
     default:
@@ -195,6 +199,11 @@ export function encodeInput(t: number, events: InputEvent[]): Uint8Array {
     }
   }
   return w.take()
+}
+
+/** ControllerMsg::Clipboard = [7, [文本]]，走大块通道。 */
+export function encodeClipboard(text: string): Uint8Array {
+  return new CborWriter().array(2).uint(7).array(1).text(text).take()
 }
 
 /** ControllerMsg::RequestKeyframe = [4, [after, stream?]]。 */

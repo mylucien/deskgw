@@ -50,6 +50,7 @@
         aria-hidden="true"
         @input="onImeInput"
         @compositionend="onCompositionEnd"
+        @paste="onPaste"
         @blur="onImeBlur"
       ></textarea>
 
@@ -188,6 +189,7 @@ const webButton: Record<number, number> = { 0: 0, 2: 1, 1: 2, 3: 3, 4: 4 }
 
 function onPointerDown(ev: PointerEvent) {
   focusIme(ev)
+  if (pendingRemote) void writeLocalClipboard(pendingRemote)
   canvas.value?.setPointerCapture?.(ev.pointerId)
   const p = point(ev)
   if (p && cursorMode !== 0) pushMove({ kind: 'move', x: p.x, y: p.y })
@@ -265,6 +267,10 @@ function onKey(ev: KeyboardEvent, down: boolean) {
   // 输入法接管的键（Chrome 里是 Process / Unidentified）：不拦，让它启动组字。
   if (ev.key === 'Process' || ev.key === 'Unidentified') return
 
+  // Ctrl+V（macOS 上是 Cmd+V）：不直接发物理键，先由 paste 事件把本地剪贴板
+  // 推给被控端，再让它粘贴。否则被控端粘的是它自己的旧剪贴板。
+  if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && ev.code === 'KeyV') return
+
   if (!down) {
     if (ev.code && heldKeys.delete(ev.code)) {
       push({ kind: 'key', code: ev.code, down: false })
@@ -320,6 +326,45 @@ function onCompositionEnd() {
 
 function onImeBlur() {
   if (ime.value) ime.value.value = ''
+}
+
+// ---- 剪贴板 ---------------------------------------------------------------
+//
+// 被控端复制之后自动推到本地；本地粘贴时先把内容推过去再让被控端粘贴。
+// 不做「本地剪贴板一变就推」，那样要么轮询要权限，要么两头来回推。
+
+/** 上一次从被控端收到的文本，用来吃掉它自己推回来的重复内容。 */
+let lastRemote = ''
+/** 页面没有焦点时写入本地剪贴板会失败，先存着，下次点击画面再试。 */
+let pendingRemote = ''
+
+async function writeLocalClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    pendingRemote = ''
+  } catch {
+    pendingRemote = text
+  }
+}
+
+function onRemoteClipboard(text: string) {
+  if (!text || text === lastRemote) return
+  lastRemote = text
+  if (document.hasFocus()) void writeLocalClipboard(text)
+  else pendingRemote = text
+}
+
+/** 粘贴：本地剪贴板的内容先推给被控端，再发一次 Ctrl+V 让它自己粘。 */
+function onPaste(ev: ClipboardEvent) {
+  const text = ev.clipboardData?.getData('text/plain') || ''
+  if (!text) return
+  // 不让它落进隐藏的输入框（否则会当成一次 Text 输入又发一遍）。
+  ev.preventDefault()
+  conn?.sendClipboard(text)
+  lastRemote = text
+  // Ctrl 已经按下去了（物理键），这里只补 V，收尾交给真实的 keyup。
+  push({ kind: 'key', code: 'KeyV', down: true })
+  push({ kind: 'key', code: 'KeyV', down: false })
 }
 
 /** 失焦或页面隐藏时松开所有按键，免得打字机效应。 */
@@ -381,6 +426,8 @@ function onEvent(ev: HostEvent) {
     const v = ev.visibility
     cursorMode = v === 1 ? 1 : v === 2 ? 2 : 0
     cursorStyle.value = cursorMode === 1 ? 'default' : 'none'
+  } else if (ev.type === 'clipboard') {
+    onRemoteClipboard(ev.text)
   } else if (ev.type === 'notice') {
     if (!ev.recovered && ev.text) setBanner(ev.text)
     else if (ev.recovered) banner.value = ''

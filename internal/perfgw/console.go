@@ -390,12 +390,17 @@ type keyBundle struct {
 	ControlRecv  string   `json:"control_recv"`
 	DatagramSend string   `json:"datagram_send"`
 	DatagramRecv string   `json:"datagram_recv"`
+	BulkSend     string   `json:"bulk_send"`
+	BulkRecv     string   `json:"bulk_recv"`
 	Video        []string `json:"video"`
 
 	ControlSendCounter  uint64 `json:"control_send_counter"`
 	ControlRecvCounter  uint64 `json:"control_recv_counter"`
 	DatagramSendCounter uint64 `json:"datagram_send_counter"`
 	DatagramRecvCounter uint64 `json:"datagram_recv_counter"`
+	// 大块通道两个方向都从 0 开始：握手不在这条通道上发东西。
+	BulkSendCounter uint64 `json:"bulk_send_counter"`
+	BulkRecvCounter uint64 `json:"bulk_recv_counter"`
 }
 
 func buildKeyBundle(k *sessionKeys) keyBundle {
@@ -404,6 +409,8 @@ func buildKeyBundle(k *sessionKeys) keyBundle {
 		ControlRecv:         hex.EncodeToString(k.control[1][:]),
 		DatagramSend:        hex.EncodeToString(k.datagram[0][:]),
 		DatagramRecv:        hex.EncodeToString(k.datagram[1][:]),
+		BulkSend:            hex.EncodeToString(k.bulk[0][:]),
+		BulkRecv:            hex.EncodeToString(k.bulk[1][:]),
 		Video:               make([]string, 0, len(k.video)),
 		ControlSendCounter:  firstCounter,
 		ControlRecvCounter:  firstCounter,

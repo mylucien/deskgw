@@ -6,7 +6,7 @@
 
 import { avcCodecString, importKeyBundle, openSealed, parseMediaHeader, sealUnit } from './wire'
 import type { SessionKeys } from './wire'
-import { decodeHostDatagram, decodeHostMsg, encodeAck, encodeEcho, encodeInput, encodePing, encodeRequestKeyframe } from './messages'
+import { decodeHostDatagram, decodeHostMsg, encodeAck, encodeClipboard, encodeEcho, encodeInput, encodePing, encodeRequestKeyframe } from './messages'
 import type { InputEvent } from './messages'
 
 const VD = (self as any).VideoDecoder
@@ -15,6 +15,10 @@ const post = (msg: any, transfer?: Transferable[]) => (self as any).postMessage(
 let keys: SessionKeys | null = null
 let ctrlBuf = new Uint8Array(0)
 let ctrlChain: Promise<void> = Promise.resolve()
+// 大块通道也是一条常驻流、连续的帧，必须按顺序解开（计数一个接一个）。
+let bulkBuf = new Uint8Array(0)
+let bulkSeq = -1
+let bulkChain: Promise<void> = Promise.resolve()
 let upChain: Promise<void> = Promise.resolve()
 let pingTimer: number | undefined
 let stopped = false
@@ -69,6 +73,7 @@ self.onmessage = (ev: MessageEvent) => {
   if (m.type === 'start') void start(m.keys)
   else if (m.type === 'frame') onBinary(new Uint8Array(m.data as ArrayBuffer))
   else if (m.type === 'input') sendControl(encodeInput(m.t, m.events as InputEvent[]))
+  else if (m.type === 'clipboard') sendBulk(encodeClipboard(String(m.text || '')))
   else if (m.type === 'stop') stop()
 }
 
@@ -134,6 +139,23 @@ function onDownStream(u8: Uint8Array) {
     }
     return
   }
+  if (lane === 1) {
+    // 大块通道：剪贴板、光标图像。同样按长度前缀切，但共用一条流。
+    if (bulkSeq !== seq) {
+      bulkSeq = seq
+      bulkBuf = new Uint8Array(0)
+    }
+    bulkBuf = concat([bulkBuf, data], bulkBuf.length + data.length)
+    for (;;) {
+      if (bulkBuf.length < 4) break
+      const n = new DataView(bulkBuf.buffer, bulkBuf.byteOffset, 4).getUint32(0, true)
+      if (n === 0 || bulkBuf.length < 4 + n) break
+      const unit = bulkBuf.slice(4, 4 + n)
+      bulkBuf = bulkBuf.slice(4 + n)
+      bulkChain = bulkChain.then(() => handleBulk(unit))
+    }
+    return
+  }
   if (lane < 2 || lane > 5) return
 
   let buf = streams.get(seq)
@@ -167,6 +189,20 @@ function dropStaleStreams() {
   for (const [seq, b] of streams) {
     if (b.arrived < cut) streams.delete(seq)
   }
+}
+
+async function handleBulk(unit: Uint8Array) {
+  if (!keys) return
+  let plain: Uint8Array
+  try {
+    plain = await openSealed(keys.bulkRecv, unit)
+  } catch {
+    // 大块通道乱序/丢帧：跳过这一条，别把整个会话废掉（剪贴板不是关键路径）。
+    console.warn('[perf] 大块通道解密失败')
+    return
+  }
+  const ev = decodeHostMsg(plain)
+  if (ev && ev.type === 'clipboard') post({ type: 'event', event: ev })
 }
 
 async function handleControl(unit: Uint8Array) {
@@ -380,6 +416,21 @@ function sendDatagram(plain: Uint8Array) {
     out[0] = 0x12
     out[1] = 1
     out.set(sealed, 2)
+    post({ type: 'uplink', data: out.buffer }, [out.buffer])
+  })
+}
+
+// sendBulk 写大块通道：帧里只有长度前缀，网关负责写会话头、开流。
+function sendBulk(plain: Uint8Array) {
+  if (!keys) return
+  upChain = upChain.then(async () => {
+    if (!keys || stopped) return
+    const sealed = await sealUnit(keys.bulkSend, keys.bulkSendCounter++, plain)
+    const out = new Uint8Array(6 + sealed.length)
+    out[0] = 0x11
+    out[1] = 1
+    new DataView(out.buffer).setUint32(2, sealed.length, true)
+    out.set(sealed, 6)
     post({ type: 'uplink', data: out.buffer }, [out.buffer])
   })
 }

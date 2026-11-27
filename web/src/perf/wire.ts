@@ -9,11 +9,15 @@ export interface KeyBundle {
   control_recv: string
   datagram_send: string
   datagram_recv: string
+  bulk_send: string
+  bulk_recv: string
   video: string[]
   control_send_counter: number
   control_recv_counter: number
   datagram_send_counter: number
   datagram_recv_counter: number
+  bulk_send_counter: number
+  bulk_recv_counter: number
 }
 
 export interface SessionKeys {
@@ -21,9 +25,13 @@ export interface SessionKeys {
   controlRecv: CryptoKey
   datagramSend: CryptoKey
   datagramRecv: CryptoKey
+  /** 大块通道（剪贴板、光标图像）：常驻一条流，按顺序解密。 */
+  bulkSend: CryptoKey
+  bulkRecv: CryptoKey
   video: CryptoKey[]
   sendCounter: number
   datagramSendCounter: number
+  bulkSendCounter: number
 }
 
 function hexToBytes(hex: string): Uint8Array {
@@ -44,9 +52,12 @@ export async function importKeyBundle(b: KeyBundle): Promise<SessionKeys> {
     controlRecv: await importAes(b.control_recv),
     datagramSend: await importAes(b.datagram_send),
     datagramRecv: await importAes(b.datagram_recv),
+    bulkSend: await importAes(b.bulk_send),
+    bulkRecv: await importAes(b.bulk_recv),
     video,
     sendCounter: b.control_send_counter,
     datagramSendCounter: b.datagram_send_counter,
+    bulkSendCounter: b.bulk_send_counter || 0,
   }
 }
 
