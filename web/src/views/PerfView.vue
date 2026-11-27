@@ -1,34 +1,15 @@
 <template>
-  <div class="perf-page">
-    <div class="perf-head">
-      <div class="who">
-        <strong>{{ ready?.host.name || perfSession.current?.hostName || '性能模式' }}</strong>
-        <span v-if="ready" class="tag ok">端到端加密</span>
-        <span v-if="ready" class="muted small">安全码 <b>{{ ready.safety }}</b></span>
-      </div>
-      <div class="meter" v-if="state === 'ready' && hasFrame">
-        <span>{{ resLabel }}</span>
-        <span>{{ stats.fps }} fps</span>
-        <span>{{ rateLabel }}</span>
-        <span>RTT {{ stats.rtt }} ms</span>
-        <span v-if="stats.dropped">丢 {{ stats.dropped }}</span>
-      </div>
-      <div class="acts">
-        <button @click="leave">返回主机列表</button>
-        <button v-if="state === 'ready'" class="primary" @click="hangup">断开</button>
-      </div>
-    </div>
-
+  <div class="perf-page" ref="pageEl">
     <div class="stage" ref="stage">
       <canvas
         ref="canvas"
         tabindex="0"
-        title="点击画面后可直接用键盘和鼠标操作，支持中文输入法"
+        :title="inputHint"
         :class="{ idle: !hasFrame }"
         :style="{ cursor: cursorStyle }"
         @pointerdown="onPointerDown"
         @pointerup="onPointerUp"
-        @pointercancel="onPointerUp"
+        @pointercancel="onPointerCancel"
         @pointermove="onPointerMove"
         @wheel.prevent="onWheel"
         @contextmenu.prevent
@@ -86,6 +67,53 @@
 
       <div v-if="banner" class="banner">{{ banner }}</div>
     </div>
+
+    <!-- 悬浮按钮：和普通模式一样可拖动，位置单独保存，不影响 RDP 模式。 -->
+    <button class="fab" :class="{ on: menuOpen, drag: dragging }" :style="fabStyle"
+      :aria-expanded="menuOpen" aria-label="会话菜单" title="会话菜单"
+      @pointerdown="onFabDown" @click="onFabTap">
+      <span class="mark">DG</span>
+      <span v-if="state === 'ready'" class="live"></span>
+    </button>
+
+    <div class="panel" :class="{ open: menuOpen }" :style="panelStyle"
+      :aria-hidden="!menuOpen" role="dialog" aria-label="会话菜单" ref="panelEl">
+      <div class="p-top">
+        <span class="p-cap">性能模式 · {{ ready?.host.name || perfSession.current?.hostName || '未连接' }}</span>
+        <span v-if="ready" class="p-ok">加密</span>
+        <button class="p-x" @click="closeMenu" aria-label="收起">×</button>
+      </div>
+
+      <div class="p-meta">
+        <div v-if="ready">安全码 <b>{{ ready.safety }}</b></div>
+        <div v-if="state === 'ready' && hasFrame">
+          {{ resLabel }} · {{ stats.fps }} fps · {{ rateLabel }} · RTT {{ stats.rtt }} ms
+          <span v-if="stats.dropped">· 丢 {{ stats.dropped }}</span>
+        </div>
+      </div>
+
+      <template v-if="state === 'ready'">
+        <div class="p-div">按键模式</div>
+        <div class="seg">
+          <button :class="{ on: keyMode === 'text' }" @click="setKeyMode('text')">文本</button>
+          <button :class="{ on: keyMode === 'physical' }" @click="setKeyMode('physical')">物理键</button>
+        </div>
+        <p v-if="keyMode === 'physical'" class="p-note">按键全部按扫描码发送；中文输入法不可用</p>
+
+        <div class="p-div">输入方式</div>
+        <div class="seg">
+          <button :class="{ on: inputMode === 'pointer' }" @click="setInputMode('pointer')">指针</button>
+          <button :class="{ on: inputMode === 'touch' }" :disabled="!hostTouch"
+            :title="hostTouch ? '' : '被控端没有声明支持多点触摸'" @click="setInputMode('touch')">触摸</button>
+        </div>
+        <p v-if="!hostTouch" class="p-note">被控端不支持触摸，可使用指针</p>
+      </template>
+
+      <div class="p-foot">
+        <button @click="leave">返回主机列表</button>
+        <button v-if="state === 'ready'" class="danger" @click="hangup">断开</button>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -116,6 +144,41 @@ const frameSize = reactive({ w: 0, h: 0 })
 const stats = reactive<PerfStats>({ fps: 0, kbps: 0, bytes: 0, dropped: 0, rtt: 0, errors: 0 })
 const cursorStyle = ref<'default' | 'none'>('default')
 
+// 面板里的两项选择都记住。RDP 模式用的是另一套 localStorage 键，互不干扰。
+type KeyMode = 'text' | 'physical'
+type InputMode = 'pointer' | 'touch'
+function saved<T extends string>(key: string, choices: readonly T[], fallback: T): T {
+  try {
+    const v = localStorage.getItem(key)
+    if (v && (choices as readonly string[]).includes(v)) return v as T
+  } catch { /* 隐私模式读不到，用默认值 */ }
+  return fallback
+}
+const keyMode = ref<KeyMode>(saved('deskgw.perfKeyMode', ['text', 'physical'] as const, 'text'))
+const inputMode = ref<InputMode>(saved('deskgw.perfInputMode', ['pointer', 'touch'] as const, 'pointer'))
+const hostTouch = ref(false)
+const inputHint = computed(() =>
+  inputMode.value === 'touch' ? '手指触摸画面操作被控端' :
+    keyMode.value === 'physical' ? '点击画面后直接操作，按键按物理键发送' :
+      '点击画面后可直接用键盘和鼠标操作，支持中文输入法',
+)
+
+// ---- 悬浮按钮（照普通模式的可拖动面板） ---------------------------------
+const pageEl = ref<HTMLDivElement | null>(null)
+const menuOpen = ref(false)
+const panelEl = ref<HTMLElement | null>(null)
+const FAB_SIZE = 46
+const FAB_MARGIN = 14
+const FAB_EDGE = 6
+const POS_KEY = 'deskgw.perfFabPos'
+const fabX = ref(-1)
+const fabY = ref(-1)
+const dragging = ref(false)
+let dragFrom: { px: number; py: number; ox: number; oy: number } | null = null
+let lastDragEndAt = 0
+const vw = ref(window.innerWidth)
+const vh = ref(window.innerHeight)
+
 let conn: PerfConnection | null = null
 let bannerTimer = 0
 
@@ -134,6 +197,142 @@ const rateLabel = computed(() => (stats.kbps >= 1000 ? (stats.kbps / 1000).toFix
 const waitingText = computed(() =>
   ready.value ? '握手已完成，正在等被控端的第一个关键帧。' : '正在等待网关的 ready。',
 )
+
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
+function maxX() { return Math.max(FAB_EDGE, vw.value - FAB_SIZE - FAB_EDGE) }
+function maxY() { return Math.max(FAB_EDGE, vh.value - FAB_SIZE - FAB_EDGE) }
+
+function measurePage() {
+  const r = pageEl.value?.getBoundingClientRect()
+  vw.value = Math.round(r?.width || window.innerWidth)
+  vh.value = Math.round(r?.height || window.innerHeight)
+  if (fabX.value < 0) {
+    fabX.value = clamp(vw.value - FAB_SIZE - FAB_MARGIN, FAB_EDGE, maxX())
+    fabY.value = clamp(vh.value - FAB_SIZE - FAB_MARGIN, FAB_EDGE, maxY())
+  } else {
+    fabX.value = clamp(fabX.value, FAB_EDGE, maxX())
+    fabY.value = clamp(fabY.value, FAB_EDGE, maxY())
+  }
+}
+
+function loadFabPos() {
+  try {
+    const p = JSON.parse(localStorage.getItem(POS_KEY) || 'null') as { x?: number; y?: number } | null
+    if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) {
+      fabX.value = Math.round(p.x as number)
+      fabY.value = Math.round(p.y as number)
+    }
+  } catch { /* 存坏了就放回右下角 */ }
+}
+
+function saveFabPos() {
+  try {
+    localStorage.setItem(POS_KEY, JSON.stringify({ x: Math.round(fabX.value), y: Math.round(fabY.value) }))
+  } catch { /* 隐私模式写不进去，位置只在本页有效 */ }
+}
+
+const fabStyle = computed(() => ({
+  transform: `translate3d(${Math.round(fabX.value)}px, ${Math.round(fabY.value)}px, 0)`,
+}))
+
+// 面板贴着按钮所在的一侧；上方放不下就翻到下方。
+const panelStyle = computed(() => {
+  const w = Math.min(288, vw.value - 28)
+  const cx = fabX.value + FAB_SIZE / 2
+  const left = clamp(cx < vw.value / 2 ? fabX.value : fabX.value + FAB_SIZE - w,
+    14, Math.max(14, vw.value - w - 14))
+  const originX = clamp(cx - left, 12, w - 12)
+  const below = fabY.value + FAB_SIZE / 2 < vh.value / 2
+  const style: Record<string, string> = { left: `${Math.round(left)}px`, width: `${Math.round(w)}px` }
+  if (below) {
+    style.top = `${Math.round(fabY.value + FAB_SIZE + 10)}px`
+    style.maxHeight = `${Math.round(Math.max(160, vh.value - fabY.value - FAB_SIZE - 24))}px`
+    style.transformOrigin = `${Math.round(originX)}px 0`
+  } else {
+    style.bottom = `${Math.round(vh.value - fabY.value + 10)}px`
+    style.maxHeight = `${Math.round(Math.max(160, fabY.value - 24))}px`
+    style.transformOrigin = `${Math.round(originX)}px 100%`
+  }
+  return style
+})
+
+function closeMenu() { menuOpen.value = false }
+
+function onFabDown(e: PointerEvent) {
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  dragFrom = { px: e.clientX, py: e.clientY, ox: fabX.value, oy: fabY.value }
+  window.addEventListener('pointermove', onFabMove, { passive: false })
+  window.addEventListener('pointerup', onFabEnd)
+  window.addEventListener('pointercancel', onFabEnd)
+}
+
+function onFabMove(e: PointerEvent) {
+  if (!dragFrom) return
+  const dx = e.clientX - dragFrom.px
+  const dy = e.clientY - dragFrom.py
+  if (!dragging.value) {
+    if (Math.hypot(dx, dy) < 6) return
+    dragging.value = true
+    menuOpen.value = false
+  }
+  e.preventDefault()
+  fabX.value = clamp(dragFrom.ox + dx, FAB_EDGE, maxX())
+  fabY.value = clamp(dragFrom.oy + dy, FAB_EDGE, maxY())
+}
+
+function onFabEnd() {
+  window.removeEventListener('pointermove', onFabMove)
+  window.removeEventListener('pointerup', onFabEnd)
+  window.removeEventListener('pointercancel', onFabEnd)
+  if (!dragFrom) return
+  dragFrom = null
+  if (!dragging.value) return
+  dragging.value = false
+  if (fabX.value < FAB_MARGIN + 12) fabX.value = FAB_EDGE
+  else if (fabX.value > vw.value - FAB_SIZE - FAB_MARGIN - 12) fabX.value = maxX()
+  saveFabPos()
+  // 拖完浏览器还会补一次 click，用时间窗挡掉，别马上把面板又打开。
+  lastDragEndAt = Date.now()
+}
+
+function onFabTap() {
+  if (Date.now() - lastDragEndAt < 400) return
+  menuOpen.value = !menuOpen.value
+}
+
+function onDocDown(e: PointerEvent) {
+  if (!menuOpen.value) return
+  const t = e.target as Node
+  if (panelEl.value?.contains(t)) return
+  if ((e.currentTarget as HTMLElement)?.classList?.contains('fab')) return
+  // fab 上的 pointerdown 会在 click 之前到这里，不能因为点按钮就把面板收起又展开。
+  if (t instanceof Element && t.closest('.fab')) return
+  closeMenu()
+}
+
+function onWindowResize() { measurePage() }
+
+function setKeyMode(mode: KeyMode) {
+  if (keyMode.value === mode) return
+  // 切走时把可能按住的键松开，免得模式变了留下卡键。
+  releaseAll()
+  keyMode.value = mode
+  try { localStorage.setItem('deskgw.perfKeyMode', mode) } catch { /* 忽略 */ }
+  if (ime.value) ime.value.value = ''
+  menuOpen.value = false
+}
+
+function setInputMode(mode: InputMode) {
+  if (inputMode.value === mode) return
+  if (mode === 'touch' && !hostTouch.value) return
+  releaseTouches()
+  releaseAll()
+  inputMode.value = mode
+  try { localStorage.setItem('deskgw.perfInputMode', mode) } catch { /* 忽略 */ }
+  // 触摸模式不要自动弹手机软键盘。
+  if (mode === 'pointer' && keyMode.value === 'text') nextTick(() => focusIme())
+  menuOpen.value = false
+}
 
 function setBanner(text: string) {
   banner.value = text
@@ -187,10 +386,46 @@ function point(ev: { clientX: number; clientY: number }) {
 // 浏览器与协议对鼠标键的编号不同：中键在浏览器是 1、协议里是 2。
 const webButton: Record<number, number> = { 0: 0, 2: 1, 1: 2, 3: 3, 4: 4 }
 
+// 触摸模式：浏览器 pointerId → 协议的触摸点 id（0..9，与 MAX_TOUCH_POINTS 一致）。
+const touches = new Map<number, { id: number; x: number; y: number }>()
+function touchFor(pid: number, p: { x: number; y: number }): number | null {
+  const old = touches.get(pid)
+  if (old) return old.id
+  if (touches.size >= 10) return null
+  const used = new Set(Array.from(touches.values(), (t) => t.id))
+  let id = 0
+  while (id < 10 && used.has(id)) id++
+  if (id >= 10) return null
+  touches.set(pid, { id, ...p })
+  return id
+}
+
+/** 失焦、切模式、断开时松开还没抬起的触摸点，免得被控端留下按着的点。 */
+function releaseTouches(phase: 'up' | 'cancel' = 'cancel') {
+  if (!touches.size) return
+  for (const t of touches.values()) push({ kind: 'touch', id: t.id, phase, x: t.x, y: t.y })
+  touches.clear()
+}
+
 function onPointerDown(ev: PointerEvent) {
-  focusIme(ev)
   if (pendingRemote) void writeLocalClipboard(pendingRemote)
   canvas.value?.setPointerCapture?.(ev.pointerId)
+  if (inputMode.value === 'touch') {
+    const p = point(ev)
+    if (p) {
+      const id = touchFor(ev.pointerId, p)
+      if (id !== null) {
+        push({ kind: 'touch', id, phase: 'down', x: p.x, y: p.y })
+        ev.preventDefault()
+      }
+    }
+    return
+  }
+  // 文本模式才需要输入代理；手指点画面时别聚焦它，否则手机会弹软键盘。
+  // pointerdown 被 preventDefault 了，浏览器不会自己改焦点，这里得显式聚焦画布，
+  // 否则焦点还留在面板按钮上，onKey 会把按键让给按钮。
+  if (keyMode.value === 'text' && ev.pointerType !== 'touch') focusIme(ev)
+  else canvas.value?.focus({ preventScroll: true })
   const p = point(ev)
   if (p && cursorMode !== 0) pushMove({ kind: 'move', x: p.x, y: p.y })
   const b = webButton[ev.button]
@@ -201,8 +436,16 @@ function onPointerDown(ev: PointerEvent) {
 }
 
 function onPointerUp(ev: PointerEvent) {
-  const b = webButton[ev.button]
-  if (b !== undefined) push({ kind: 'button', button: b, down: false })
+  if (inputMode.value === 'touch') {
+    const t = touches.get(ev.pointerId)
+    if (t) {
+      push({ kind: 'touch', id: t.id, phase: 'up', x: t.x, y: t.y })
+      touches.delete(ev.pointerId)
+    }
+  } else {
+    const b = webButton[ev.button]
+    if (b !== undefined) push({ kind: 'button', button: b, down: false })
+  }
   try {
     canvas.value?.releasePointerCapture?.(ev.pointerId)
   } catch {
@@ -210,7 +453,24 @@ function onPointerUp(ev: PointerEvent) {
   }
 }
 
+function onPointerCancel(ev: PointerEvent) {
+  const t = touches.get(ev.pointerId)
+  if (!t) return
+  push({ kind: 'touch', id: t.id, phase: 'cancel', x: t.x, y: t.y })
+  touches.delete(ev.pointerId)
+}
+
 function onPointerMove(ev: PointerEvent) {
+  if (inputMode.value === 'touch') {
+    const t = touches.get(ev.pointerId)
+    const p = point(ev)
+    if (!t || !p) return
+    t.x = p.x
+    t.y = p.y
+    push({ kind: 'touch', id: t.id, phase: 'move', x: p.x, y: p.y })
+    ev.preventDefault()
+    return
+  }
   if (cursorMode === 0) {
     // 被控端把光标藏起来了（游戏里转视角）：改发相对移动。
     const dx = Math.round(ev.movementX)
@@ -245,6 +505,8 @@ const NAMED_KEYS = new Set([
 
 /** 带修饰键的组合、功能键、编辑键走物理键；其余可打印字符交给输入代理。 */
 function isPhysicalKey(ev: KeyboardEvent): boolean {
+  // 物理键模式下连字母数字都走 Key，给读扫描码的程序（游戏）用。
+  if (keyMode.value === 'physical') return true
   if (ev.ctrlKey || ev.altKey || ev.metaKey) return true
   if (/^F\d{1,2}$/.test(ev.key)) return true
   return NAMED_KEYS.has(ev.key)
@@ -260,12 +522,18 @@ function onKey(ev: KeyboardEvent, down: boolean) {
   // 页面上的输入框、按钮、可编辑区还给自己；隐藏的输入代理除外，它是画面的嘴。
   if (tag === 'INPUT' || tag === 'SELECT' || tag === 'BUTTON' || el?.isContentEditable) return
   if (tag === 'TEXTAREA' && el !== ime.value) return
-  // 输入法组字期间整段交给输入法：不上屏、也不拦默认行为。
-  if (ev.isComposing) return
+  // 输入法组字期间：文本模式交给输入法；物理键模式严格不送中文，直接吃掉。
+  if (ev.isComposing) {
+    if (keyMode.value === 'physical') ev.preventDefault()
+    return
+  }
   // 刷新、全屏、开发者工具交还给浏览器。
   if (ev.key === 'F5' || ev.key === 'F11' || ev.key === 'F12') return
-  // 输入法接管的键（Chrome 里是 Process / Unidentified）：不拦，让它启动组字。
-  if (ev.key === 'Process' || ev.key === 'Unidentified') return
+  // Chrome 用 Process / Unidentified 表示输入法接管的键。
+  if (ev.key === 'Process' || ev.key === 'Unidentified') {
+    if (keyMode.value === 'physical') ev.preventDefault()
+    return
+  }
 
   // Ctrl+V（macOS 上是 Cmd+V）：不直接发物理键，先由 paste 事件把本地剪贴板
   // 推给被控端，再让它粘贴。否则被控端粘的是它自己的旧剪贴板。
@@ -304,6 +572,11 @@ function focusIme(ev?: { clientX: number; clientY: number }) {
 function onImeInput(ev: Event) {
   const el = ime.value
   if (!el) return
+  // 物理键模式下没有 Text 这条路，输入法上屏的内容一律丢掉。
+  if (keyMode.value === 'physical') {
+    el.value = ''
+    return
+  }
   // 组字中间态，等 composition 结束后那一次 input。
   if ((ev as InputEvent).isComposing) return
   const text = el.value
@@ -317,6 +590,10 @@ function onCompositionEnd() {
   const el = ime.value
   if (!el) return
   queueMicrotask(() => {
+    if (keyMode.value === 'physical') {
+      el.value = ''
+      return
+    }
     const text = el.value
     if (!text) return
     el.value = ''
@@ -377,10 +654,14 @@ function releaseAll() {
 
 function onBlur() {
   releaseAll()
+  releaseTouches()
 }
 
 function onVisibility() {
-  if (document.hidden) releaseAll()
+  if (document.hidden) {
+    releaseAll()
+    releaseTouches()
+  }
 }
 
 function onKeyDown(ev: KeyboardEvent) {
@@ -418,7 +699,14 @@ function onVideo(frame: VideoFrame) {
 }
 
 function onEvent(ev: HostEvent) {
-  if (ev.type === 'encoder') {
+  if (ev.type === 'hello') {
+    // 被控端没声明 touch 时，面板里的「触摸」选项保持不可选。
+    hostTouch.value = ev.touch
+    if (inputMode.value === 'touch' && !ev.touch) {
+      inputMode.value = 'pointer'
+      try { localStorage.setItem('deskgw.perfInputMode', 'pointer') } catch { /* 忽略 */ }
+    }
+  } else if (ev.type === 'encoder') {
     encoderName.value = `${ev.name}${ev.hardware ? '（硬件）' : ''}`
   } else if (ev.type === 'cursor') {
     // 1 = 显示着，用本地光标；2 = 被控端已经把光标画进画面，藏本地光标；
@@ -442,7 +730,7 @@ function connect() {
     onReady: (r) => {
       ready.value = r
       state.value = 'ready'
-      nextTick(() => focusIme())
+      if (inputMode.value === 'pointer' && keyMode.value === 'text') nextTick(() => focusIme())
     },
     onEvent,
     onVideo,
@@ -466,8 +754,10 @@ function connect() {
 
 function shutdown() {
   window.clearTimeout(bannerTimer)
-  // 先把按下的键松开再断，免得被控端留下按住的状态。
+  // 先把按下的键、触摸点松开再断，免得被控端留下按住的状态。
   releaseAll()
+  releaseTouches()
+  closeMenu()
   if (raf) {
     cancelAnimationFrame(raf)
     raf = 0
@@ -490,11 +780,17 @@ function leave() {
 }
 
 onMounted(() => {
-  nextTick(() => focusIme())
+  loadFabPos()
+  nextTick(() => {
+    measurePage()
+    if (inputMode.value === 'pointer' && keyMode.value === 'text') focusIme()
+  })
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
   window.addEventListener('blur', onBlur)
+  window.addEventListener('resize', onWindowResize)
   document.addEventListener('visibilitychange', onVisibility)
+  document.addEventListener('pointerdown', onDocDown)
   connect()
 })
 
@@ -502,39 +798,73 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('keyup', onKeyUp)
   window.removeEventListener('blur', onBlur)
+  window.removeEventListener('resize', onWindowResize)
   document.removeEventListener('visibilitychange', onVisibility)
+  document.removeEventListener('pointerdown', onDocDown)
   shutdown()
 })
 </script>
 
 <style scoped>
 .perf-page {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: calc(100vh - 56px);
   min-height: 0;
   background: #0f1115;
 }
-.perf-head {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 10px 18px;
-  background: #161a20;
-  border-bottom: 1px solid #262b33;
-  color: #e5e7eb;
-}
-.perf-head .who { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.perf-head .who strong { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.perf-head .muted { color: #9ca3af; }
-.perf-head .muted b { color: #e5e7eb; font-variant-numeric: tabular-nums; letter-spacing: .5px; }
-.perf-head .meter { display: flex; gap: 14px; margin-left: auto; font-size: 12px; color: #9ca3af;
-  font-variant-numeric: tabular-nums; }
-.perf-head .acts { display: flex; gap: 8px; margin-left: auto; }
-.perf-head .meter + .acts { margin-left: 4px; }
-.perf-head button { background: #232830; border-color: #333a45; color: #e5e7eb; }
-.perf-head button:hover:not(:disabled) { background: #2b323c; }
-.perf-head button.primary { background: #2563eb; border-color: #2563eb; }
+
+/* ---------- 悬浮按钮与面板（与普通模式同一套路） ---------- */
+.fab { position: absolute; left: 0; top: 0; width: 46px; height: 46px; padding: 0;
+  border-radius: 50%; display: grid; place-items: center; z-index: 40;
+  border: 1px solid rgba(255, 255, 255, .14);
+  background: #2f3540; color: #fff; cursor: pointer;
+  touch-action: none; -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, .5);
+  transition: transform .18s ease, box-shadow .16s ease; }
+.fab:hover { background: #3a4250; box-shadow: 0 12px 26px rgba(0, 0, 0, .58); }
+.fab.on { border-color: rgba(59, 130, 246, .6); }
+.fab.drag { transition: none; cursor: grabbing; filter: brightness(1.12); }
+.fab .mark { font-size: 12px; letter-spacing: .04em; font-weight: 600; }
+.fab .live { position: absolute; bottom: 1px; right: 1px; width: 10px; height: 10px;
+  border-radius: 50%; background: #22c55e; border: 2px solid #2f3540; }
+
+.panel { position: absolute; z-index: 39;
+  display: flex; flex-direction: column; overflow-y: auto;
+  background: rgba(24, 27, 33, .96);
+  -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
+  border: 1px solid rgba(255, 255, 255, .1); border-radius: 12px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, .6);
+  color: #e5e7eb; opacity: 0; transform: scale(.92) translateY(8px); pointer-events: none;
+  transition: opacity .13s ease, transform .13s ease; }
+.panel.open { opacity: 1; transform: none; pointer-events: auto; }
+.p-top { display: flex; align-items: center; gap: 8px; padding: 11px 12px 9px;
+  border-bottom: 1px solid rgba(255, 255, 255, .07); flex: none; }
+.p-cap { font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.p-ok { margin-left: auto; font-size: 11px; color: #4ade80; border: 1px solid rgba(74, 222, 128, .35);
+  border-radius: 4px; padding: 1px 5px; flex: none; }
+.p-x { width: 24px; height: 24px; border: 0; padding: 0; background: transparent;
+  color: #98a1b0; cursor: pointer; font-size: 16px; line-height: 1; flex: none; }
+.p-meta { padding: 10px 12px 4px; font-size: 12px; line-height: 1.7; color: #9ca3af;
+  font-variant-numeric: tabular-nums; flex: none; }
+.p-meta b { color: #e5e7eb; letter-spacing: .5px; }
+.p-div { padding: 8px 12px 6px; font-size: 11px; color: #98a1b0; flex: none; }
+.p-note { margin: 6px 12px 0; font-size: 11px; color: #8f9aaa; line-height: 1.6; flex: none; }
+.seg { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 0 12px; padding: 3px;
+  background: #16191f; border: 1px solid rgba(255, 255, 255, .08); border-radius: 8px; flex: none; }
+.seg button { border: 0; padding: 6px 0; border-radius: 6px; background: transparent;
+  color: #98a1b0; font-size: 12px; }
+.seg button.on { background: #2563eb; color: #fff; }
+.seg button:hover:not(:disabled):not(.on) { background: rgba(255, 255, 255, .06); }
+.seg button:disabled { opacity: .4; cursor: not-allowed; }
+.p-foot { display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+  padding: 12px 12px 12px; margin-top: auto; flex: none; }
+.p-foot button { font-size: 12px; padding: 6px 0; background: #232830;
+  border-color: #333a45; color: #e5e7eb; }
+.p-foot button:hover:not(:disabled) { background: #2b323c; }
+.p-foot button.danger { color: #fca5a5; border-color: rgba(239, 68, 68, .35); }
 
 .stage {
   position: relative;

@@ -265,7 +265,7 @@ WARN，属于正常收尾（我们主动取消流），不影响后续会话。
 | --- | --- |
 | `wire.ts` | 导入会话密钥、AES-GCM 密封/解封、媒体包头、SPS → `avc1.PPCCLL` |
 | `cbor.ts` | 用到的 CBOR 子集（整数、字节串、文本、数组、映射、f32） |
-| `messages.ts` | `HostMsg` 解析；`RequestKeyframe`、`Ack`、`Ping`、`Echo` 的编码 |
+| `messages.ts` | `HostMsg` 解析（含 `HostHello.touch`）；`RequestKeyframe`、`Ack`、`Ping`、`InputEvent::Touch` 的编码 |
 | `worker.ts` | 按流序号重组、控制通道顺序解密、WebCodecs 解码、Ack/Ping/关键帧请求 |
 | `client.ts` | WebSocket 与 Worker 之间的桥，密钥只在 `ready` 之后交给 Worker |
 
@@ -293,16 +293,29 @@ WARN，属于正常收尾（我们主动取消流），不影响后续会话。
 - 键鼠走 `ControllerMsg::Input`（控制通道上密封）：鼠标是归一化坐标（0..1，相对
   第 0 路画面），按键与滚轮按浏览器事件翻译。一批事件攒一帧发出，`t` 与控制数据报
   的 `Ping` 用同一个时钟（被控端按到达间隔判断是否过时，两边的绝对时钟不用对齐）。
-- 键盘分两条路，不重叠：
-  - **物理键**（`InputEvent::Key`）：带 Ctrl/Alt/Meta 的组合、F1–F24、Escape、Tab、
-    Enter、Backspace、Delete、方向键、Home/End/PageUp/PageDown、修饰键本身。
-    这些被浏览器 `preventDefault`，不会被输入框吃掉。
-  - **文本**（`InputEvent::Text`）：可打印字符不拦默认行为，交给一个 1×1 的隐藏
-    `textarea`；`input`（`isComposing` 为假时）与 `compositionend` 兜底把上屏的文本
-    发出去。中文、日文、emoji、粘贴都走这条，被控端按 Unicode 注入，跟键盘布局无关。
+- 键盘分两条路，不重叠，由悬浮面板里的「文本 / 物理键」切换（记在 localStorage）：
+  - **文本模式**（默认）：带 Ctrl/Alt/Meta 的组合、F1–F24、Escape、Tab、Enter、
+    Backspace、Delete、方向键、Home/End/PageUp/PageDown、修饰键本身走
+    `InputEvent::Key`；可打印字符不拦默认行为，交给一个 1×1 的隐藏 `textarea`，
+    `input`（`isComposing` 为假时）与 `compositionend` 兜底把上屏的文本作为
+    `InputEvent::Text` 发出去。中文、日文、emoji 都走这条，被控端按 Unicode 注入。
+  - **物理键模式**：所有键（含字母数字）都按 `KeyboardEvent.code` 走
+    `InputEvent::Key`，给读扫描码的程序用；中文与输入法组字一律不发送。切模式时
+    先 `ReleaseAll`，并清掉输入代理里没上屏的内容。
   - 抬起时按"按下时发过没有"（`heldKeys`）决定，不看此刻的修饰键状态，否则
     Ctrl+A 的 `A` 抬起会漏发，被控端卡住这个键。
-- 隐藏 `textarea` 每次按下鼠标都会移到指针处并聚焦，输入法候选框跟着走。
+- 隐藏 `textarea` 只在文本模式、且用鼠标按下时才移到指针处并聚焦，输入法候选框
+  跟着走；手指点画面不聚焦它，免得手机弹软键盘。切到物理键模式或触摸模式后，
+  pointerdown 显式聚焦 canvas —— 事件被 `preventDefault` 了，焦点不会自己过去。
+- **触摸**（面板里的「指针 / 触摸」切换）：`HostHello.touch`（字段 7）为真时才可选，
+  否则按钮禁用并在面板里说明。按 `pointerId` 跟踪最多 10 个点，发
+  `InputEvent::Touch`（变体 7，字段 `id / phase / x / y`，phase 为
+  down=0 / move=1 / up=2 / cancel=3），坐标同 `MouseMove`；失焦、切模式、断开时
+  给未抬起的点补 `cancel`。黄金字节 `82018205818207840201fa3f000000fa3e800000`
+  由 v0.4.0 的 minicbor derive 生成。
+- 顶栏已取消：主机、安全码、读数、返回与断开都收进可拖动的悬浮面板（与普通模式
+  同一套交互），面板开合点按钮或面板外；按钮位置单独存 `deskgw.perfFabPos`，
+  不影响 RDP 模式。
 - **剪贴板走大块通道（通道 1）**：两个方向各一条常驻流，密钥 `bulk_send` /
   `bulk_recv`，计数都从 0 开始，帧还是「u32 长度前缀 + 密封单元」。
   - 下行：被控端剪贴板变了发 `HostMsg::Clipboard`（`[8, ["文本"]]`），浏览器
@@ -336,6 +349,10 @@ WARN，属于正常收尾（我们主动取消流），不影响后续会话。
 | 中文文本 | 输入法组字上屏、直接插入中文都进记事本（被控端按 Unicode 注入） |
 | 剪贴板下行 | 被控端记事本里复制 `远端复制ABC-123`，浏览器 `navigator.clipboard.readText()` 读回一致 |
 | 剪贴板上行 | 浏览器 `clipboard.writeText` 后按 Ctrl+V，被控端记事本粘出第二行 `浏览器推过来的xyz789`（截图确认） |
+| 悬浮面板 | 桌面点击展开、拖动改位并写入 `deskgw.perfFabPos`、面板外点击收起；顶栏已移除 |
+| 手机触摸 | 390×664 触摸模拟：面板在屏内可点，点画布后焦点在 canvas，不会弹软键盘 |
+| 物理键模式 | 记事本里打出 `PHYS-ABC`（全部走 `Key`）；同模式下 `中文不应上屏` 一个字都没进 |
+| 文本模式 | 切回后 `中文TEXT` 正常上屏（见截图 `keymode-text.png`） |
 
 离线核对（`.perf/tests/perf.test.mjs`）覆盖：Go 生成的密封单元能在浏览器侧解开、
 再封回去字节一致；`v10.rs` 的 CBOR 黄金字节；媒体包头与 SPS。测试入口：
@@ -357,3 +374,8 @@ node out.mjs
   需要页面有焦点，没焦点时先攒着，下一次点击补写。
 - **粘贴靠被控端自己按 Ctrl+V**：浏览器把文本推过去，再补一对 `KeyV`。被控端
   当前焦点在游戏之类不认 `WM_PASTE` 的窗口里就粘不进去（键是按下去了）。
+- **触摸开关受被控端限制**：Windows 被控端的 `HostHello.touch=false`，面板里的
+  「触摸」禁用；手机仍能用「指针」模式点按/拖动，但真机验不了 Touch 注入效果
+  （离线有黄金字节）。触摸模式也没有长按右键、双指缩放这些手势。
+- **物理键模式下无法打字到软键盘**：手机上不自动聚焦隐藏输入框，避免误弹软键盘；
+  要用软键盘打字得切回文本模式（或接蓝牙键盘后切物理键模式）。

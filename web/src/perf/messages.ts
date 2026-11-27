@@ -26,6 +26,7 @@ export type HostEvent =
       platform: number
       shown: number[]
       streams: number
+      touch: boolean
     }
   | { type: 'displays'; displays: DisplayInfo[]; current: number; shown: number[] }
   | { type: 'encoder'; codec: number; name: string; hardware: boolean; width: number; height: number; stream: number }
@@ -101,6 +102,8 @@ export function decodeHostMsg(buf: Uint8Array): HostEvent | null {
         platform: num(hello[6]),
         shown: arr(hello[9]).map((v) => num(v)),
         streams: num(hello[10]),
+        // 被控端能不能收 InputEvent::Touch，决定面板里是否给「触摸」选项。
+        touch: hello[7] === true,
       }
     }
     case 4:
@@ -153,6 +156,10 @@ export function decodeHostMsg(buf: Uint8Array): HostEvent | null {
 
 // ---- 发往被控端 -----------------------------------------------------------
 
+/** 触摸阶段编号与 airhand_proto::session::TouchPhase 一致。 */
+export type TouchPhaseName = 'down' | 'move' | 'up' | 'cancel'
+const touchPhase: Record<TouchPhaseName, number> = { down: 0, move: 1, up: 2, cancel: 3 }
+
 /** 输入事件。编号与 airhand_proto::session::InputEvent 一致。 */
 export type InputEvent =
   | { kind: 'move'; x: number; y: number; stream?: number }
@@ -162,6 +169,7 @@ export type InputEvent =
   | { kind: 'key'; code: string; down: boolean }
   | { kind: 'text'; text: string }
   | { kind: 'releaseAll' }
+  | { kind: 'touch'; id: number; phase: TouchPhaseName; x: number; y: number }
 
 /**
  * ControllerMsg::Input = [1, [t, [事件…]]]。
@@ -195,6 +203,11 @@ export function encodeInput(t: number, events: InputEvent[]): Uint8Array {
         break
       case 'releaseAll':
         w.array(2).uint(6).array(0)
+        break
+      case 'touch':
+        // 坐标同 MouseMove（归一化 0..1）；多点靠 id 区分，同一批是同一时刻。
+        w.array(2).uint(7).array(4).uint(e.id & 0xff).uint(touchPhase[e.phase])
+          .float32(e.x).float32(e.y)
         break
     }
   }

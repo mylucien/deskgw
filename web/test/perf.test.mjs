@@ -60,9 +60,10 @@ hw.array(2).uint(1).array(1).array(11)
   .array(1).array(7).uint(0).text('Dis').int(1).int(2).uint(1920).uint(1080).bool(true)
   .uint(0)
   .array(1).uint(0)
-  .uint(0).bool(false).array(0).array(0).uint(1)
+  .uint(0).bool(true).array(0).array(0).uint(1)
 const helloEv = decodeHostMsg(hw.take())
 check('Hello 基本字段', [helloEv.hostname, helloEv.os, helloEv.version, helloEv.platform, helloEv.streams], ['HOST', 'OS!', '0.4', 0, 1])
+check('Hello touch', helloEv.touch, true)
 check('Hello 显示器', helloEv.displays, [{ index: 0, name: 'Dis', x: 1, y: 2, width: 1920, height: 1080, primary: true }])
 
 // ---- CBOR：ControllerMsg / 数据报 ----
@@ -73,6 +74,9 @@ check('Input(ReleaseAll)', toHex(encodeInput(5, [{ kind: 'releaseAll' }])), '820
 // InputEvent::Text：变体 5，字段是单个字符串；被控端按 Unicode 注入，中文、emoji 都走这条。
 check('Input(Text 你好)', toHex(encodeInput(5, [{ kind: 'text', text: '你好' }])), '820182058182058166e4bda0e5a5bd')
 check('Input(Text abc)', toHex(encodeInput(5, [{ kind: 'text', text: 'abc' }])), '820182058182058163616263')
+// InputEvent::Touch 的黄金字节由 airhand-proto v0.4.0 的 minicbor derive 生成。
+check('Input(Touch move)', toHex(encodeInput(5, [{ kind: 'touch', id: 2, phase: 'move', x: 0.5, y: 0.25 }])),
+  '82018205818207840201fa3f000000fa3e800000')
 
 // ---- CBOR：剪贴板（大块通道） ----
 // ControllerMsg::Clipboard 是单字段变体 7，HostMsg::Clipboard 是变体 8。

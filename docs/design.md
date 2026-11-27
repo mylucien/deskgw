@@ -380,7 +380,7 @@ UCI：`perf_enabled`、`perf_listen`（默认 `0.0.0.0:4433`，建议绑定 LAN 
 | `worker.ts` | 按流序号重组下行数据块、控制通道顺序解密、WebCodecs 解码、`Ack` 与关键帧请求 |
 | `web/src/views/PerfView.vue` | 界面：画布、安全码、状态栏（分辨率、帧率、码率、RTT）、错误提示 |
 
-键鼠已接并实测：鼠标归一化坐标、光标三态（`shown`／`inFrame`／`hidden`）、`ReleaseAll`；键盘分物理键（组合键、功能键、编辑键走 `Key`）与文本（可打印字符经隐藏 `textarea` 走 `Text`，输入法组字、粘贴、emoji 都能上屏）。剪贴板双向已接（大块通道，只传文本：下行自动写本地剪贴板，上行在 `paste` 里推送并补一对 `KeyV`，由被控端自己粘贴）。画质设置与 `Report` 还没接，`Lost` 用 `RequestKeyframe` 代替（每帧一条流，缺帧由本端判断）。已知限制：系统级 ANSI 对话框（Win+R）收不到 Unicode 文本；读扫描码的程序拿不到物理按键；光标形状（`CursorImage`）受网关丢弃的限制，暂时只有一个箭头；剪贴板不传图片与文件。
+键鼠已接并实测：鼠标归一化坐标、光标三态（`shown`／`inFrame`／`hidden`）、`ReleaseAll`；键盘分「文本 / 物理键」两模式（面板里切、localStorage 记住）：文本模式下可打印字符经隐藏 `textarea` 走 `Text`，输入法组字、emoji 都能上屏；物理键模式下所有键走 `Key`，中文不发送，给读扫描码的程序用。剪贴板双向已接（大块通道，只传文本：下行自动写本地剪贴板，上行在 `paste` 里推送并补一对 `KeyV`，由被控端自己粘贴）。输入方式可在「指针 / 触摸」间切换：触摸走 `InputEvent::Touch`（多点、四阶段），只在 `HostHello.touch` 为真时可选；手机点画面不弹软键盘。会话页顶栏已取消，主机信息、读数与操作都收进可拖动的悬浮面板（与普通模式一致，位置单独持久化）。画质设置与 `Report` 还没接，`Lost` 用 `RequestKeyframe` 代替（每帧一条流，缺帧由本端判断）。已知限制：系统级 ANSI 对话框（Win+R）收不到 Unicode 文本；光标形状（`CursorImage`）受网关丢弃的限制，暂时只有一个箭头；剪贴板不传图片与文件；Windows 被控端不支持触摸注入，手机上只能用指针模式。
 
 **解密与性能**
 
