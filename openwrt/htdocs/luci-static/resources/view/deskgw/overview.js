@@ -87,14 +87,33 @@ return view.extend({
 
 		s = m.section(form.NamedSection, 'main', 'deskgw', _('运维操作'));
 
-		o = s.option(form.Button, '_fp', _('查看证书指纹'));
+		o = s.option(form.Button, '_fp', _('HTTPS 证书指纹（普通模式）'));
 		o.inputstyle = 'action';
 		o.onclick = function() {
 			return fs.exec('/usr/libexec/deskgw/cert-fingerprint.sh').then(function(res) {
 				var fp = (res.code === 0) ? String(res.stdout || '').trim()
 					: _('读取失败，请确认服务已启动至少一次');
-				ui.showModal(_('HTTPS 证书指纹'), [
-					E('p', {}, _('该指纹用于校验服务端证书，长度为 64 位十六进制字符。')),
+				ui.showModal(_('HTTPS 证书指纹（普通模式）'), [
+					E('p', {}, _('8443 端口的 HTTPS 证书指纹，供普通远程桌面的客户端校验。' +
+					             '不要填进性能模式被控端的 server_fp，那里需要下面的 QUIC 指纹。')),
+					E('pre', { 'style': 'word-break:break-all;white-space:pre-wrap' }, fp),
+				]);
+			});
+		};
+
+		o = s.option(form.Button, '_fp_perf', _('QUIC 证书指纹（性能模式）'));
+		o.inputstyle = 'action';
+		o.onclick = function() {
+			// 和「打开管理界面」一样用 id 后缀取输入框里的路径，取不到回落到默认值。
+			var el = document.querySelector('input[id$=".perf_cert"]') ||
+				document.querySelector('input[data-name="perf_cert"]');
+			var cert = (el && el.value) || '/etc/deskgw/perf.crt';
+			return fs.exec('/usr/libexec/deskgw/cert-fingerprint.sh', [ cert ]).then(function(res) {
+				var fp = (res.code === 0) ? String(res.stdout || '').trim()
+					: _('读取失败，请确认性能模式已启用并至少启动过一次');
+				ui.showModal(_('QUIC 证书指纹（性能模式）'), [
+					E('p', {}, _('填进被控端 config.toml 的 server_fp（64 位十六进制）。' +
+					             '控制端公钥 [[paired]].key 不在这里，请到管理后台「性能模式」页复制。')),
 					E('pre', { 'style': 'word-break:break-all;white-space:pre-wrap' }, fp),
 				]);
 			});

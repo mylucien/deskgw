@@ -1,5 +1,6 @@
 #!/bin/sh
-# 输出 deskgw HTTPS 证书的 SHA-256 指纹（小写，无冒号）。
+# 输出指定证书的 SHA-256 指纹（小写，无冒号）。默认取 deskgw 的 HTTPS 证书；
+# 传入 perf_cert 路径时输出性能模式的 QUIC 证书指纹（填被控端的 server_fp）。
 # 用法: cert-fingerprint.sh [cert.pem]
 set -u
 
