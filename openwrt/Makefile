@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=deskgw
-PKG_VERSION:=0.3.34
+PKG_VERSION:=0.3.35
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=mylucien
@@ -63,6 +63,7 @@ define Package/deskgw/install
 
 	$(INSTALL_DIR) $(1)/usr/libexec/deskgw
 	$(INSTALL_BIN) ./files/usr/libexec/deskgw/cert-fingerprint.sh $(1)/usr/libexec/deskgw/
+	$(INSTALL_BIN) ./files/usr/libexec/deskgw/udp-tune.sh $(1)/usr/libexec/deskgw/
 
 	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
 	$(INSTALL_DATA) ./files/lib/upgrade/keep.d/deskgw $(1)/lib/upgrade/keep.d/deskgw

@@ -532,7 +532,7 @@ config rdpgw 'main'
 - 不新增进程：perfgw 随 rdpgw 启动，多监听一个 UDP 端口（默认 4433），防火墙只对 LAN 区域放行。
 - 证书：首次启动自动生成自签证书和密钥（`perf_cert`、`perf_key`），后台显示证书指纹，供构建被控端安装包使用。
 - 控制端密钥：首次启动生成 X25519 密钥（`perf_identity`，权限 600），后台显示公钥，供预置被控端的 `[[paired]]`。
-- 内核 UDP 缓冲：`sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608`，写入 `/etc/sysctl.conf`，否则高码率视频会因缓冲被填满而卡顿。
+- 内核 UDP 缓冲：LuCI「性能模式」分区提供开关（默认开启）与缓冲上限（默认 8MiB，可改）。服务启动时由 `/usr/libexec/deskgw/udp-tune.sh` 写入 `net.core.rmem_max` / `wmem_max` 并持久化到 `/etc/sysctl.conf`，用标记块管理、重复调用会覆盖旧值；关闭时移除该块。不设的话高码率视频会因缓冲被填满而卡顿。
 - UCI 增加 `perf_*` 选项（见 4.10）。
 - 构建：仍是 Go 单一二进制，QUIC 使用 quic-go，不需要 Rust 和 Docker；性能模式只建议用于 amd64 和 arm64 设备。
 

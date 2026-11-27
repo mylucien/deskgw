@@ -85,6 +85,19 @@ return view.extend({
 		o.placeholder = '/etc/deskgw/perf_identity';
 		o.readonly = true;
 
+		o = s.option(form.Flag, 'perf_udp_tune', _('优化 UDP 接收缓冲'),
+			_('服务启动时将内核的 UDP 收发缓冲上限调整为下方指定值，并写入 /etc/sysctl.conf 以在重启后继续生效。' +
+			  '高码率视频传输依赖较大的接收缓冲；缓冲不足会导致丢包与画面卡顿。关闭后不修改内核参数，重启服务时移除此前写入的配置。'));
+		o.default = '1';
+
+		o = s.option(form.Value, 'perf_udp_buf_mb', _('UDP 缓冲上限（MiB）'),
+			_('对应 net.core.rmem_max 与 net.core.wmem_max 的目标值，默认 8 MiB。' +
+			  '数值越大越能吸收网络抖动，但会相应增加内核内存占用；仅在开启缓冲优化时生效。'));
+		o.datatype = 'uinteger';
+		o.placeholder = '8';
+		o.default = '8';
+		o.rmempty = false;
+
 		s = m.section(form.NamedSection, 'main', 'deskgw', _('运维操作'));
 
 		o = s.option(form.Button, '_fp', _('HTTPS 证书指纹（普通模式）'));

@@ -9,7 +9,7 @@ PROG=/usr/bin/deskgw
 
 start_service() {
 	local enabled listen cert key cert_names data_dir idle upload cookie_secure redirect mem_limit
-	local perf_enabled perf_listen perf_cert perf_key perf_identity
+	local perf_enabled perf_listen perf_cert perf_key perf_identity perf_udp_tune perf_udp_buf_mb
 
 	config_load deskgw
 	config_get_bool enabled main enabled 1
@@ -30,6 +30,16 @@ start_service() {
 	config_get perf_cert main perf_cert '/etc/deskgw/perf.crt'
 	config_get perf_key main perf_key '/etc/deskgw/perf.key'
 	config_get perf_identity main perf_identity '/etc/deskgw/perf_identity'
+	config_get_bool perf_udp_tune main perf_udp_tune 1
+	config_get perf_udp_buf_mb main perf_udp_buf_mb '8'
+
+	# 性能模式的 UDP 缓冲：由 helper 写入内核并持久化到 /etc/sysctl.conf。
+	# helper 失败只记日志，不让网关服务起不来。
+	if [ "$perf_udp_tune" -eq 1 ]; then
+		/usr/libexec/deskgw/udp-tune.sh "$perf_udp_buf_mb" || echo "deskgw: UDP 缓冲设置失败" >&2
+	else
+		/usr/libexec/deskgw/udp-tune.sh 0 >/dev/null 2>&1 || true
+	fi
 
 	if [ -z "$mem_limit" ]; then
 		# Go 默认把 GC 目标定在「堆的两倍」，而单次 Argon2 就要约 19MB。
