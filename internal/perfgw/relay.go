@@ -18,8 +18,12 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/mylucien/deskgw/internal/textutil"
 	"github.com/quic-go/quic-go"
 )
+
+// reasonMax 是关闭帧原因的上限：协议规定 123 字节，留 3 字节余量。
+const reasonMax = 120
 
 const (
 	// 与浏览器之间的二进制帧类型。首字节是类型，其余按类型解释（4.10）。
@@ -215,7 +219,7 @@ func (s *sink) close() {
 	reason := s.reason
 	s.mu.Unlock()
 	_ = s.ws.WriteControl(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, clipReason(reason)),
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, textutil.Clip(reason, reasonMax)),
 		time.Now().Add(5*time.Second))
 	_ = s.ws.Close()
 }
@@ -494,6 +498,9 @@ func (r *relay) upBulk(data []byte) error {
 		if _, err := st.Write(buf); err != nil {
 			log.Printf("写大块通道失败: %v", err)
 			r.stop("写入大块通道失败")
+			// 与下面的分支一致：坏流不能留着，否则后续每次写入都打在
+			// 同一条已经废掉的流上。
+			r.bulk = nil
 			return err
 		}
 		return nil
@@ -551,17 +558,4 @@ func (r *relay) untrack(rs *quic.ReceiveStream) {
 	r.mu.Lock()
 	delete(r.streams, rs)
 	r.mu.Unlock()
-}
-
-// clipReason 把关闭帧的原因截到 123 字节以内，并避开 UTF-8 字符中间。
-func clipReason(s string) string {
-	const max = 120
-	if len(s) <= max {
-		return s
-	}
-	cut := max
-	for cut > 0 && s[cut]&0xC0 == 0x80 {
-		cut--
-	}
-	return s[:cut]
 }

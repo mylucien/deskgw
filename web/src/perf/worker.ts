@@ -43,9 +43,7 @@ interface DecoderState {
   decoder: any
   expected: number | null
   pending: Map<number, Waiting>
-  decoded: Set<number>
   lastSeq: number
-  askedAt: number
   width: number
   height: number
   codec: string
@@ -94,7 +92,7 @@ async function start(bundle: any) {
     return
   }
   post({ type: 'ready' })
-  lastStats = { frames: 0, bytes: 0, at: performance.now() }
+  lastStats = { frames: 0, bytes: 0, dropped: 0, at: performance.now() }
   pingTimer = (self as any).setInterval(tick, 1000)
   reportTimer = (self as any).setInterval(reportTick, REPORT_EVERY_MS)
 }
@@ -315,8 +313,8 @@ function decoderState(stream: number, width: number, height: number): DecoderSta
   let st = decoders.get(stream)
   if (!st) {
     st = {
-      decoder: null, expected: null, pending: new Map(), decoded: new Set(),
-      lastSeq: 0, askedAt: 0, width, height, codec: '',
+      decoder: null, expected: null, pending: new Map(),
+      lastSeq: 0, width, height, codec: '',
     }
     decoders.set(stream, st)
   }
@@ -369,7 +367,6 @@ function onDecoderError(st: DecoderState, e: any) {
   }
   st.decoder = null
   st.pending.clear()
-  st.decoded.clear()
   st.expected = null
   askKeyframe()
 }
@@ -414,8 +411,6 @@ function drain(st: DecoderState) {
       onDecoderError(st, e)
       return
     }
-    st.decoded.add(f.seq)
-    if (st.decoded.size > 64) st.decoded.delete(f.seq - 64)
     st.lastSeq = f.seq
     st.expected++
   }
@@ -490,7 +485,7 @@ function reportTick() {
   reportStats.clear()
 }
 
-let lastStats = { frames: 0, bytes: 0, at: 0 }
+let lastStats = { frames: 0, bytes: 0, dropped: 0, at: 0 }
 function tick() {
   if (!keys || stopped) return
   sendDatagram(encodePing(nowUs()))
@@ -508,10 +503,12 @@ function tick() {
         kbps: Math.round(((stats.bytes - lastStats.bytes) * 8) / dt / 1000),
         bytes: stats.bytes,
         dropped: stats.dropped,
+        // 累计值只增不减，面板上没法判断「现在还在丢吗」；同时给出本周期速率。
+        dropRate: Math.round((stats.dropped - lastStats.dropped) / dt),
         rtt: stats.rtt,
         errors: stats.decodeErrors,
       },
     })
   }
-  lastStats = { frames: stats.frames, bytes: stats.bytes, at: now }
+  lastStats = { frames: stats.frames, bytes: stats.bytes, dropped: stats.dropped, at: now }
 }

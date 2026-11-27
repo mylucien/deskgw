@@ -120,11 +120,12 @@ func TestErrorKind(t *testing.T) {
 		{errHostOffline, "codeNotFound"},
 		{errNotApproved, "codeNotFound"},
 		{errHostBusy, "hostBusy"},
-		{errFull, "hostBusy"},
+		{errFull, "limit"},
 		{errKeyChanged, "hostKeyChanged"},
 		{errPairingRequired, "pairingRequired"},
 		{errVersion, "incompatible"},
 		{errNoise, "incompatible"},
+		{errors.New("拨号超时"), "serverError"},
 	}
 	for _, c := range cases {
 		if got := errorKind(c.err); got != c.want {

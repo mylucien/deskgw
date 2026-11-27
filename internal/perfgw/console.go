@@ -437,10 +437,16 @@ func buildKeyBundle(k *sessionKeys) keyBundle {
 }
 
 // errorKind 把内部错误映射成浏览器认识的类型（4.10 的错误处理表）。
+//
+// hostBusy 与 limit 必须分开：前者是「这台被控端有别的人在连」，后者是
+// 「网关的全局名额满了」。合并成一句会让用户去结束自己的另一个会话，
+// 实际该做的是等一下或让管理员调高限额。
 func errorKind(err error) string {
 	switch {
-	case errors.Is(err, errHostBusy), errors.Is(err, errFull):
+	case errors.Is(err, errHostBusy):
 		return "hostBusy"
+	case errors.Is(err, errFull):
+		return "limit"
 	case errors.Is(err, errPairingRequired):
 		return "pairingRequired"
 	case errors.Is(err, errHostOffline), errors.Is(err, errNotApproved),
@@ -448,8 +454,12 @@ func errorKind(err error) string {
 		return "codeNotFound"
 	case errors.Is(err, errKeyChanged):
 		return "hostKeyChanged"
-	default:
+	case errors.Is(err, errVersion), errors.Is(err, errNoise):
 		return "incompatible"
+	default:
+		// 剩下的多是拨号超时、读写中断之类的临时故障。说成「版本不一致」
+		// 会让人去升级两端，所以单独给一个类型。
+		return "serverError"
 	}
 }
 
@@ -458,7 +468,7 @@ func (c *Console) reject(ws *websocket.Conn, tk *Ticket, cl ConsoleClient, kind,
 	_ = ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_ = ws.WriteJSON(map[string]any{"type": "error", "kind": kind, "message": msg})
 	_ = ws.WriteControl(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, clipReason(msg)),
+		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, textutil.Clip(msg, reasonMax)),
 		time.Now().Add(5*time.Second))
 	c.audit(cl.UserID, "perf.connect_failed", strconv.FormatInt(tk.HostID, 10), kind, cl.ClientIP)
 	c.endSession(tk.SessionID, "failed", kind)

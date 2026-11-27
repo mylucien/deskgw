@@ -59,11 +59,17 @@
             <h3>连接失败</h3>
             <p class="error">{{ errorText }}</p>
             <p v-if="hint" class="muted small">{{ hint }}</p>
+            <button class="primary" :disabled="reconnecting" @click="reconnect">
+              {{ reconnecting ? '重连中…' : '重新连接' }}
+            </button>
             <button @click="leave">返回主机列表</button>
           </template>
           <template v-else-if="state === 'ended'">
             <h3>会话已结束</h3>
             <p class="muted">{{ endedReason || '被控端或网关结束了这次会话。' }}</p>
+            <button class="primary" :disabled="reconnecting" @click="reconnect">
+              {{ reconnecting ? '重连中…' : '重新连接' }}
+            </button>
             <button @click="leave">返回主机列表</button>
           </template>
           <template v-else>
@@ -77,16 +83,17 @@
       <div v-if="banner" class="banner">{{ banner }}</div>
     </div>
 
-    <!-- 悬浮按钮：和普通模式一样可拖动，位置单独保存，不影响 RDP 模式。 -->
+    <!-- mousedown.prevent：按钮不抢焦点，点完面板还能继续打字。 -->
     <button class="fab" :class="{ on: menuOpen, drag: dragging }" :style="fabStyle"
       :aria-expanded="menuOpen" aria-label="会话菜单" title="会话菜单"
-      @pointerdown="onFabDown" @click="onFabTap">
+      @mousedown.prevent @pointerdown="onFabDown" @click="onFabTap">
       <span class="mark">DG</span>
       <span v-if="state === 'ready'" class="live"></span>
     </button>
 
-    <div class="panel" :class="{ open: menuOpen }" :style="panelStyle"
-      :aria-hidden="!menuOpen" role="dialog" aria-label="会话菜单" ref="panelEl">
+    <div class="panel" :class="{ open: menuOpen }" :style="panelStyle" :inert="!menuOpen"
+      :aria-hidden="!menuOpen" role="dialog" aria-label="会话菜单" ref="panelEl"
+      @mousedown.prevent>
       <div class="p-top">
         <span class="p-cap">性能模式 · {{ ready?.host.name || perfSession.current?.hostName || '未连接' }}</span>
         <span v-if="ready" class="p-ok">加密</span>
@@ -97,8 +104,10 @@
         <div v-if="ready">安全码 <b>{{ ready.safety }}</b></div>
         <div v-if="state === 'ready' && hasFrame">
           {{ resLabel }} · {{ stats.fps }} fps · {{ rateLabel }} · RTT {{ stats.rtt }} ms
-          <span v-if="stats.dropped">· 丢 {{ stats.dropped }}</span>
+          <span v-if="stats.dropRate">· 丢 {{ stats.dropRate }}/s</span>
+          <span v-if="stats.errors">· 解码错误 {{ stats.errors }}</span>
         </div>
+        <div v-if="hostHostname" class="p-sub">被控端：{{ hostHostname }}</div>
       </div>
 
       <template v-if="state === 'ready'">
@@ -140,6 +149,7 @@ import { perfSession, closePerf } from '../perf'
 import { connectPerf } from '../perf/client'
 import type { PerfConnection, PerfReady, PerfStats } from '../perf/client'
 import type { HostEvent, InputEvent, QualitySettings } from '../perf/messages'
+import { post } from '../api'
 
 type State = 'connecting' | 'ready' | 'error' | 'ended'
 
@@ -149,6 +159,7 @@ const canvas = ref<HTMLCanvasElement | null>(null)
 const ime = ref<HTMLTextAreaElement | null>(null)
 
 const state = ref<State>('connecting')
+const reconnecting = ref(false)
 const ready = ref<PerfReady | null>(null)
 const hasFrame = ref(false)
 const errorKind = ref('')
@@ -156,8 +167,10 @@ const errorText = ref('')
 const endedReason = ref('')
 const banner = ref('')
 const encoderName = ref('')
+// 被控端自报的机器名，和后台登记的名字可能不一样，连着的时候两个都显示。
+const hostHostname = ref('')
 const frameSize = reactive({ w: 0, h: 0 })
-const stats = reactive<PerfStats>({ fps: 0, kbps: 0, bytes: 0, dropped: 0, rtt: 0, errors: 0 })
+const stats = reactive<PerfStats>({ fps: 0, kbps: 0, bytes: 0, dropped: 0, dropRate: 0, rtt: 0, errors: 0 })
 // 自绘光标的兜底图：还没收到被控端形状时用普通模式同款箭头。
 const DEFAULT_CURSOR_SVG = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="19" viewBox="0 0 12 19">'
@@ -223,6 +236,7 @@ function setQuality(key: QualityKey) {
   quality.value = key
   try { localStorage.setItem('deskgw.perfQuality', key) } catch { /* 隐私模式忽略 */ }
   conn?.sendSettings(currentQuality())
+  refocus()
 }
 
 function currentQuality(): QualitySettings {
@@ -263,6 +277,8 @@ const hints: Record<string, string> = {
   incompatible: '两端的会话版本不一致，升级到同一版本。',
   limit: '达到并发上限，稍后再试或调高后台的限额。',
   disabled: '性能模式没有启用，检查网关的 perf.enabled。',
+  serverError: '网关连不上被控端（拨号超时或链路中断），稍后重试；持续失败请看网关日志。',
+  connectFailed: '连接没有建立：票据一次性有效，网关也可能拒绝了升级。点「重新连接」换一张票据再试。',
 }
 const hint = computed(() => hints[errorKind.value] || '')
 const resLabel = computed(() => (frameSize.w ? `${frameSize.w}×${frameSize.h}` : '—'))
@@ -393,6 +409,7 @@ function setKeyMode(mode: KeyMode) {
   try { localStorage.setItem('deskgw.perfKeyMode', mode) } catch { /* 忽略 */ }
   if (ime.value) ime.value.value = ''
   menuOpen.value = false
+  refocus()
 }
 
 function setInputMode(mode: InputMode) {
@@ -403,9 +420,9 @@ function setInputMode(mode: InputMode) {
   releaseAll()
   inputMode.value = mode
   try { localStorage.setItem('deskgw.perfInputMode', mode) } catch { /* 忽略 */ }
-  // 触摸模式不要自动弹手机软键盘。
-  if (mode === 'pointer' && keyMode.value === 'text') nextTick(() => focusIme())
   menuOpen.value = false
+  // 触摸模式不要自动弹手机软键盘；refocus 会按模式选画布或输入代理。
+  refocus()
 }
 
 function setBanner(text: string) {
@@ -471,6 +488,19 @@ function placeCursor(x: number, y: number) {
   el.style.transform = `translate3d(${Math.round(x - hotX)}px,${Math.round(y - hotY)}px,0)`
 }
 
+// 高频 pointermove 下每帧最多摆一次光标：中间位置没人看得见，而且每次都读
+// 布局会拖慢输入处理。
+let cursorRaf = 0
+let cursorAt = { x: 0, y: 0 }
+function scheduleCursor(x: number, y: number) {
+  cursorAt = { x, y }
+  if (cursorRaf) return
+  cursorRaf = requestAnimationFrame(() => {
+    cursorRaf = 0
+    placeCursor(cursorAt.x, cursorAt.y)
+  })
+}
+
 function flushInput() {
   raf = 0
   if (!pending.length) return
@@ -493,10 +523,8 @@ function pushMove(ev: InputEvent) {
 
 /** 指针在画布上的位置，归一化到 0..1；拖到画布外时夹住。 */
 function point(ev: { clientX: number; clientY: number }) {
-  const c = canvas.value
-  if (!c) return null
-  const r = c.getBoundingClientRect()
-  if (!r.width || !r.height) return null
+  const r = canvas.value?.getBoundingClientRect()
+  if (!r?.width || !r.height) return null
   return {
     x: Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)),
     y: Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height)),
@@ -832,7 +860,7 @@ function onPointerMove(ev: PointerEvent) {
   // 桌面收到远端形状后自绘光标，跟着系统指针走（触屏的虚拟指针走 drawVirtualCursor）。
   if (!touchDevice && activeShape.value) {
     const sr = stage.value?.getBoundingClientRect()
-    if (    sr) requestAnimationFrame(() => placeCursor(ev.clientX - sr.left, ev.clientY - sr.top))
+    if (sr) scheduleCursor(ev.clientX - sr.left, ev.clientY - sr.top)
   }
 }
 
@@ -933,6 +961,12 @@ function focusIme(ev?: { clientX: number; clientY: number }) {
     el.style.top = y + 'px'
   }
   if (document.activeElement !== el) el.focus({ preventScroll: true })
+}
+
+/** 把焦点还给画面。面板按钮点完（或用键盘选完）还能继续输入。 */
+function refocus() {
+  if (inputMode.value === 'pointer' && keyMode.value === 'text') focusIme()
+  else canvas.value?.focus({ preventScroll: true })
 }
 
 /** 上屏的文本（含输入法、粘贴）走 ControllerMsg 的 Text，交给被控端按 Unicode 注入。 */
@@ -1041,7 +1075,27 @@ function onKeyUp(ev: KeyboardEvent) {
   onKey(ev, false)
 }
 
+let framePending: VideoFrame | null = null
+let frameRaf = 0
+let ctx2d: CanvasRenderingContext2D | null = null
+
 function onVideo(frame: VideoFrame) {
+  if (!canvas.value) {
+    frame.close()
+    return
+  }
+  // 主线程忙的时候 worker 的消息会排队。只保留最新一帧：旧帧不画也不 close
+  // 会一直占着显存，而且排队越久延迟越高、永远追不回来。
+  if (framePending) framePending.close()
+  framePending = frame
+  if (!frameRaf) frameRaf = requestAnimationFrame(drawFrame)
+}
+
+function drawFrame() {
+  frameRaf = 0
+  const frame = framePending
+  framePending = null
+  if (!frame) return
   const c = canvas.value
   if (!c) {
     frame.close()
@@ -1054,11 +1108,12 @@ function onVideo(frame: VideoFrame) {
     frameSize.w = frame.displayWidth
     frameSize.h = frame.displayHeight
   }
-  const ctx = c.getContext('2d', { alpha: false })
-  if (ctx) {
+  // getContext 每帧调用虽然返回同一个对象，但要走一遍参数校验；缓存起来。
+  if (!ctx2d) ctx2d = c.getContext('2d', { alpha: false })
+  if (ctx2d) {
     try {
       // VideoFrame 是 CanvasImageSource，TS 的旧 lib 里还没列进去。
-      ctx.drawImage(frame as unknown as CanvasImageSource, 0, 0)
+      ctx2d.drawImage(frame as unknown as CanvasImageSource, 0, 0)
     } catch (e) {
       console.warn('[perf] 画一帧失败', e)
     }
@@ -1090,6 +1145,7 @@ function onCursorImage(ev: Extract<HostEvent, { type: 'cursorImage' }>) {
 
 function onEvent(ev: HostEvent) {
   if (ev.type === 'hello') {
+    hostHostname.value = ev.hostname
     // 被控端没声明 touch 时，面板里的「触摸」选项保持不可选。
     hostTouch.value = ev.touch
     if (inputMode.value === 'touch' && !ev.touch) {
@@ -1128,6 +1184,10 @@ function onEvent(ev: HostEvent) {
 function connect() {
   const cur = perfSession.current
   if (!cur) return
+  // 上一次失败留下的 kind/文案不能带到这一次，否则会显示相反的提示。
+  errorKind.value = ''
+  errorText.value = ''
+  endedReason.value = ''
   state.value = 'connecting'
   conn = connectPerf(cur.wsPath, cur.hostId, {
     onReady: (r) => {
@@ -1168,6 +1228,19 @@ function shutdown() {
     cancelAnimationFrame(raf)
     raf = 0
   }
+  if (frameRaf) {
+    cancelAnimationFrame(frameRaf)
+    frameRaf = 0
+  }
+  if (cursorRaf) {
+    cancelAnimationFrame(cursorRaf)
+    cursorRaf = 0
+  }
+  if (framePending) {
+    framePending.close()
+    framePending = null
+  }
+  ctx2d = null
   conn?.close()
   conn = null
   pending = []
@@ -1190,6 +1263,37 @@ function leave() {
   shutdown()
   closePerf()
   router.push({ name: 'hosts' })
+}
+
+// 重连要换一张新票据：旧票据一次性，失败的那次已经用掉了。和 RDP 模式一致。
+async function reconnect() {
+  const cur = perfSession.current
+  if (reconnecting.value || !cur) return
+  reconnecting.value = true
+  shutdown()
+  errorKind.value = ''
+  errorText.value = ''
+  endedReason.value = ''
+  ready.value = null
+  hasFrame.value = false
+  frameSize.w = 0
+  frameSize.h = 0
+  encoderName.value = ''
+  hostHostname.value = ''
+  state.value = 'connecting'
+  try {
+    const t = await post<{ session_id: number; ws_path: string }>('/perf/ticket', { host_id: cur.hostId })
+    // 等待期间用户可能已经离开页面。
+    if (!perfSession.current) return
+    perfSession.current.sessionId = t.session_id
+    perfSession.current.wsPath = t.ws_path
+    connect()
+  } catch (e: any) {
+    errorText.value = '重连失败：' + (e.message || '无法签发票据')
+    state.value = 'error'
+  } finally {
+    reconnecting.value = false
+  }
 }
 
 onMounted(() => {
@@ -1215,6 +1319,8 @@ onBeforeUnmount(() => {
   document.removeEventListener('visibilitychange', onVisibility)
   document.removeEventListener('pointerdown', onDocDown)
   shutdown()
+  // 浏览器后退离开时不会走 leave()，票据留在内存里会被下一次进入误用。
+  closePerf()
 })
 </script>
 
@@ -1263,10 +1369,13 @@ onBeforeUnmount(() => {
 .p-meta { padding: 10px 12px 4px; font-size: 12px; line-height: 1.7; color: #9ca3af;
   font-variant-numeric: tabular-nums; flex: none; }
 .p-meta b { color: #e5e7eb; letter-spacing: .5px; }
+.p-sub { color: #8f9aaa; font-size: 11px; }
 .p-div { padding: 8px 12px 6px; font-size: 11px; color: #98a1b0; flex: none; }
 .p-note { margin: 6px 12px 0; font-size: 11px; color: #8f9aaa; line-height: 1.6; flex: none; }
 .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 0 12px; padding: 3px;
   background: #16191f; border: 1px solid rgba(255, 255, 255, .08); border-radius: 8px; flex: none; }
+/* 画质三档：不加这条会按两列排成 2+1。 */
+.seg.seg3 { grid-template-columns: repeat(3, 1fr); }
 .seg button { border: 0; padding: 6px 0; border-radius: 6px; background: transparent;
   color: #98a1b0; font-size: 12px; }
 .seg button.on { background: #2563eb; color: #fff; }
@@ -1359,6 +1468,10 @@ onBeforeUnmount(() => {
 .overlay-card .muted { color: #9ca3af; font-size: 13px; margin: 0 0 10px; }
 .overlay-card .error { color: #fecaca; background: #3f1d1d; border-color: #7f1d1d; text-align: left; }
 .overlay-card button { margin-top: 8px; background: #232830; border-color: #333a45; color: #e5e7eb; }
+/* 主按钮要压过上面那条（同特异性，靠后生效）。 */
+.overlay-card button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+.overlay-card button.primary:hover:not(:disabled) { background: #1d4ed8; }
+.overlay-card button + button { margin-left: 8px; }
 
 .banner {
   position: absolute;

@@ -1423,6 +1423,7 @@ name = "iron-remote-desktop"
 version = "0.7.1"
 dependencies = [
  "console_error_panic_hook",
+ "js-sys",
  "tracing",
  "tracing-subscriber",
  "tracing-web",

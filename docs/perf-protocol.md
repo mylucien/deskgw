@@ -173,7 +173,7 @@ Confirm         = a0                                 # 空映射
 | 浏览器 → 路由器 | `{"type":"connect","host":"h3"}` | 必须是第一条消息，10 秒内发出 |
 | 浏览器 → 路由器 | `{"type":"disconnect"}` / `{"type":"ping"}` | 断开；心跳 |
 | 路由器 → 浏览器 | `ready` | `session_id`、`host{id,name,os}`、`safety`、`keys` |
-| 路由器 → 浏览器 | `error` | `kind`：`codeNotFound` / `hostBusy` / `pairingRequired` / `hostKeyChanged` / `incompatible` |
+| 路由器 → 浏览器 | `error` | `kind`：`codeNotFound` / `hostBusy` / `limit` / `pairingRequired` / `hostKeyChanged` / `incompatible` / `serverError` |
 | 路由器 → 浏览器 | `ended` | 结束原因，之后是正常的关闭帧 |
 | 路由器 → 浏览器 | `pong` | 心跳应答 |
 

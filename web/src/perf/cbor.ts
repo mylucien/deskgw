@@ -65,12 +65,16 @@ export class CborReader {
         return -1 - value
       case 2: {
         if (value < 0) throw new Error('不支持不定长字节串')
+        // 不检查的话 subarray 会静默截短，pos 越过末尾，错误要等到下一步
+        // 才以「数据不够」的形式抛出，排查时看不出是长度字段坏了。
+        if (this.pos + value > this.buf.length) throw new Error('CBOR 字节串越界')
         const out = this.buf.subarray(this.pos, this.pos + value)
         this.pos += value
         return out
       }
       case 3: {
         if (value < 0) throw new Error('不支持不定长文本')
+        if (this.pos + value > this.buf.length) throw new Error('CBOR 文本越界')
         const out = textDecoder.decode(this.buf.subarray(this.pos, this.pos + value))
         this.pos += value
         return out

@@ -32,6 +32,22 @@ const MIME_TEXT: &str = "text/plain";
 const MIME_HTML: &str = "text/html";
 const MIME_PNG: &str = "image/png";
 
+/// 一条 FormatDataRequest 最多等多久。
+///
+/// CLIPRDR 的响应不带格式 id，只能靠「同一时刻只有一个请求在飞」配对。
+/// 被控端漏回一条响应时，这个不变量会把后续所有列表都挡在 stale 分支上，
+/// 剪贴板直到重连都不会再同步 —— 所以必须能主动放弃。
+const REQUEST_TIMEOUT_MS: u64 = 15_000;
+
+/// 单调时钟（毫秒）。wasm32 上 std 的时间依赖 performance.now，这里直接用
+/// 同一个来源，和锁超时保持一致。
+#[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::as_conversions)]
+fn now_ms() -> u64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map_or_else(|| js_sys::Date::now() as u64, |p| p.now() as u64)
+}
+
 #[derive(Clone, Copy)]
 struct ClientFormatDescriptor {
     id: ClipboardFormatId,
@@ -256,6 +272,9 @@ pub(crate) struct WasmClipboard {
     /// 新内容。丢弃后再按新列表继续请求。
     pending_is_stale: bool,
 
+    /// `pending_request` 的发出时间（`now_ms()`），用于超时放弃。
+    pending_since: Option<u64>,
+
     /// Deferred file list paste: when the remote FormatList includes FileGroupDescriptorW,
     /// we store its format ID here and trigger `SendInitiatePaste` only after all text/image
     /// formats have been fetched (or immediately if no text/image formats are present).
@@ -281,6 +300,21 @@ pub(crate) struct JsClipboardCallbacks {
     pub(crate) on_format_list_response: Option<js_sys::Function>,
 }
 
+/// `process_remote_clipboard_changed` 的结论：调用方据此决定发不发请求。
+///
+/// 早先这里用 `Option<ClipboardFormatId>`，`None` 同时表示「没有文本/图片格式」
+/// 和「有请求在飞，先等着」。调用方按前者处理，于是新列表一到就立刻发文件列表
+/// 请求，和还没回来的旧请求撞在一起 —— 两个响应无法区分。
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteClipboardUpdate {
+    /// 立刻请求这个格式。
+    Request(ClipboardFormatId),
+    /// 没有要读的文本/图片格式；若有待读的文件列表，调用方可以马上请求。
+    Idle,
+    /// 上一份列表的请求还在飞，等它回来（会被丢弃）后自动按新列表继续。
+    Waiting,
+}
+
 impl WasmClipboard {
     pub(crate) fn new(message_proxy: WasmClipboardMessageProxy, js_callbacks: JsClipboardCallbacks) -> Self {
         Self {
@@ -293,6 +327,7 @@ impl WasmClipboard {
             remote_formats_to_read: Vec::new(),
             pending_request: None,
             pending_is_stale: false,
+            pending_since: None,
             pending_file_list_paste: None,
         }
     }
@@ -417,7 +452,7 @@ impl WasmClipboard {
     fn process_remote_clipboard_changed(
         &mut self,
         formats: Vec<ClipboardFormat>,
-    ) -> anyhow::Result<Option<ClipboardFormatId>> {
+    ) -> anyhow::Result<RemoteClipboardUpdate> {
         self.remote_clipboard.clear();
         self.remote_mapping.clear();
         self.pending_file_list_paste = None;
@@ -516,16 +551,27 @@ impl WasmClipboard {
 
         // 上一个请求还没回来：这里绝不能再发一个，否则两个响应无法区分，第二个就会
         // 把 CF_HTML 的数据配给 CF_UNICODETEXT。把它标记作废，响应回来时整条丢弃，
-        // 再按这份新列表重新开始请求。
+        // 再按这份新列表重新开始请求。文件列表也必须一起等，见 `Waiting` 的说明。
         if self.pending_request.is_some() {
             self.pending_is_stale = true;
-            return Ok(None);
+            return Ok(RemoteClipboardUpdate::Waiting);
         }
 
         // 从队尾取（与原实现一致）：先请求最后一个格式，响应后依次向前。
         let next = self.remote_formats_to_read.pop();
         self.pending_request = next;
-        return Ok(next);
+        // 注意这里必须写 return：下面的 `fn format_name_eq` 是语句，
+        // 直接把它放在 tail expression 后面会让函数返回 ()。
+        return match next {
+            Some(format) => {
+                self.pending_since = Some(now_ms());
+                Ok(RemoteClipboardUpdate::Request(format))
+            }
+            None => {
+                self.pending_since = None;
+                Ok(RemoteClipboardUpdate::Idle)
+            }
+        };
 
         fn format_name_eq(format: &ClipboardFormat, name: &str) -> bool {
             format
@@ -545,6 +591,7 @@ impl WasmClipboard {
                 return Ok(());
             }
         };
+        self.pending_since = None;
 
         // 这次请求是在上一份 FormatList 下发出的，数据属于旧剪贴板内容，整条丢弃，
         // 否则旧内容会混进用户刚复制的新内容里。
@@ -636,6 +683,7 @@ impl WasmClipboard {
     fn request_next_format(&mut self) {
         if let Some(format) = self.remote_formats_to_read.pop() {
             self.pending_request = Some(format);
+            self.pending_since = Some(now_ms());
             self.proxy
                 .send_cliprdr_message(ClipboardMessage::SendInitiatePaste(format));
             return;
@@ -660,6 +708,31 @@ impl WasmClipboard {
             self.proxy
                 .send_cliprdr_message(ClipboardMessage::SendInitiatePaste(file_format));
         }
+    }
+
+    /// 驱动格式请求的超时。由会话主循环的 cleanup 定时器调用。
+    pub(crate) fn drive_timeouts(&mut self) {
+        self.drive_timeouts_at(now_ms());
+    }
+
+    fn drive_timeouts_at(&mut self, now: u64) {
+        let Some(since) = self.pending_since else {
+            return;
+        };
+        if now.saturating_sub(since) < REQUEST_TIMEOUT_MS {
+            return;
+        }
+
+        warn!(
+            format = ?self.pending_request,
+            "剪贴板格式请求超时，放弃并继续下一项"
+        );
+        self.pending_request = None;
+        self.pending_since = None;
+        self.pending_is_stale = false;
+        // 队列里还有就继续请求；已经读完（超时的就是最后一项）则收尾并触发
+        // 延迟的文件列表请求。
+        self.request_next_format();
     }
 
     /// Process backend event. This method should be called from the main event loop.
@@ -691,7 +764,7 @@ impl WasmClipboard {
             }
             WasmClipboardBackendMessage::RemoteClipboardChanged(formats) => {
                 match self.process_remote_clipboard_changed(formats) {
-                    Ok(Some(format)) => {
+                    Ok(RemoteClipboardUpdate::Request(format)) => {
                         // We start querying text/image formats right away. This is due to
                         // absence of delay-rendering in web client.
                         // If a file list format is also pending, it will be triggered after
@@ -699,7 +772,7 @@ impl WasmClipboard {
                         self.proxy
                             .send_cliprdr_message(ClipboardMessage::SendInitiatePaste(format));
                     }
-                    Ok(None) => {
+                    Ok(RemoteClipboardUpdate::Idle) => {
                         // No text/image formats to query. If a file list format was detected,
                         // trigger it immediately since there's no text/image fetch chain to
                         // wait for.
@@ -707,6 +780,11 @@ impl WasmClipboard {
                             self.proxy
                                 .send_cliprdr_message(ClipboardMessage::SendInitiatePaste(file_format));
                         }
+                    }
+                    Ok(RemoteClipboardUpdate::Waiting) => {
+                        // 上一份列表的请求还在飞。它回来时会被整条丢弃，再按这份
+                        // 新列表继续；文件列表也要等到那时才发，否则两条请求
+                        // 同时在飞，响应就配不上号了。
                     }
                     Err(e) => {
                         error!(error = format!("{e:#}"), "Failed to process remote clipboard change");
@@ -1065,15 +1143,8 @@ impl CliprdrBackend for WasmClipboardBackend {
     }
 
     fn now_ms(&self) -> u64 {
-        // Prefer Performance.now() for a monotonic clock that won't jump
-        // backwards on NTP adjustments. Fall back to Date.now() if the
-        // Performance API is unavailable (e.g. in non-browser WASM runtimes).
-        #[expect(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::as_conversions)]
-        {
-            web_sys::window()
-                .and_then(|w| w.performance())
-                .map_or_else(|| js_sys::Date::now() as u64, |p| p.now() as u64)
-        }
+        // 统一走模块级的单调时钟，锁超时与格式请求超时用同一个时间源。
+        now_ms()
     }
 
     fn elapsed_ms(&self, since: u64) -> u64 {
@@ -1740,7 +1811,7 @@ mod tests {
         let result = clipboard.process_remote_clipboard_changed(formats).unwrap();
 
         // Should return CF_UNICODETEXT as the format to fetch
-        assert_eq!(result, Some(ClipboardFormatId::CF_UNICODETEXT));
+        assert_eq!(result, RemoteClipboardUpdate::Request(ClipboardFormatId::CF_UNICODETEXT));
         // File format should NOT be in remote_formats_to_read
         assert!(
             !clipboard
@@ -1768,11 +1839,15 @@ mod tests {
         ];
 
         let first = clipboard.process_remote_clipboard_changed(formats.clone()).unwrap();
-        assert_eq!(first, Some(FORMAT_WIN_HTML_ID), "先请求队尾的 HTML Format");
+        assert_eq!(
+            first,
+            RemoteClipboardUpdate::Request(FORMAT_WIN_HTML_ID),
+            "先请求队尾的 HTML Format"
+        );
         assert_eq!(clipboard.pending_request, Some(FORMAT_WIN_HTML_ID));
 
         let second = clipboard.process_remote_clipboard_changed(formats).unwrap();
-        assert_eq!(second, None, "已有请求在飞时不能再发");
+        assert_eq!(second, RemoteClipboardUpdate::Waiting, "已有请求在飞时不能再发");
         assert!(clipboard.pending_is_stale, "在飞的请求应被标记作废");
 
         // 迟到的 CF_HTML 响应必须整条丢弃，不能落到 CF_UNICODETEXT 上。
@@ -1806,7 +1881,11 @@ StartFragment:0000000149\r\nEndFragment:0000000194\r\n\
 
         let result = clipboard.process_remote_clipboard_changed(formats).unwrap();
 
-        assert_eq!(result, None, "No text/image formats should be returned");
+        assert_eq!(
+            result,
+            RemoteClipboardUpdate::Idle,
+            "No text/image formats should be returned"
+        );
         assert_eq!(clipboard.pending_file_list_paste, Some(ClipboardFormatId::new(0xC080)));
     }
 
@@ -1899,5 +1978,103 @@ StartFragment:0000000149\r\nEndFragment:0000000194\r\n\
             clipboard.pending_file_list_paste, None,
             "New FormatList without files should clear pending file paste"
         );
+    }
+
+    #[test]
+    fn test_stale_request_defers_file_paste_from_new_list() {
+        // 第一份列表只有文本，请求还在飞时远端又发来「文本 + 文件」。
+        // 旧实现把「有请求在飞」也返回成 None，调用方立刻发了文件列表请求，
+        // 于是两个 FormatDataRequest 同时在飞，响应开始错配。
+        let (proxy, mut rx) = create_test_proxy();
+        let mut clipboard = WasmClipboard::new(proxy, create_test_callbacks());
+
+        clipboard
+            .process_event(WasmClipboardBackendMessage::RemoteClipboardChanged(vec![
+                ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+            ]))
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInputEvent::Cliprdr(ClipboardMessage::SendInitiatePaste(f)))
+                if f == ClipboardFormatId::CF_UNICODETEXT
+        ));
+
+        // 新列表带文件格式：旧请求没回来之前，一条请求都不能再发。
+        clipboard
+            .process_event(WasmClipboardBackendMessage::RemoteClipboardChanged(vec![
+                ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+                file_list_format(0xC080),
+            ]))
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "有请求在飞时不能发文件列表请求");
+        assert_eq!(
+            clipboard.pending_file_list_paste,
+            Some(ClipboardFormatId::new(0xC080))
+        );
+
+        // 旧响应回来被丢弃，随后按新列表请求文本。
+        clipboard
+            .process_event(WasmClipboardBackendMessage::RemoteDataResponse(
+                FormatDataResponse::new_data(b"old".to_vec()).into_owned(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInputEvent::Cliprdr(ClipboardMessage::SendInitiatePaste(f)))
+                if f == ClipboardFormatId::CF_UNICODETEXT
+        ));
+
+        // 文本读完后才轮到文件列表。
+        clipboard
+            .process_event(WasmClipboardBackendMessage::RemoteDataResponse(
+                FormatDataResponse::new_data(vec![0x68, 0x00, 0x69, 0x00, 0x00, 0x00]).into_owned(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInputEvent::Cliprdr(ClipboardMessage::SendInitiatePaste(f)))
+                if f == ClipboardFormatId::new(0xC080)
+        ));
+    }
+
+    #[test]
+    fn test_format_request_timeout_moves_on() {
+        // 响应永远不来时不能一直卡着：超时后放弃在飞请求，按当前列表继续。
+        let (proxy, mut rx) = create_test_proxy();
+        let mut clipboard = WasmClipboard::new(proxy, create_test_callbacks());
+
+        clipboard
+            .process_event(WasmClipboardBackendMessage::RemoteClipboardChanged(vec![
+                ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+                ClipboardFormat::new(FORMAT_WIN_HTML_ID)
+                    .with_name(ClipboardFormatName::new_static(FORMAT_WIN_HTML_NAME)),
+            ]))
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInputEvent::Cliprdr(ClipboardMessage::SendInitiatePaste(f)))
+                if f == FORMAT_WIN_HTML_ID
+        ));
+
+        let since = clipboard.pending_since.expect("发出请求后应记录时间");
+        clipboard.drive_timeouts_at(since + REQUEST_TIMEOUT_MS - 1);
+        assert_eq!(
+            clipboard.pending_request,
+            Some(FORMAT_WIN_HTML_ID),
+            "未到超时不应放弃"
+        );
+        assert!(rx.try_recv().is_err());
+
+        clipboard.drive_timeouts_at(since + REQUEST_TIMEOUT_MS);
+        assert_eq!(
+            clipboard.pending_request,
+            Some(ClipboardFormatId::CF_UNICODETEXT),
+            "超时后应继续请求队列里的下一项"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInputEvent::Cliprdr(ClipboardMessage::SendInitiatePaste(f)))
+                if f == ClipboardFormatId::CF_UNICODETEXT
+        ));
     }
 }

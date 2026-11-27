@@ -85,10 +85,14 @@ func (l *Limits) acquire(hostID int64) error {
 	return nil
 }
 
-// release 归还名额。重复调用会让计数变负，所以调用方必须保证成对。
+// release 归还名额。调用方必须成对，这里仍做一次兜底：计数一旦变负，
+// acquire 的 total >= max 会永远不成立，等于限额彻底失效。
 func (l *Limits) release(hostID int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.total <= 0 || l.hosts[hostID] <= 0 {
+		return
+	}
 	l.total--
 	if n := l.hosts[hostID] - 1; n > 0 {
 		l.hosts[hostID] = n

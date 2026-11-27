@@ -56,6 +56,10 @@ check('CursorImage', decodeHostMsg(hex('820a8282020785010100004401020304')), {
   rgba: hex('01020304'),
 })
 check('Mic(Ready)', decodeHostMsg(hex('820c8102')), { type: 'other', variant: 12 })
+// 长度字段比实际字节多：必须在读串时就报错。早先 subarray 静默截短，
+// pos 越过末尾，错误要等到下一步才以「数据不够」的形式出现。
+// decodeHostMsg 把解析异常统一吃掉返回 null，所以这里断言整条消息被拒。
+check('CBOR 字节串越界被拒', decodeHostMsg(hex('820a82820207850101000043aabb')), null)
 
 // HostHello：hostname, os, version, displays[], current, codecs[], platform, touch, actions[], shown[], streams
 const hw = new CborWriter()

@@ -1,4 +1,4 @@
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicU16, Ordering};
@@ -518,7 +518,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         spawn_local(writer_task(writer_rx, rdp_writer, outbound_message_size_limit));
 
         Ok(Session {
-            desktop_size: connection_result.desktop_size,
+            desktop_size: Cell::new(connection_result.desktop_size),
             input_database: RefCell::new(ironrdp::input::Database::new()),
             writer_tx,
             input_events_tx,
@@ -567,7 +567,8 @@ impl iron_remote_desktop::SessionTerminationInfo for SessionTerminationInfo {
 }
 
 pub(crate) struct Session {
-    desktop_size: connector::DesktopSize,
+    /// 远端当前的分辨率。会随 Deactivate-Reactivate 序列变化，所以用 Cell。
+    desktop_size: Cell<connector::DesktopSize>,
     input_database: RefCell<ironrdp::input::Database>,
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     input_events_tx: mpsc::UnboundedSender<RdpInputEvent>,
@@ -896,6 +897,13 @@ impl iron_remote_desktop::Session for Session {
                     }
                 }
                 _ = cleanup_interval.next() => {
+                    // 剪贴板：锁超时与格式请求超时都在这里驱动。
+                    // 格式请求丢了响应会卡住「同一时刻只有一个请求」的不变量，
+                    // 不主动放弃的话剪贴板到重连前都不会再同步。
+                    if let Some(clipboard) = clipboard.as_mut() {
+                        clipboard.drive_timeouts();
+                    }
+
                     // Drive clipboard lock timeout cleanup
                     if let Some(cliprdr) = active_stage.get_svc_processor_mut::<CliprdrClient>() {
                         match cliprdr.drive_timeouts() {
@@ -1068,6 +1076,15 @@ impl iron_remote_desktop::Session for Session {
                             {
                                 debug!("Deactivation-Reactivation Sequence completed");
                                 image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
+                                // 远端改了分辨率（用户在 Windows 里调显示设置、或从
+                                // 竖屏切横屏）：画布与记录尺寸都要跟上，否则新画面被
+                                // 旧画布裁掉，desktop_size() 也还报旧值。
+                                let width = NonZeroU32::new(u32::from(desktop_size.width))
+                                    .context("desktop width is zero")?;
+                                let height = NonZeroU32::new(u32::from(desktop_size.height))
+                                    .context("desktop height is zero")?;
+                                gui.resize(width, height);
+                                self.desktop_size.set(desktop_size);
                                 // Create a new [`FastPathProcessor`] with potentially updated
                                 // io/user channel ids.
                                 active_stage.set_fastpath_processor(
@@ -1117,9 +1134,10 @@ impl iron_remote_desktop::Session for Session {
     }
 
     fn desktop_size(&self) -> DesktopSize {
+        let size = self.desktop_size.get();
         DesktopSize {
-            width: self.desktop_size.width,
-            height: self.desktop_size.height,
+            width: size.width,
+            height: size.height,
         }
     }
 
@@ -1237,7 +1255,17 @@ impl iron_remote_desktop::Session for Session {
                 let is_error = get_bool(&obj, "is_error")?;
                 let data_val = js_sys::Reflect::get(&obj, &JsValue::from_str("data"))
                     .map_err(|e| IronError::from(anyhow::anyhow!("get property `data`: {e:?}")))?;
-                let data = js_sys::Uint8Array::new(&data_val).to_vec();
+                // Uint8Array::new 对普通对象会静默返回长度 0 的数组，粘贴文件时就
+                // 变成「成功传了 0 字节」。先确认类型，再取内容。
+                let data = if data_val.is_instance_of::<js_sys::Uint8Array>()
+                    || data_val.is_instance_of::<js_sys::ArrayBuffer>()
+                {
+                    js_sys::Uint8Array::new(&data_val).to_vec()
+                } else {
+                    return Err(IronError::from(anyhow::anyhow!(
+                        "submit_file_contents: data 必须是 Uint8Array 或 ArrayBuffer"
+                    )));
+                };
 
                 self.input_events_tx
                     .unbounded_send(RdpInputEvent::ClipboardBackend(
