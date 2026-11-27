@@ -86,6 +86,8 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
     worker = null
     ws.onclose = null
     ws.onmessage = null
+    ws.onerror = null
+    ws.onopen = null
     if (!silent && ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(JSON.stringify({ type: 'disconnect' }))

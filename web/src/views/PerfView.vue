@@ -1280,6 +1280,7 @@ async function reconnect() {
   frameSize.h = 0
   encoderName.value = ''
   hostHostname.value = ''
+  Object.assign(stats, { fps: 0, kbps: 0, bytes: 0, dropped: 0, dropRate: 0, rtt: 0, errors: 0 })
   state.value = 'connecting'
   try {
     const t = await post<{ session_id: number; ws_path: string }>('/perf/ticket', { host_id: cur.hostId })
