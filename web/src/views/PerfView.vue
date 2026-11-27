@@ -16,6 +16,12 @@
       ></canvas>
 
       <!--
+        触屏的「指针」模式没有系统光标，用这张图画出手指操纵的虚拟指针。
+        位置由 touch 手势层维护，坐标是 CSS 像素（相对画布左上角）。
+      -->
+      <img v-if="showVirtualCursor" ref="cursorEl" class="vcur" :src="DEFAULT_CURSOR_SVG" alt="" />
+
+      <!--
         输入代理：画面本身收不到输入法组字，所以用这个不可见的 textarea 接住。
         可打印字符不拦默认行为，交给它；上屏的文本再作为 ControllerMsg 的 Text 发出。
       -->
@@ -118,7 +124,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { perfSession, closePerf } from '../perf'
 import { connectPerf } from '../perf/client'
@@ -143,6 +149,15 @@ const encoderName = ref('')
 const frameSize = reactive({ w: 0, h: 0 })
 const stats = reactive<PerfStats>({ fps: 0, kbps: 0, bytes: 0, dropped: 0, rtt: 0, errors: 0 })
 const cursorStyle = ref<'default' | 'none'>('default')
+
+// 触屏没有系统光标，虚拟指针用普通模式同款箭头（网关不下发 CursorImage）。
+const DEFAULT_CURSOR_SVG = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="19" viewBox="0 0 12 19">'
+  + '<path d="M1 1v15.2l3.7-3.6 2.4 4.8 2.3-1.1-2.3-4.7h5.4z"'
+  + ' fill="#fff" stroke="#000" stroke-width="1" stroke-linejoin="round"/></svg>',
+)
+const cursorEl = ref<HTMLImageElement | null>(null)
+const touchDevice = window.matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0
 
 // 面板里的两项选择都记住。RDP 模式用的是另一套 localStorage 键，互不干扰。
 type KeyMode = 'text' | 'physical'
@@ -310,7 +325,7 @@ function onDocDown(e: PointerEvent) {
   closeMenu()
 }
 
-function onWindowResize() { measurePage() }
+function onWindowResize() { measurePage(); nextTick(drawVirtualCursor) }
 
 function setKeyMode(mode: KeyMode) {
   if (keyMode.value === mode) return
@@ -326,6 +341,7 @@ function setInputMode(mode: InputMode) {
   if (inputMode.value === mode) return
   if (mode === 'touch' && !hostTouch.value) return
   releaseTouches()
+  releaseGesture()
   releaseAll()
   inputMode.value = mode
   try { localStorage.setItem('deskgw.perfInputMode', mode) } catch { /* 忽略 */ }
@@ -350,6 +366,9 @@ let raf = 0
 // 被控端对光标的三种说法（协议 CursorVisibility）：0 隐藏（游戏里转视角）、
 // 1 显示且由控制端画、2 已经画在画面里。只有 0 才发相对移动，2 照常发绝对坐标。
 let cursorMode: 0 | 1 | 2 = 1
+const showVirtualCursor = computed(() =>
+  touchDevice && inputMode.value === 'pointer' && cursorMode !== 0 && hasFrame.value,
+)
 
 function flushInput() {
   raf = 0
@@ -407,9 +426,183 @@ function releaseTouches(phase: 'up' | 'cancel' = 'cancel') {
   touches.clear()
 }
 
+// ---- 触屏「指针」模式：手指当触控板 ---------------------------------------
+// 与普通模式同一套手感：相对位移 + 自绘光标 + 单击/双击拖拽/长按右键/双指滚动。
+// 只在触屏的 pointer 模式生效；鼠标和原生 Touch 模式仍走各自的分支。
+const POINTER_GAIN = 1.5      // 手指移动 1 CSS 像素带动指针移动多少 CSS 像素
+const TAP_SLOP = 10           // 超过这个位移就不算点击
+const LONG_PRESS_MS = 520     // 长按算右键
+const DOUBLE_TAP_MS = 320     // 两次按下间隔小于这个值算双击
+const DOUBLE_CLICK_WINDOW = 560
+
+const vpointer = { x: 0.5, y: 0.5 } // 虚拟指针位置，归一化 0..1
+const fingerPts = new Map<number, { x: number; y: number }>() // 触屏 pointerId → CSS 坐标
+type TouchGesture = {
+  id: number
+  startX: number
+  startY: number
+  lastX: number
+  lastY: number
+  downAt: number
+  moved: boolean
+  holding: boolean
+  second: boolean
+  rightFired: boolean
+  longTimer: number
+  holdTimer: number
+}
+let gesture: TouchGesture | null = null
+let scrolling = false
+let scrollAccum = 0
+let scrollLastY = 0
+let lastTapAt = 0
+let lastDownAt = 0
+
+function drawVirtualCursor() {
+  const el = cursorEl.value
+  const c = canvas.value
+  const stageEl = stage.value
+  if (!el || !c || !stageEl) return
+  const r = c.getBoundingClientRect()
+  const sr = stageEl.getBoundingClientRect()
+  if (!r.width || !r.height) return
+  el.style.transform = 'translate3d('
+    + Math.round(r.left - sr.left + vpointer.x * r.width) + 'px,'
+    + Math.round(r.top - sr.top + vpointer.y * r.height) + 'px,0)'
+}
+
+/** 手指位移换成归一化增量，保留小数，慢速拖动不会被取整吃掉。 */
+function moveVirtualBy(dx: number, dy: number) {
+  const r = canvas.value?.getBoundingClientRect()
+  if (!r?.width || !r.height) return
+  if (cursorMode === 0) {
+    // 游戏里被控端藏了光标，跟鼠标路径一样改发相对位移。
+    const mx = Math.round(dx * POINTER_GAIN)
+    const my = Math.round(dy * POINTER_GAIN)
+    if (mx || my) push({ kind: 'delta', dx: mx, dy: my })
+    return
+  }
+  vpointer.x = Math.max(0, Math.min(1, vpointer.x + (dx * POINTER_GAIN) / r.width))
+  vpointer.y = Math.max(0, Math.min(1, vpointer.y + (dy * POINTER_GAIN) / r.height))
+  pushMove({ kind: 'move', x: vpointer.x, y: vpointer.y })
+  requestAnimationFrame(drawVirtualCursor)
+}
+
+function syncVirtualPointer() {
+  // 触控板模式下手指位置与指针位置无关，按键前必须把虚拟指针同步过去。
+  // 游戏里被控端藏了光标，没有绝对坐标可同步，这里跳过。
+  if (cursorMode !== 0) pushMove({ kind: 'move', x: vpointer.x, y: vpointer.y })
+}
+
+function clickAtPointer(button: number) {
+  syncVirtualPointer()
+  push({ kind: 'button', button, down: true })
+  push({ kind: 'button', button, down: false })
+}
+
+function startHold(g: TouchGesture) {
+  if (g.holding) return
+  g.holding = true
+  syncVirtualPointer()
+  push({ kind: 'button', button: 0, down: true })
+}
+
+function releaseHold(g: TouchGesture) {
+  if (!g.holding) return
+  g.holding = false
+  push({ kind: 'button', button: 0, down: false })
+}
+
+function clearGestureTimers(g: TouchGesture) {
+  if (g.longTimer) window.clearTimeout(g.longTimer)
+  if (g.holdTimer) window.clearTimeout(g.holdTimer)
+  g.longTimer = 0
+  g.holdTimer = 0
+}
+
+// 第二根手指落下就进入滚动，同时取消单指手势，免得顺手点出一次左键。
+function beginScroll() {
+  if (gesture) {
+    clearGestureTimers(gesture)
+    releaseHold(gesture)
+    gesture = null
+  }
+  const pts = [...fingerPts.values()]
+  if (pts.length < 2) return
+  scrolling = true
+  scrollAccum = 0
+  scrollLastY = (pts[0].y + pts[1].y) / 2
+}
+
+function updateScroll() {
+  const pts = [...fingerPts.values()]
+  if (pts.length < 2) return
+  const y = (pts[0].y + pts[1].y) / 2
+  scrollAccum += y - scrollLastY
+  scrollLastY = y
+  if (Math.abs(scrollAccum) < 6) return
+  // 60 CSS 像素一格，折算成协议的滚轮单位（一格 120）。
+  const amount = Math.max(-2400, Math.min(2400, Math.round(-scrollAccum * 2)))
+  scrollAccum = 0
+  if (amount) push({ kind: 'wheel', dx: 0, dy: amount })
+}
+
+function isTouchPointer(ev: PointerEvent) {
+  return ev.pointerType === 'touch' && touchDevice && inputMode.value === 'pointer'
+}
+
+/** 切模式、失焦、断开时收干净：定时器、按住的左键、滚动状态。 */
+function releaseGesture() {
+  if (gesture) {
+    clearGestureTimers(gesture)
+    releaseHold(gesture)
+    gesture = null
+  }
+  scrolling = false
+  fingerPts.clear()
+  lastTapAt = 0
+  lastDownAt = 0
+}
+
+// 首帧、切模式、光标可见性变化都会让虚拟光标出现或消失，出现后立刻摆到位。
+watch(showVirtualCursor, (shown) => { if (shown) nextTick(drawVirtualCursor) })
+
 function onPointerDown(ev: PointerEvent) {
   if (pendingRemote) void writeLocalClipboard(pendingRemote)
   canvas.value?.setPointerCapture?.(ev.pointerId)
+  if (isTouchPointer(ev)) {
+    ev.preventDefault()
+    // 焦点给画布而不是隐藏输入框：手机别弹软键盘，桌面键盘照常由 window 接。
+    canvas.value?.focus({ preventScroll: true })
+    fingerPts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY })
+    if (fingerPts.size >= 2) { beginScroll(); return }
+    const now = Date.now()
+    const second = now - lastTapAt < DOUBLE_TAP_MS
+    const g: TouchGesture = {
+      id: ev.pointerId,
+      startX: ev.clientX, startY: ev.clientY,
+      lastX: ev.clientX, lastY: ev.clientY,
+      downAt: now,
+      moved: false, holding: false, second, rightFired: false,
+      longTimer: 0, holdTimer: 0,
+    }
+    gesture = g
+    if (second) {
+      // 双击后按住 = 拖拽；按下推迟到双击窗口之外，否则被远端合并成一次双击。
+      const delay = Math.max(90, DOUBLE_CLICK_WINDOW - (now - lastDownAt))
+      g.holdTimer = window.setTimeout(() => { if (gesture === g) startHold(g) }, delay)
+    } else {
+      lastDownAt = now
+      g.longTimer = window.setTimeout(() => {
+        if (gesture !== g || g.moved) return
+        g.rightFired = true
+        clickAtPointer(webButton[2])
+        navigator.vibrate?.(14)
+      }, LONG_PRESS_MS)
+    }
+    requestAnimationFrame(drawVirtualCursor)
+    return
+  }
   if (inputMode.value === 'touch') {
     const p = point(ev)
     if (p) {
@@ -436,6 +629,26 @@ function onPointerDown(ev: PointerEvent) {
 }
 
 function onPointerUp(ev: PointerEvent) {
+  if (isTouchPointer(ev)) {
+    fingerPts.delete(ev.pointerId)
+    if (scrolling) {
+      if (fingerPts.size < 2) scrolling = false
+      return
+    }
+    const g = gesture
+    if (!g || g.id !== ev.pointerId) return
+    clearGestureTimers(g)
+    gesture = null
+    const wasHolding = g.holding
+    releaseHold(g)
+    if (!g.moved && !g.rightFired && !wasHolding) {
+      clickAtPointer(0)
+      lastTapAt = Date.now()
+      lastDownAt = g.downAt
+    }
+    try { canvas.value?.releasePointerCapture?.(ev.pointerId) } catch { /* 没捕获过 */ }
+    return
+  }
   if (inputMode.value === 'touch') {
     const t = touches.get(ev.pointerId)
     if (t) {
@@ -454,6 +667,17 @@ function onPointerUp(ev: PointerEvent) {
 }
 
 function onPointerCancel(ev: PointerEvent) {
+  if (isTouchPointer(ev)) {
+    fingerPts.delete(ev.pointerId)
+    if (fingerPts.size < 2) scrolling = false
+    const g = gesture
+    if (g && g.id === ev.pointerId) {
+      clearGestureTimers(g)
+      releaseHold(g)
+      gesture = null
+    }
+    return
+  }
   const t = touches.get(ev.pointerId)
   if (!t) return
   push({ kind: 'touch', id: t.id, phase: 'cancel', x: t.x, y: t.y })
@@ -461,6 +685,33 @@ function onPointerCancel(ev: PointerEvent) {
 }
 
 function onPointerMove(ev: PointerEvent) {
+  if (isTouchPointer(ev)) {
+    const pt = fingerPts.get(ev.pointerId)
+    if (!pt) return
+    pt.x = ev.clientX
+    pt.y = ev.clientY
+    ev.preventDefault()
+    if (scrolling) { updateScroll(); return }
+    const g = gesture
+    if (!g || g.id !== ev.pointerId) return
+    const dx = ev.clientX - g.lastX
+    const dy = ev.clientY - g.lastY
+    g.lastX = ev.clientX
+    g.lastY = ev.clientY
+    if (!g.moved) {
+      if (Math.hypot(ev.clientX - g.startX, ev.clientY - g.startY) < TAP_SLOP) return
+      g.moved = true
+      // 移动了就不再是长按，右键计时作废。
+      if (g.longTimer) { window.clearTimeout(g.longTimer); g.longTimer = 0 }
+    }
+    moveVirtualBy(dx, dy)
+    // 双击的第二下划过抖动阈值后立刻按下，别等计时器，否则会拖错目标。
+    if (g.second && !g.holding) {
+      if (g.holdTimer) { window.clearTimeout(g.holdTimer); g.holdTimer = 0 }
+      startHold(g)
+    }
+    return
+  }
   if (inputMode.value === 'touch') {
     const t = touches.get(ev.pointerId)
     const p = point(ev)
@@ -655,12 +906,14 @@ function releaseAll() {
 function onBlur() {
   releaseAll()
   releaseTouches()
+  releaseGesture()
 }
 
 function onVisibility() {
   if (document.hidden) {
     releaseAll()
     releaseTouches()
+    releaseGesture()
   }
 }
 
@@ -703,6 +956,8 @@ function onEvent(ev: HostEvent) {
     // 被控端没声明 touch 时，面板里的「触摸」选项保持不可选。
     hostTouch.value = ev.touch
     if (inputMode.value === 'touch' && !ev.touch) {
+      releaseTouches()
+      releaseGesture()
       inputMode.value = 'pointer'
       try { localStorage.setItem('deskgw.perfInputMode', 'pointer') } catch { /* 忽略 */ }
     }
@@ -757,6 +1012,7 @@ function shutdown() {
   // 先把按下的键、触摸点松开再断，免得被控端留下按住的状态。
   releaseAll()
   releaseTouches()
+  releaseGesture()
   closeMenu()
   if (raf) {
     cancelAnimationFrame(raf)
@@ -886,8 +1142,22 @@ onBeforeUnmount(() => {
   outline: none;
   user-select: none;
   -webkit-user-select: none;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
 }
 .stage canvas.idle { opacity: 0; }
+
+/* 触屏指针模式的自绘光标；transform 由手势层按画布缩放比定位。 */
+.stage .vcur {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 12px;
+  height: 19px;
+  pointer-events: none;
+  z-index: 3;
+  will-change: transform;
+}
 
 /* 输入代理：看不见、点不到，只用来接输入法；候选框跟着它走。 */
 .stage .ime {
