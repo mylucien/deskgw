@@ -9,7 +9,7 @@
 
 import { importKeyBundle, openSealed, sealUnit, unitCounter, parseMediaHeader, avcCodecString } from '../src/perf/wire'
 import { CborWriter } from '../src/perf/cbor'
-import { decodeHostMsg, encodeAck, encodeClipboard, encodeInput, encodePing, encodeRequestKeyframe } from '../src/perf/messages'
+import { decodeHostMsg, encodeAck, encodeClipboard, encodeInput, encodePing, encodeReport, encodeRequestKeyframe, encodeSettings } from '../src/perf/messages'
 
 let failed = 0
 function check(name, got, want) {
@@ -50,7 +50,11 @@ check('Bye(Kicked)', decodeHostMsg(hex('82098100')), { type: 'bye', reason: 0 })
 check('Cursor(Hidden, None)', decodeHostMsg(hex('82078100')), { type: 'cursor', visibility: 0, slot: -1, generation: -1 })
 check('Cursor(Shown, ref 2/7)', decodeHostMsg(hex('82078201820207')), { type: 'cursor', visibility: 1, slot: 2, generation: 7 })
 check('Cursor(InFrame)', decodeHostMsg(hex('82078102')), { type: 'cursor', visibility: 2, slot: -1, generation: -1 })
-check('CursorImage', decodeHostMsg(hex('820a8282020785010100004401020304')), { type: 'other', variant: 10 })
+// CursorImage = [10, [[槽位,代际],[宽,高,热点x,热点y,rgba]]]，大块通道。
+check('CursorImage', decodeHostMsg(hex('820a8282020785010100004401020304')), {
+  type: 'cursorImage', slot: 2, generation: 7, width: 1, height: 1, hotX: 0, hotY: 0,
+  rgba: hex('01020304'),
+})
 check('Mic(Ready)', decodeHostMsg(hex('820c8102')), { type: 'other', variant: 12 })
 
 // HostHello：hostname, os, version, displays[], current, codecs[], platform, touch, actions[], shown[], streams
@@ -70,6 +74,14 @@ check('Hello 显示器', helloEv.displays, [{ index: 0, name: 'Dis', x: 1, y: 2,
 check('RequestKeyframe(5)', toHex(encodeRequestKeyframe(5)), '82048105')
 check('Ping(5)', toHex(encodePing(5)), '82008105')
 check('Ack(99,1000)', toHex(encodeAck(99, 1000)), '82018218631903e8')
+// Report 是控制端→被控端的数据报，500ms 一次，frames/stalled 是本周期个数。
+check('Report(60,2)', toHex(encodeReport(60, 2)), '82048182183c02')
+check('Report(60,2,stream2)', toHex(encodeReport(60, 2, 2)), '82048282183c0202')
+// Settings = [3,[[fps,码率,短边,自适应,codec,(draw_cursor)]]]，末项 false 时不写。
+check('Settings(default)', toHex(encodeSettings({ fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true, codec: 0 })),
+  '82038185181e190fa0190438f500')
+check('Settings(drawCursor)', toHex(encodeSettings({ fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true, codec: 0, drawCursor: true })),
+  '82038186181e190fa0190438f500f5')
 check('Input(ReleaseAll)', toHex(encodeInput(5, [{ kind: 'releaseAll' }])), '8201820581820680')
 // InputEvent::Text：变体 5，字段是单个字符串；被控端按 Unicode 注入，中文、emoji 都走这条。
 check('Input(Text 你好)', toHex(encodeInput(5, [{ kind: 'text', text: '你好' }])), '820182058182058166e4bda0e5a5bd')

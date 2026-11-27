@@ -265,8 +265,8 @@ WARN，属于正常收尾（我们主动取消流），不影响后续会话。
 | --- | --- |
 | `wire.ts` | 导入会话密钥、AES-GCM 密封/解封、媒体包头、SPS → `avc1.PPCCLL` |
 | `cbor.ts` | 用到的 CBOR 子集（整数、字节串、文本、数组、映射、f32） |
-| `messages.ts` | `HostMsg` 解析（含 `HostHello.touch`）；`RequestKeyframe`、`Ack`、`Ping`、`InputEvent::Touch` 的编码 |
-| `worker.ts` | 按流序号重组、控制通道顺序解密、WebCodecs 解码、Ack/Ping/关键帧请求 |
+| `messages.ts` | `HostMsg` 解析（含 `HostHello.touch`、`CursorImage`）；`Settings`、`Report`、`RequestKeyframe`、`Ack`、`Ping`、`InputEvent::Touch` 的编码 |
+| `worker.ts` | 按流序号重组、控制通道顺序解密、WebCodecs 解码、Ack/Ping/Report/关键帧请求 |
 | `client.ts` | WebSocket 与 Worker 之间的桥，密钥只在 `ready` 之后交给 Worker |
 
 要点：
@@ -278,18 +278,31 @@ WARN，属于正常收尾（我们主动取消流），不影响后续会话。
   按网关分配的流序号重组，密钥取 `keys.video[通道号 - 2]`。
 - 每收到一帧就发 `Ack`（`seq`、到达时刻、`stream`），每秒发一次 `Ping` 并
   重发最近的 `Ack`（数据报会丢）；缺帧或解码器报错时发 `RequestKeyframe`。
+- 每 500ms 发一次 `Report`（`ControllerDatagram` 变体 4，`[4,[[frames,stalled],(stream)]]`
+  ，stream=0 省略），`frames` 是本周期收齐的帧数，`stalled` 是其中等重传卡住的
+  （浏览器看不到 QUIC 重传，用「首包到收齐 ≥15ms」近似，与被控端 `STALL` 同阈值），
+  `frames=0` 不发。被控端拿它算丢包率调码率；重复/过期样本它自己会丢。
+- 画质用 `ControllerMsg::Settings`（变体 3）发，`[3,[[fps,码率kbps,短边,自适应,codec,(draw_cursor)]]]`，
+  末项是 false 时不写数组。连上后按面板档位发一次，切档再发；被控端没有专门的回执，
+  它收到后自己夹到合法范围（fps 1–120、码率 100–100000）。档位是
+  流畅（30/2000/720）、均衡（30/4000/1080，与默认一致）、清晰（60/8000/0=不限），
+  `adaptive=true` 固定开，codec 固定 H.264，记在 `deskgw.perfQuality`。
 - 画面在 Worker 里解成 `VideoFrame` 后转移给主线程，主线程画到 canvas 上并
   立即 `close()`；主线程不接触密钥。
 - 只解 H.264（Annex-B）。codec 字符串从关键帧里第一段 SPS 的前三个字节拼出来，
   H.265/AV1 只提示不支持。
-- `Cursor`（可见性，控制通道）已经处理；`CursorImage`（光标形状）与文件通道仍
-  按设计丢弃。可见性在协议里是三态，不能压成布尔：
+- 光标分两条消息：`Cursor`（可见性 + 当前形状引用，控制通道）与 `CursorImage`
+  （形状像素，大块通道）。可见性在协议里是三态，不能压成布尔：
   - `shown`（1）：被控端不画光标，用本地光标；
   - `inFrame`（2）：被控端已经把光标画进画面，藏掉本地光标，**但照常发绝对坐标**
     （协议明确如此，误当成"隐藏"会让指针不动）；
   - `hidden`（0）：藏掉本地光标，改发 `MouseDelta`。
-  代价是光标形状不同步：文本 I 型、调整大小、忙碌这些只从 `CursorImage` 来，
-  现在网关丢弃大块通道，本地只能显示一个箭头。
+- `CursorImage`（变体 10）走大块通道：`[10,[[槽位,代际],[宽,高,热点x,热点y,rgba]]]`，
+  `rgba` 是宽×高×4 字节的 RGBA8（非预乘），不是 PNG。浏览器把它转成 data URL，
+  按槽位（0–31）缓存，**只接受代际更大的**（图像常比 `Cursor` 的引用先到，乱序也靠这个挡）。
+  `Cursor` 里的 `{slot,generation}` 指定当前该显示哪个；`slot=-1` 表示没有形状，退回系统箭头。
+  形状像素按画布的显示缩放比缩放，热点同比折算；桌面与触屏的指针共用这套自绘 img
+  （触屏原先固定显示箭头，现在也用远端形状）。没有形状时桌面仍用系统默认箭头。
 - 键鼠走 `ControllerMsg::Input`（控制通道上密封）：鼠标是归一化坐标（0..1，相对
   第 0 路画面），按键与滚轮按浏览器事件翻译。一批事件攒一帧发出，`t` 与控制数据报
   的 `Ping` 用同一个时钟（被控端按到达间隔判断是否过时，两边的绝对时钟不用对齐）。
@@ -361,6 +374,9 @@ WARN，属于正常收尾（我们主动取消流），不影响后续会话。
 | 触屏指针手势 | 自绘箭头可见；单击发 `move+button0`，长按 520ms 在被控端弹出右键菜单（截图确认），双指滑动发 4 次 `wheel:50`，双击拖拽发出 `down→move→up` |
 | 物理键模式 | 记事本里打出 `PHYS-ABC`（全部走 `Key`）；同模式下 `中文不应上屏` 一个字都没进 |
 | 文本模式 | 切回后 `中文TEXT` 正常上屏（见截图 `keymode-text.png`） |
+| 画质档位 | 面板三档切换后发 `Settings`，黄金字节与 v0.4.0 的 `QualitySettings` 逐字节一致（离线） |
+| Report | 每 500ms 的数据报，`frames/stalled` 黄金字节对齐 v0.4.0（离线） |
+| 光标形状 | `CursorImage` 的 RGBA 解出、缓存与 `Cursor` 引用匹配（离线黄金字节） |
 
 离线核对（`.perf/tests/perf.test.mjs`）覆盖：Go 生成的密封单元能在浏览器侧解开、
 再封回去字节一致；`v10.rs` 的 CBOR 黄金字节；媒体包头与 SPS。测试入口：
@@ -377,7 +393,8 @@ node out.mjs
   收不到 `Text`，中文进不去（英文正常）。记事本、浏览器、Office 这些正常的编辑框没问题。
 - **文本模式下读扫描码的程序拿不到物理键**：可打印字符走 `Text`，游戏（WASD）这类程序
   需要在面板里切到「物理键」模式（已做，切换会记住）。
-- **光标形状不同步**：`CursorImage` 走大块通道，网关丢弃，本地只显示箭头。
+- **形状变化未逐帧核对**：`CursorImage` 的解析、缓存与引用匹配有离线黄金字节，
+  但不同程序的 I 型/忙碌形状在真机上的观感（尤其热点与缩放）还需要逐一看。
 - **剪贴板只传文本**：图片、文件不传（文件剪贴板不在范围内）。下行写本地剪贴板
   需要页面有焦点，没焦点时先攒着，下一次点击补写。
 - **粘贴靠被控端自己按 Ctrl+V**：浏览器把文本推过去，再补一对 `KeyV`。被控端

@@ -3,7 +3,7 @@
 // 票据只能用一次，wsPath 由后端签发；ready 里的密钥在内存里交给 Worker，
 // 主线程不保留。
 
-import type { HostEvent, InputEvent } from './messages'
+import type { HostEvent, InputEvent, QualitySettings } from './messages'
 
 export interface PerfReady {
   type: 'ready'
@@ -35,6 +35,8 @@ export interface PerfHandlers {
 export interface PerfConnection {
   /** 发一批输入事件；t 是这些事件在控制端时钟上的时刻（微秒）。 */
   sendInput(events: InputEvent[], t: number): void
+  /** 设置画质（帧率/码率/短边），连上后与切换档位时各发一次。 */
+  sendSettings(quality: QualitySettings): void
   /** 把一段文本推到被控端的剪贴板（大块通道）。 */
   sendClipboard(text: string): void
   close(): void
@@ -48,6 +50,8 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
   let worker: Worker | null = null
   let workerReady = false
   let closed = false
+  // ready 回调先于 Worker 启动，连上时的首次画质设置先攒着，Worker 就绪再发。
+  let pendingQuality: QualitySettings | null = null
   const backlog: ArrayBuffer[] = []
   let beat = 0
 
@@ -76,6 +80,10 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
       switch (m?.type) {
         case 'ready':
           workerReady = true
+          if (pendingQuality) {
+            worker.postMessage({ type: 'settings', quality: pendingQuality })
+            pendingQuality = null
+          }
           for (const buf of backlog.splice(0)) worker!.postMessage({ type: 'frame', data: buf }, [buf])
           break
         case 'uplink':
@@ -144,6 +152,10 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
     },
     sendInput(events: InputEvent[], t: number) {
       if (workerReady && worker) worker.postMessage({ type: 'input', events, t })
+    },
+    sendSettings(quality: QualitySettings) {
+      if (workerReady && worker) worker.postMessage({ type: 'settings', quality })
+      else pendingQuality = quality
     },
     close: shutdown,
   }

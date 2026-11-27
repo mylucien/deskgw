@@ -11,6 +11,8 @@
         @pointerup="onPointerUp"
         @pointercancel="onPointerCancel"
         @pointermove="onPointerMove"
+        @pointerenter="onPointerEnter"
+        @pointerleave="onPointerLeave"
         @wheel.prevent="onWheel"
         @contextmenu.prevent
       ></canvas>
@@ -19,7 +21,8 @@
         触屏的「指针」模式没有系统光标，用这张图画出手指操纵的虚拟指针。
         位置由 touch 手势层维护，坐标是 CSS 像素（相对画布左上角）。
       -->
-      <img v-if="showVirtualCursor" ref="cursorEl" class="vcur" :src="DEFAULT_CURSOR_SVG" alt="" />
+      <img v-if="showVirtualCursor" ref="cursorEl" class="vcur" :src="cursorSrc"
+        :style="{ visibility: cursorInside || touchDevice ? 'visible' : 'hidden' }" alt="" />
 
       <!--
         输入代理：画面本身收不到输入法组字，所以用这个不可见的 textarea 接住。
@@ -99,6 +102,13 @@
       </div>
 
       <template v-if="state === 'ready'">
+        <div class="p-div">画质</div>
+        <div class="seg seg3">
+          <button v-for="q in qualityPresets" :key="q.key" :class="{ on: quality === q.key }"
+            :title="q.tip" @click="setQuality(q.key)">{{ q.label }}</button>
+        </div>
+        <p class="p-note">{{ qualityNote }}</p>
+
         <div class="p-div">按键模式</div>
         <div class="seg">
           <button :class="{ on: keyMode === 'text' }" @click="setKeyMode('text')">文本</button>
@@ -129,7 +139,7 @@ import { useRouter } from 'vue-router'
 import { perfSession, closePerf } from '../perf'
 import { connectPerf } from '../perf/client'
 import type { PerfConnection, PerfReady, PerfStats } from '../perf/client'
-import type { HostEvent, InputEvent } from '../perf/messages'
+import type { HostEvent, InputEvent, QualitySettings } from '../perf/messages'
 
 type State = 'connecting' | 'ready' | 'error' | 'ended'
 
@@ -148,14 +158,29 @@ const banner = ref('')
 const encoderName = ref('')
 const frameSize = reactive({ w: 0, h: 0 })
 const stats = reactive<PerfStats>({ fps: 0, kbps: 0, bytes: 0, dropped: 0, rtt: 0, errors: 0 })
-const cursorStyle = ref<'default' | 'none'>('default')
-
-// 触屏没有系统光标，虚拟指针用普通模式同款箭头（网关不下发 CursorImage）。
+// 自绘光标的兜底图：还没收到被控端形状时用普通模式同款箭头。
 const DEFAULT_CURSOR_SVG = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="19" viewBox="0 0 12 19">'
   + '<path d="M1 1v15.2l3.7-3.6 2.4 4.8 2.3-1.1-2.3-4.7h5.4z"'
   + ' fill="#fff" stroke="#000" stroke-width="1" stroke-linejoin="round"/></svg>',
 )
+
+// 远端光标形状：槽位 → 形状。代际只增不减，乱序或复用旧槽位的图像直接丢。
+interface RemoteShape {
+  slot: number
+  generation: number
+  width: number
+  height: number
+  hotX: number
+  hotY: number
+  url: string
+}
+const shapeCache = new Map<number, RemoteShape>()
+let wantedSlot = -1
+let wantedGen = -1
+const activeShape = ref<RemoteShape | null>(null)
+const cursorSrc = computed(() => activeShape.value?.url || DEFAULT_CURSOR_SVG)
+
 const cursorEl = ref<HTMLImageElement | null>(null)
 const touchDevice = window.matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0
 
@@ -172,6 +197,39 @@ function saved<T extends string>(key: string, choices: readonly T[], fallback: T
 const keyMode = ref<KeyMode>(saved('deskgw.perfKeyMode', ['text', 'physical'] as const, 'text'))
 const inputMode = ref<InputMode>(saved('deskgw.perfInputMode', ['pointer', 'touch'] as const, 'pointer'))
 const hostTouch = ref(false)
+
+// 画质三档，数值与被控端 QualitySettings::default（30 帧 / 4000 kbps / 短边 1080）对齐。
+// 自适应一直开：网络差时被控端自己降码率，比我们在这里猜更准。
+type QualityKey = 'smooth' | 'balanced' | 'sharp'
+const qualityPresets: Array<{ key: QualityKey; label: string; tip: string; quality: QualitySettings }> = [
+  {
+    key: 'smooth', label: '流畅', tip: '弱网优先：30 帧 / 短边 720 / 2 Mbps',
+    quality: { fps: 30, bitrateKbps: 2000, maxShort: 720, adaptive: true, codec: 0 },
+  },
+  {
+    key: 'balanced', label: '均衡', tip: '默认：30 帧 / 短边 1080 / 4 Mbps',
+    quality: { fps: 30, bitrateKbps: 4000, maxShort: 1080, adaptive: true, codec: 0 },
+  },
+  {
+    key: 'sharp', label: '清晰', tip: '高带宽：60 帧 / 原分辨率 / 8 Mbps',
+    quality: { fps: 60, bitrateKbps: 8000, maxShort: 0, adaptive: true, codec: 0 },
+  },
+]
+const quality = ref<QualityKey>(saved('deskgw.perfQuality', ['smooth', 'balanced', 'sharp'] as const, 'balanced'))
+const qualityNote = computed(() => qualityPresets.find((p) => p.key === quality.value)?.tip || '')
+
+function setQuality(key: QualityKey) {
+  if (quality.value === key) return
+  quality.value = key
+  try { localStorage.setItem('deskgw.perfQuality', key) } catch { /* 隐私模式忽略 */ }
+  conn?.sendSettings(currentQuality())
+}
+
+function currentQuality(): QualitySettings {
+  const p = qualityPresets.find((x) => x.key === quality.value) || qualityPresets[1]
+  // 直接给预设对象，被控端 sanitized() 会夹到合法范围；不在这里复制免得漏字段。
+  return p.quality
+}
 const inputHint = computed(() =>
   inputMode.value === 'touch' ? '手指触摸画面操作被控端' :
     keyMode.value === 'physical' ? '点击画面后直接操作，按键按物理键发送' :
@@ -365,10 +423,53 @@ let pending: InputEvent[] = []
 let raf = 0
 // 被控端对光标的三种说法（协议 CursorVisibility）：0 隐藏（游戏里转视角）、
 // 1 显示且由控制端画、2 已经画在画面里。只有 0 才发相对移动，2 照常发绝对坐标。
-let cursorMode: 0 | 1 | 2 = 1
-const showVirtualCursor = computed(() =>
-  touchDevice && inputMode.value === 'pointer' && cursorMode !== 0 && hasFrame.value,
-)
+const cursorMode = ref<0 | 1 | 2>(1)
+// 自绘光标的兜底箭头：触屏没有系统光标；桌面收到远端形状时也自绘。
+// 桌面还没收到形状时用系统默认箭头（cursorStyle），不自绘。
+const showVirtualCursor = computed(() => hasFrame.value && cursorMode.value !== 0 && (
+  (touchDevice && inputMode.value === 'pointer') || activeShape.value !== null
+))
+const cursorStyle = computed(() => {
+  if (cursorMode.value !== 1) return 'none'
+  // 有远端形状时藏掉系统光标，由自绘 img 接管；否则退回系统箭头。
+  return activeShape.value ? 'none' : 'default'
+})
+
+// RGBA8（非预乘）转 PNG data URL，给自绘光标 img 用。
+function shapeToUrl(width: number, height: number, rgba: Uint8Array): string | null {
+  if (!width || !height || rgba.length !== width * height * 4) return null
+  const c = document.createElement('canvas')
+  c.width = width
+  c.height = height
+  const ctx = c.getContext('2d')
+  if (!ctx) return null
+  const img = ctx.createImageData(width, height)
+  img.data.set(rgba)
+  ctx.putImageData(img, 0, 0)
+  return c.toDataURL('image/png')
+}
+
+const cursorInside = ref(true)
+
+/** 当前自绘光标的落点（画布左上角为原点的 CSS 像素），形状晚到时按它立刻重绘。 */
+let cursorXY = { x: 0, y: 0 }
+function placeCursor(x: number, y: number) {
+  cursorXY = { x, y }
+  const el = cursorEl.value
+  if (!el) return
+  const s = activeShape.value
+  const c = canvas.value
+  // 形状像素是被控端屏幕上的，画布显示时可能缩放，光标同比例缩。
+  const rect = c?.getBoundingClientRect()
+  const scale = frameSize.w && rect?.width ? rect.width / frameSize.w : 1
+  const w = s ? Math.max(1, s.width * scale) : 12
+  const h = s ? Math.max(1, s.height * scale) : 19
+  const hotX = s ? s.hotX * scale : 1
+  const hotY = s ? s.hotY * scale : 1
+  el.style.width = `${w}px`
+  el.style.height = `${h}px`
+  el.style.transform = `translate3d(${Math.round(x - hotX)}px,${Math.round(y - hotY)}px,0)`
+}
 
 function flushInput() {
   raf = 0
@@ -459,23 +560,20 @@ let lastTapAt = 0
 let lastDownAt = 0
 
 function drawVirtualCursor() {
-  const el = cursorEl.value
   const c = canvas.value
   const stageEl = stage.value
-  if (!el || !c || !stageEl) return
+  if (!c || !stageEl) return
   const r = c.getBoundingClientRect()
   const sr = stageEl.getBoundingClientRect()
   if (!r.width || !r.height) return
-  el.style.transform = 'translate3d('
-    + Math.round(r.left - sr.left + vpointer.x * r.width) + 'px,'
-    + Math.round(r.top - sr.top + vpointer.y * r.height) + 'px,0)'
+  placeCursor(r.left - sr.left + vpointer.x * r.width, r.top - sr.top + vpointer.y * r.height)
 }
 
 /** 手指位移换成归一化增量，保留小数，慢速拖动不会被取整吃掉。 */
 function moveVirtualBy(dx: number, dy: number) {
   const r = canvas.value?.getBoundingClientRect()
   if (!r?.width || !r.height) return
-  if (cursorMode === 0) {
+  if (cursorMode.value === 0) {
     // 游戏里被控端藏了光标，跟鼠标路径一样改发相对位移。
     const mx = Math.round(dx * POINTER_GAIN)
     const my = Math.round(dy * POINTER_GAIN)
@@ -491,7 +589,7 @@ function moveVirtualBy(dx: number, dy: number) {
 function syncVirtualPointer() {
   // 触控板模式下手指位置与指针位置无关，按键前必须把虚拟指针同步过去。
   // 游戏里被控端藏了光标，没有绝对坐标可同步，这里跳过。
-  if (cursorMode !== 0) pushMove({ kind: 'move', x: vpointer.x, y: vpointer.y })
+  if (cursorMode.value !== 0) pushMove({ kind: 'move', x: vpointer.x, y: vpointer.y })
 }
 
 function clickAtPointer(button: number) {
@@ -620,7 +718,7 @@ function onPointerDown(ev: PointerEvent) {
   if (keyMode.value === 'text' && ev.pointerType !== 'touch') focusIme(ev)
   else canvas.value?.focus({ preventScroll: true })
   const p = point(ev)
-  if (p && cursorMode !== 0) pushMove({ kind: 'move', x: p.x, y: p.y })
+  if (p && cursorMode.value !== 0) pushMove({ kind: 'move', x: p.x, y: p.y })
   const b = webButton[ev.button]
   if (b !== undefined) {
     push({ kind: 'button', button: b, down: true })
@@ -722,7 +820,7 @@ function onPointerMove(ev: PointerEvent) {
     ev.preventDefault()
     return
   }
-  if (cursorMode === 0) {
+  if (cursorMode.value === 0) {
     // 被控端把光标藏起来了（游戏里转视角）：改发相对移动。
     const dx = Math.round(ev.movementX)
     const dy = Math.round(ev.movementY)
@@ -731,6 +829,24 @@ function onPointerMove(ev: PointerEvent) {
   }
   const p = point(ev)
   if (p) pushMove({ kind: 'move', x: p.x, y: p.y })
+  // 桌面收到远端形状后自绘光标，跟着系统指针走（触屏的虚拟指针走 drawVirtualCursor）。
+  if (!touchDevice && activeShape.value) {
+    const sr = stage.value?.getBoundingClientRect()
+    if (    sr) requestAnimationFrame(() => placeCursor(ev.clientX - sr.left, ev.clientY - sr.top))
+  }
+}
+
+function onPointerEnter(ev: PointerEvent) {
+  cursorInside.value = true
+  if (activeShape.value && !touchDevice) {
+    const sr = stage.value?.getBoundingClientRect()
+    if (sr) placeCursor(ev.clientX - sr.left, ev.clientY - sr.top)
+  }
+}
+
+function onPointerLeave() {
+  // 离开画布时收起自绘光标，让系统箭头接管（触屏没有系统光标，不用管）。
+  cursorInside.value = false
 }
 
 /** 一格滚轮是 120：像素模式按 100px 一格折算，行、页按浏览器给的倍数。 */
@@ -951,6 +1067,27 @@ function onVideo(frame: VideoFrame) {
   hasFrame.value = true
 }
 
+/**
+ * 收到一个光标形状：先按槽位缓存，代际大的才覆盖（图像可能比 Cursor 引用先到）。
+ * 只有当前引用的槽位+代际都对上，才立刻切换显示。
+ */
+function onCursorImage(ev: Extract<HostEvent, { type: 'cursorImage' }>) {
+  if (ev.slot < 0 || ev.generation < 0 || ev.slot >= 32) return
+  const prev = shapeCache.get(ev.slot)
+  if (prev && prev.generation >= ev.generation) return
+  const url = shapeToUrl(ev.width, ev.height, ev.rgba)
+  if (!url) return
+  const shape: RemoteShape = {
+    slot: ev.slot, generation: ev.generation, width: ev.width, height: ev.height,
+    hotX: ev.hotX, hotY: ev.hotY, url,
+  }
+  shapeCache.set(ev.slot, shape)
+  if (ev.slot === wantedSlot && ev.generation === wantedGen) {
+    activeShape.value = shape
+    nextTick(() => placeCursor(cursorXY.x, cursorXY.y))
+  }
+}
+
 function onEvent(ev: HostEvent) {
   if (ev.type === 'hello') {
     // 被控端没声明 touch 时，面板里的「触摸」选项保持不可选。
@@ -967,8 +1104,19 @@ function onEvent(ev: HostEvent) {
     // 1 = 显示着，用本地光标；2 = 被控端已经把光标画进画面，藏本地光标；
     // 0 = 隐藏，藏本地光标并改发相对移动。
     const v = ev.visibility
-    cursorMode = v === 1 ? 1 : v === 2 ? 2 : 0
-    cursorStyle.value = cursorMode === 1 ? 'default' : 'none'
+    cursorMode.value = v === 1 ? 1 : v === 2 ? 2 : 0
+    // Cursor 带的形状引用才是当前该用哪个；-1 表示没有形状，退回系统箭头。
+    wantedSlot = ev.slot
+    wantedGen = ev.generation
+    const hit = wantedSlot >= 0 ? shapeCache.get(wantedSlot) : null
+    const next = hit && hit.generation === wantedGen ? hit : null
+    if (next !== activeShape.value) {
+      activeShape.value = next
+      // 形状刚到时可能还没走过 pointermove，按上一次落点补绘一次。
+      nextTick(() => placeCursor(cursorXY.x, cursorXY.y))
+    }
+  } else if (ev.type === 'cursorImage') {
+    onCursorImage(ev)
   } else if (ev.type === 'clipboard') {
     onRemoteClipboard(ev.text)
   } else if (ev.type === 'notice') {
@@ -985,6 +1133,8 @@ function connect() {
     onReady: (r) => {
       ready.value = r
       state.value = 'ready'
+      // 握手用的是被控端默认画质；连上后按界面选的档位补发一次（client 会在 Worker 就绪后发）。
+      conn?.sendSettings(currentQuality())
       if (inputMode.value === 'pointer' && keyMode.value === 'text') nextTick(() => focusIme())
     },
     onEvent,
@@ -1021,6 +1171,13 @@ function shutdown() {
   conn?.close()
   conn = null
   pending = []
+  // 槽位与代际只在本次会话有效，重连时不能拿旧形状去套新引用。
+  shapeCache.clear()
+  activeShape.value = null
+  wantedSlot = -1
+  wantedGen = -1
+  cursorMode.value = 1
+  cursorInside.value = true
 }
 
 function hangup() {

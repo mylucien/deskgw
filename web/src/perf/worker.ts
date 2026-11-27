@@ -6,8 +6,8 @@
 
 import { avcCodecString, importKeyBundle, openSealed, parseMediaHeader, sealUnit } from './wire'
 import type { SessionKeys } from './wire'
-import { decodeHostDatagram, decodeHostMsg, encodeAck, encodeClipboard, encodeEcho, encodeInput, encodePing, encodeRequestKeyframe } from './messages'
-import type { InputEvent } from './messages'
+import { decodeHostDatagram, decodeHostMsg, encodeAck, encodeClipboard, encodeEcho, encodeInput, encodePing, encodeReport, encodeRequestKeyframe, encodeSettings } from './messages'
+import type { InputEvent, QualitySettings } from './messages'
 
 const VD = (self as any).VideoDecoder
 const post = (msg: any, transfer?: Transferable[]) => (self as any).postMessage(msg, transfer || [])
@@ -21,6 +21,7 @@ let bulkSeq = -1
 let bulkChain: Promise<void> = Promise.resolve()
 let upChain: Promise<void> = Promise.resolve()
 let pingTimer: number | undefined
+let reportTimer: number | undefined
 let stopped = false
 
 // 下行流的组装：每帧画面一条流（seq 由网关分配），控制通道固定 seq 0 常驻。
@@ -54,6 +55,13 @@ const decoders = new Map<number, DecoderState>()
 const stats = { frames: 0, bytes: 0, dropped: 0, decodeErrors: 0, rtt: 0 }
 let lastAck = new Map<number, { seq: number; arrived: number }>()
 
+// 每 500ms 向被控端报一次各路画面的收帧情况，驱动它调码率。上游 pack 之间
+// 隔 15ms 且有更晚的包越过就算「卡住」（等重传）；浏览器侧看不到 QUIC 重传，
+// 用「一帧从首包到收齐超过 15ms」近似，指标只作提示，不影响解码。
+const REPORT_EVERY_MS = 500
+const STALL_US = 15_000
+const reportStats = new Map<number, { frames: number; stalled: number }>()
+
 const nowUs = () => Math.round(performance.now() * 1000)
 
 function concat(parts: Uint8Array[], total = 0): Uint8Array {
@@ -73,6 +81,7 @@ self.onmessage = (ev: MessageEvent) => {
   if (m.type === 'start') void start(m.keys)
   else if (m.type === 'frame') onBinary(new Uint8Array(m.data as ArrayBuffer))
   else if (m.type === 'input') sendControl(encodeInput(m.t, m.events as InputEvent[]))
+  else if (m.type === 'settings') sendControl(encodeSettings(m.quality as QualitySettings))
   else if (m.type === 'clipboard') sendBulk(encodeClipboard(String(m.text || '')))
   else if (m.type === 'stop') stop()
 }
@@ -87,11 +96,13 @@ async function start(bundle: any) {
   post({ type: 'ready' })
   lastStats = { frames: 0, bytes: 0, at: performance.now() }
   pingTimer = (self as any).setInterval(tick, 1000)
+  reportTimer = (self as any).setInterval(reportTick, REPORT_EVERY_MS)
 }
 
 function stop() {
   stopped = true
   if (pingTimer !== undefined) (self as any).clearInterval(pingTimer)
+  if (reportTimer !== undefined) (self as any).clearInterval(reportTimer)
   for (const st of decoders.values()) {
     try {
       st.decoder?.close()
@@ -181,7 +192,16 @@ function onDownStream(u8: Uint8Array) {
   if (whole.length < 4) return
   const n = new DataView(whole.buffer, whole.byteOffset, 4).getUint32(0, true)
   if (4 + n > whole.length) return
-  void handleVideo(lane - 2, whole.subarray(4, 4 + n), buf.arrived)
+  const stream = lane - 2
+  // 收齐一帧就记一次；首包到收齐超过 15ms 算卡住（近似等重传）。
+  let r = reportStats.get(stream)
+  if (!r) {
+    r = { frames: 0, stalled: 0 }
+    reportStats.set(stream, r)
+  }
+  r.frames++
+  if (nowUs() - buf.arrived >= STALL_US) r.stalled++
+  void handleVideo(stream, whole.subarray(4, 4 + n), buf.arrived)
 }
 
 function dropStaleStreams() {
@@ -202,7 +222,8 @@ async function handleBulk(unit: Uint8Array) {
     return
   }
   const ev = decodeHostMsg(plain)
-  if (ev && ev.type === 'clipboard') post({ type: 'event', event: ev })
+  // 大块通道上目前有剪贴板与光标形状两种消息，都交给主线程。
+  if (ev && (ev.type === 'clipboard' || ev.type === 'cursorImage')) post({ type: 'event', event: ev })
 }
 
 async function handleControl(unit: Uint8Array) {
@@ -459,6 +480,15 @@ function askKeyframe(force = false) {
 }
 
 // ---- 心跳与统计 -----------------------------------------------------------
+
+/** 每 500ms 报一次各路画面的收帧情况；这一周期没画面就不报（上游的规则）。 */
+function reportTick() {
+  if (!keys || stopped) return
+  for (const [stream, r] of reportStats) {
+    if (r.frames > 0) sendDatagram(encodeReport(r.frames, r.stalled, stream))
+  }
+  reportStats.clear()
+}
 
 let lastStats = { frames: 0, bytes: 0, at: 0 }
 function tick() {

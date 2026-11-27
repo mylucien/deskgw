@@ -31,6 +31,20 @@ export type HostEvent =
   | { type: 'displays'; displays: DisplayInfo[]; current: number; shown: number[] }
   | { type: 'encoder'; codec: number; name: string; hardware: boolean; width: number; height: number; stream: number }
   | { type: 'cursor'; visibility: number; slot: number; generation: number }
+  /**
+   * 光标形状，走大块通道。rgba 是宽×高×4 字节的 RGBA8（非预乘），
+   * 热点是相对图像左上角的像素偏移。槽位/代际用来对抗乱序与复用。
+   */
+  | {
+      type: 'cursorImage'
+      slot: number
+      generation: number
+      width: number
+      height: number
+      hotX: number
+      hotY: number
+      rgba: Uint8Array
+    }
   | { type: 'notice'; text: string; recovered: boolean }
   | { type: 'clipboard'; text: string }
   | { type: 'bye'; reason: number }
@@ -147,6 +161,23 @@ export function decodeHostMsg(buf: Uint8Array): HostEvent | null {
     case 8:
       // 被控端剪贴板变了：大块通道上的单字段变体 [8, ["文本"]]。
       return { type: 'clipboard', text: str(fields[0]) }
+    case 10: {
+      // CursorImage = [10, [[槽位,代际],[宽,高,热点x,热点y,rgba]]]，大块通道。
+      const ref = arr(fields[0])
+      const shape = arr(fields[1])
+      const rgba = shape[4]
+      return {
+        type: 'cursorImage',
+        slot: num(ref[0], -1),
+        generation: num(ref[1], -1),
+        width: num(shape[0]),
+        height: num(shape[1]),
+        hotX: num(shape[2]),
+        hotY: num(shape[3]),
+        // CborReader 给的是底层缓冲的视图，复制一份，免得后续收包覆盖。
+        rgba: rgba instanceof Uint8Array ? rgba.slice() : new Uint8Array(0),
+      }
+    }
     case 9:
       return { type: 'bye', reason: num(fields[0]) }
     default:
@@ -214,6 +245,30 @@ export function encodeInput(t: number, events: InputEvent[]): Uint8Array {
   return w.take()
 }
 
+/** 画质设置，字段名与被控端的 QualitySettings 一致（kbps、短边像素）。 */
+export interface QualitySettings {
+  fps: number
+  bitrateKbps: number
+  maxShort: number
+  adaptive: boolean
+  codec: number
+  /** 把被控端光标画进画面（游戏模式）；false 时整项不写上线。 */
+  drawCursor?: boolean
+}
+
+/**
+ * ControllerMsg::Settings = [3, [[fps,码率,短边,自适应,codec,(画进画面?)]]]。
+ * 最后一项是 skip_if=false，默认不写；被控端收到后自己夹到合法范围，没有回执。
+ */
+export function encodeSettings(q: QualitySettings): Uint8Array {
+  const w = new CborWriter()
+  const n = q.drawCursor ? 6 : 5
+  w.array(2).uint(3).array(1).array(n)
+    .uint(q.fps).uint(q.bitrateKbps).uint(q.maxShort).bool(q.adaptive).uint(q.codec)
+  if (q.drawCursor) w.bool(true)
+  return w.take()
+}
+
 /** ControllerMsg::Clipboard = [7, [文本]]，走大块通道。 */
 export function encodeClipboard(text: string): Uint8Array {
   return new CborWriter().array(2).uint(7).array(1).text(text).take()
@@ -237,6 +292,18 @@ export function encodePing(t: number): Uint8Array {
 export function encodeAck(seq: number, arrived: number, stream = 0): Uint8Array {
   const w = new CborWriter()
   w.array(2).uint(1).array(stream ? 3 : 2).uint(seq >>> 0).uint(arrived)
+  if (stream) w.uint(stream)
+  return w.take()
+}
+
+/**
+ * ControllerDatagram::Report = [4, [[frames, stalled], (stream?)]]。
+ * 都是本周期（500ms）的个数，不是累计；frames=0 时上游不会发。
+ */
+export function encodeReport(frames: number, stalled: number, stream = 0): Uint8Array {
+  const w = new CborWriter()
+  w.array(2).uint(4).array(stream ? 2 : 1)
+    .array(2).uint(frames).uint(stalled)
   if (stream) w.uint(stream)
   return w.take()
 }
