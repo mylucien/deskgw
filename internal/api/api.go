@@ -878,10 +878,6 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
-	if err != nil {
-		serverError(w, err)
-		return
-	}
 	defer rows.Close()
 	live := s.gateway.LiveIDs()
 	out := []sessionView{}
