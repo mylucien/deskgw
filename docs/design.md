@@ -60,7 +60,7 @@
 └───────┬─────────────────────┬──────┘
         │ HTTPS REST          │ WSS（二进制流）
 ┌───────▼─────────────────────▼──────────────────┐
-│               OpenWrt：rdpgw 守护进程            │
+│               OpenWrt：deskgw 守护进程            │
 │ ┌────────┐ ┌────────┐ ┌─────────┐ ┌──────────┐ │
 │ │认证/会话│ │用户/主机│ │ RDP隧道 │ │ 文件网关  │ │
 │ │ 模块    │ │ 管理    │ │ WS↔TCP  │ │ SMB 客户端│ │
@@ -83,11 +83,11 @@
 
 ### 4.1 认证与会话模块
 
-- 登录：`POST /api/login`（用户名 + 密码）→ 校验 argon2id 哈希 → 下发 Session Cookie（HttpOnly、Secure、SameSite=Strict，默认 8 小时空闲过期）。
-- 防暴力破解：按 IP+用户名限流，连续失败 5 次锁定 10 分钟。
-- 首次启动：无用户时进入初始化向导，创建第一个管理员；或由 `uci` 配置的初始密码引导。
-- 可选增强：TOTP 双因素（管理员建议强制）。
-- CSRF：除 SameSite 外，写接口要求自定义头 `X-CSRF-Token`。
+- 登录：`POST /api/login`（用户名 + 密码）→ 校验 argon2id 哈希 → 下发 Session Cookie（HttpOnly、Secure、SameSite=Strict，默认 8 小时空闲过期；前端每 4 分钟打一次 `/api/me` 续期，切回前台补一次）。
+- 防暴力破解：按「IP+用户名」计数，15 分钟窗口内连续失败 5 次锁定 10 分钟；同一 IP 跨用户名另有 50 次的总闸门。成功登录会清掉该键与来源 IP 的计数，避免偶发输错累积成锁定。
+- 首次启动：无用户时生成 `admin` 与随机密码写入 `/etc/deskgw/initial-password.txt`（0600），日志只提示文件位置，不做初始化向导。登录后可用顶栏「改密码」自助修改（校验旧密码，保留当前会话，其余会话失效）。
+- 可选增强：TOTP 双因素——当前只保留了 `users.totp_secret` 字段与只读的 `has_totp` 标记，功能未实现。
+- CSRF：除 SameSite 外，写接口要求自定义头 `X-CSRF-Token`（登录接口也校验双提交 Cookie）。
 
 ### 4.2 用户与权限模块
 
@@ -97,9 +97,10 @@
 
 ### 4.3 主机管理模块（后台）
 
-- 字段：名称、IP/主机名、RDP 端口（默认 3389）、SMB 端口（默认 445）、备注、分组、是否启用。
-- 功能：增删改查、连通性探测（TCP 3389 探活，列表显示在线/离线）、批量导入（CSV）、可选 ARP/ICMP 局域网扫描辅助添加。
-- 主机的 Windows 账号密码**不在后台保存**；如确有需要，可开启"加密保存凭据"选项（AES-GCM，密钥由管理员口令派生，默认关闭）。
+- 字段：名称、IP/主机名、RDP 端口（默认 3389）、SMB 端口（默认 445）、备注、分组、连接方式、是否启用。
+- 已实现：增删改查、用户授权、主机 id 显式递增（删掉最大 id 后不复用，避免与性能模式的注册表错位）。
+- 未实现（后续）：TCP 3389 探活与在线/离线标记、批量导入 CSV、ARP/ICMP 局域网扫描辅助添加、定时巡检。
+- 主机的 Windows 账号密码**不在后台保存**；"加密保存凭据"（AES-GCM，密钥由管理员口令派生）未实现，当前也没有计划。
 
 ### 4.4 RDP 隧道模块（核心）
 
@@ -123,34 +124,36 @@
 
 RDP 磁盘重定向在浏览器 WASM 中支持有限，因此采用**独立的 SMB 文件通道**，使用户在连接时输入的同一份 Windows 凭据访问目标主机。
 
-- 前端"文件"面板：目录树、列表、上传（拖拽、分片）、下载（单文件/多文件打包 zip 流式输出）、新建文件夹、重命名、删除。
+- 前端"文件"面板：单层面包屑导航（不带树）、列表（目录优先、按名称排序）、上传（拖拽 / 选择文件，分片可续传）、下载（单文件流式、支持 Range）、新建文件夹、重命名、删除。多文件打包 zip 未实现。
 - 接口：
-  - `GET /api/files/list?session=…&path=…`
-  - `POST /api/files/upload?session=…&path=…`（`multipart` 或分片，`Content-Range` 续传）
+  - `GET /api/files/list?session=…&share=…&path=…`
+  - `POST /api/files/upload/{begin,chunk,finish,abort}`（分片；`begin` 声明总大小，`finish` 校验偏移，409 返回已收偏移供续传；覆盖已有文件需显式确认）
   - `GET /api/files/download?session=…&path=…`（流式、支持 Range）
   - `POST /api/files/mkdir|rename|delete`
-- 服务端用 go-smb2 连接 `\\host\共享名`（默认可访问 `C$` 管理共享，也可限定为管理员预设的共享目录），**流式读写**，不在路由器落盘，避免耗尽 Flash/内存。
-- 凭据处理：文件会话使用独立的短期 `file_token`，凭据只保存在该会话的内存中，会话结束立即清除。
-- 限制：单文件大小上限、并发传输数、允许的路径前缀均可在后台配置；可禁止特定用户使用文件功能。
+- 服务端用 go-smb2 连接 `\\host\共享名`（默认可访问 `C$` 管理共享，也可切换共享名），**流式读写**，不在路由器落盘，避免耗尽 Flash/内存。写入是"临时文件 → 备份旧文件 → 改名覆盖 → 删备份"，失败可回滚。
+- 凭据处理：文件会话使用独立的短期 `file_token`（绑定会话与来源 IP，30 分钟），凭据只保存在该会话的内存中，会话结束立即清除；令牌过期返回 403、会话结束返回 410，前端就地重取，不会把用户踢回登录页。
+- 限制：单文件大小上限（默认 2 GiB，后台可调）、上传分片大小、全局 24 条 SMB 连接、单次读写 60 秒空闲上限；可禁止特定用户使用文件功能。每次文件操作都重新校验用户-主机授权。
 - 前提：Windows 需开启文件和打印机共享，防火墙放行 445（文档中给出一键配置脚本）。
 
 ### 4.6 审计日志模块
 
-记录：登录成功/失败、会话开始/结束（用户、主机、来源 IP、时长）、文件操作（上传/下载/删除的路径与大小）、后台配置变更。日志存入 SQLite，支持按时间/用户/主机检索与 CSV 导出，默认保留 90 天并自动清理。
+记录：登录成功/失败、会话开始/结束（用户、主机、来源 IP、时长）、文件操作（上传/下载/删除的路径与大小）、后台配置变更、性能模式批准与下线。日志存入 SQLite，支持按时间/用户/动作检索与 CSV 导出；检索支持分页，关键词里的 `%`、`_` 会被转义，导出走 `limit=0` 取全量，不再有 20 万行截断。审计保留 90 天、每 24 小时清理一次；`sessions` 表按同样口径保留 90 天，避免只增不减拖慢列表与配额查询。
 
 ### 4.7 前端设计
 
 页面：
 
-- **登录页**；**主机列表页**（卡片 + 在线状态 + 搜索分组）；
-- **会话页**：顶部工具栏（全屏、Ctrl+Alt+Del、剪贴板、文件面板开关、分辨率、断开），支持多标签同时打开多台主机；
+- **登录页**；**主机列表页**（卡片 + 分组 + 搜索 + 刷新）；
+- **会话页**：顶部工具栏（会话菜单、Ctrl+Alt+Del、全屏、剪贴板、文件面板、断开），支持多标签同时打开多台主机，标签数上限由服务端配额决定；离开页面时用 keep-alive 保活，会话不中断。
 - **后台管理**：主机管理、用户管理、授权分配、在线会话（可强制踢下线）、审计日志、系统设置。
 
 前端不缓存任何 Windows 密码；输入框使用 `autocomplete=off`，提交后立即清空变量。
 
 ### 4.8 性能连接模式（浏览器端解密）
 
-性能模式是 RDP 模式之外的第二种连接方式：Windows 端运行 Airhand 被控端（开源，MIT 许可，Rust），用 GPU 硬编码传输画面，目标是高帧率。OpenWrt 上**不部署 Airhand 的中继和网页控制台**，rdpgw 内置的 perfgw 只做三件事：接受被控端接入、与被控端完成握手、把密文转发给浏览器。**画面和输入的加解密全部在浏览器里完成**，目的是尽可能减轻路由器负担。原则是只做满足需求的功能，其余一律不做。
+> 实现状态：本节的 M7–M10 已落地，`internal/perfgw/` 与浏览器控制端可用，协议细节以 [`perf-protocol.md`](perf-protocol.md) 为准；下文提到的「M7 实测/确认」保留为当时的设计依据，实测结论已经写回该文档。没有开放的能力（多显示器、剪贴板图片等）仍按「不做」处理。
+
+性能模式是 RDP 模式之外的第二种连接方式：Windows 端运行 Airhand 被控端（开源，MIT 许可，Rust），用 GPU 硬编码传输画面，目标是高帧率。OpenWrt 上**不部署 Airhand 的中继和网页控制台**，deskgw 内置的 perfgw 只做三件事：接受被控端接入、与被控端完成握手、把密文转发给浏览器。**画面和输入的加解密全部在浏览器里完成**，目的是尽可能减轻路由器负担。原则是只做满足需求的功能，其余一律不做。
 
 **范围**
 
@@ -175,7 +178,7 @@ RDP 磁盘重定向在浏览器 WASM 中支持有限，因此采用**独立的 S
 ```
 浏览器：界面（fork 的 Airhand 控制台） + 浏览器控制端（Web Worker：解密、帧与消息处理）
    │ HTTPS / WSS（登录态 + 一次性票据）：握手结果、密文转发
-rdpgw（Go，单进程）
+deskgw（Go，单进程）
  ├─ 既有模块：认证 · 授权 · 主机表 · 审计
  └─ perfgw：QUIC 服务端 UDP 4433 · 握手 · 密文转发 · 背压
    │ QUIC / UDP 4433（局域网，被控端主动连入）
@@ -193,11 +196,11 @@ Windows 主机：Airhand 被控端（SYSTEM 服务，开机未登录即可连）
 
 **主机接入与批准**
 
-- 被控端的 `server` 指向 rdpgw 的局域网地址和 4433 端口，`server_fp` 填 rdpgw 证书的指纹（后台"性能模式"页显示，构建安装包时写入）。
-- 新被控端第一次连上来，rdpgw 完成注册应答，并把它放进"待批准"列表（名称、系统、来源 IP、时间）。批准之前任何用户都不能使用它。
+- 被控端的 `server` 指向 deskgw 的局域网地址和 4433 端口，`server_fp` 填 deskgw 证书的指纹（后台"性能模式"页显示，构建安装包时写入）。
+- 新被控端第一次连上来，deskgw 完成注册应答，并把它放进"待批准"列表（名称、系统、来源 IP、时间）。批准之前任何用户都不能使用它。
 - 管理员批准只做准入：选择已有主机或新建，路由器把待批准的控制码换成主机 id，断开让被控端重连取新码。控制端公钥要等用户第一次真正连接、走完 Noise XX 才学得到（被控端在 `Confirm` 之前不显示控制端，安全码核对在实机上做不到），学到之后记进 `hosts.perf_key`，之后只用 Noise IK，公钥变化即阻断并要求重新批准。
 - 批准结果与重连密钥同时落库（`hosts.perf_secret`）。网关重启后被控端带着控制码回来，路由器凭这对值直接认回「已批准」，不用管理员再批一次。
-- rdpgw 把"主机 id"作为控制码回给被控端，同时给一个 16 字节随机重连密钥，被控端重连时凭这对值识别身份（落库为 `hosts.perf_secret`）。
+- deskgw 把"主机 id"作为控制码回给被控端，同时给一个 16 字节随机重连密钥，被控端重连时凭这对值识别身份（落库为 `hosts.perf_secret`）。
 - 局域网里任何设备都可以冒充被控端来注册，所以未批准的连接不转发任何用户数据；注册接口限流，只监听局域网接口。
 - 被控端放行控制端靠"配对过的公钥"。路由器持有一把固定的 X25519 控制端密钥，需要预先写入每台被控端 `config.toml` 的 `[[paired]]`，该方式未经验证，列入 M7；不可行则第二期实现 SPAKE2 配对。
 
@@ -228,10 +231,10 @@ QUIC 服务端，ALPN 为 `airhand/1`，使用自签证书（被控端用 `serve
 
 | 方向 | 消息 | 处理 |
 | --- | --- | --- |
-| 被控端 → rdpgw | `ClientHello`（版本、角色、名称、系统） | 校验版本，回复 `ServerHello`，文件上限填空 |
-| 被控端 → rdpgw | `Register`（重连凭证、keep、rekey） | 回复 `Registered`（控制码 = 主机 id，重连密钥）；无凭证的进入待批准 |
-| rdpgw → 被控端 | `Incoming`（会话号、对端信息、地址、握手第一条消息） | 有用户连接时发送 |
-| 被控端 → rdpgw | `Release`、`Rekey` | 被控端本机用户更换控制码时发来，回最简应答并要求管理员重新批准 |
+| 被控端 → deskgw | `ClientHello`（版本、角色、名称、系统） | 校验版本，回复 `ServerHello`，文件上限填空 |
+| 被控端 → deskgw | `Register`（重连凭证、keep、rekey） | 回复 `Registered`（控制码 = 主机 id，重连密钥）；无凭证的进入待批准 |
+| deskgw → 被控端 | `Incoming`（会话号、对端信息、地址、握手第一条消息） | 有用户连接时发送 |
+| 被控端 → deskgw | `Release`、`Rekey` | 被控端本机用户更换控制码时发来，回最简应答并要求管理员重新批准 |
 
 `Connect`、`ConnectResult`、`HostOnline` 是控制端与中继之间的消息，我们不需要。消息是带编号字段的 CBOR。
 
@@ -299,7 +302,7 @@ QUIC 服务端，ALPN 为 `airhand/1`，使用自签证书（被控端用 `serve
 
 ### 4.10 路由器 perfgw 设计（本项目要写的代码之一）
 
-`internal/perfgw/` 是 rdpgw 内的一个 Go 包。它不解密、不解析视频和控制消息，只负责：被控端接入、握手、会话密钥下发、密文转发与背压。
+`internal/perfgw/` 是 deskgw 内的一个 Go 包。它不解密、不解析视频和控制消息，只负责：被控端接入、握手、会话密钥下发、密文转发与背压。
 
 | 文件 | 职责 |
 | --- | --- |
@@ -364,7 +367,7 @@ UCI：`perf_enabled`、`perf_listen`（默认 `0.0.0.0:4433`，建议绑定 LAN 
 **测试**
 
 - 协议样本：用真实被控端抓取的信令、握手和会话开头的字节做 fixture，覆盖握手与密钥派生，密钥包交给 4.11 的浏览器端测试复用。
-- 兼容性测试：Windows 虚拟机里的被控端连测试用 rdpgw，验证注册、批准、握手、出画面、断开；被控端每次升级都跑一遍。
+- 兼容性测试：Windows 虚拟机里的被控端连测试用 deskgw，验证注册、批准、握手、出画面、断开；被控端每次升级都跑一遍。
 - 模糊测试：信令、握手回复、流头解析。
 - 压力测试：模拟 30Mbps 视频流，观察路由器 CPU、内存、背压与丢帧行为。
 
@@ -419,15 +422,15 @@ UCI：`perf_enabled`、`perf_listen`（默认 `0.0.0.0:4433`，建议绑定 LAN 
   - `lib/backend/` 下新增使用浏览器控制端（4.11）的后端，取代依赖 airhand-web 的通路，具体接口形状需先核对。
   - `components/ConnectView.tsx` 换成 `GET /api/hosts` 返回的主机列表（只显示支持性能模式的），点击后向路由器取票据，并通过浏览器控制端发起 `connect`，主机用占位符 `h<主机id>`。
   - 错误文案补充"该主机的性能模式尚未配置"等，对应 4.10 的错误类型。
-- 构建产物 `client/dist` 与 Worker 脚本由 rdpgw 托管在 `/perf/` 下，保持同源；页面必须通过 HTTPS 打开，浏览器才会启用 WebCodecs 和 WebCrypto。
+- 构建产物 `client/dist` 与 Worker 脚本由 deskgw 托管在 `/perf/` 下，保持同源；页面必须通过 HTTPS 打开，浏览器才会启用 WebCodecs 和 WebCrypto。
 - 未验证：上游的解码模块是否直接依赖控制台 WebSocket 的二进制格式（通道号加媒体包）。若耦合较深，就在后端边界处适配成同一种形状。M9 开始前要先读 `client/src` 并列出改动文件清单。
 
 **Windows 端（Airhand 官方被控端，不改代码）**
 
-- 构建安装包：在 `client/` 下设置 `AIRHAND_SERVER=<OpenWrt 局域网地址>:4433` 与 `AIRHAND_SERVER_FP=<rdpgw 证书指纹>`，运行 `npm run tauri build` 得到 Windows 安装包；已安装的主机也可以改 `config.toml` 的 `server` 与 `server_fp`。
+- 构建安装包：在 `client/` 下设置 `AIRHAND_SERVER=<OpenWrt 局域网地址>:4433` 与 `AIRHAND_SERVER_FP=<deskgw 证书指纹>`，运行 `npm run tauri build` 得到 Windows 安装包；已安装的主机也可以改 `config.toml` 的 `server` 与 `server_fp`。
 - 安装需要管理员权限，装好后作为 SYSTEM 服务运行，开机未登录也在线；安装器会添加 `airhand.exe` 的防火墙规则。
 - 预置控制端密钥：把路由器控制端的公钥、名称、时间写入 `config.toml` 的 `[[paired]]`，由安装脚本完成，该方式未经验证（M7）。
-- 批准：被控端连上 rdpgw 后，管理员在后台"待批准"里批准，并核对被控端托盘上的安全码。
+- 批准：被控端连上 deskgw 后，管理员在后台"待批准"里批准，并核对被控端托盘上的安全码。
 - 被控机策略：设置无操作自动锁屏，让 Windows 登录界面成为网关授权之外的第二道防线；性能模式不依赖 Windows 的 RDP 服务，家庭版理论上也能用（Airhand 支持 Windows 10 / 11），需在 M7 实测。
 - 运维：在被控端托盘更换控制码会清空该机的配对记录，之后需要重新预置 `[[paired]]` 并在后台重新批准。
 - 批量部署：静默安装参数没有核实，需在 M7 确认。
@@ -443,57 +446,61 @@ hosts(id, name, address, rdp_port, smb_port, group_name,
 
 user_hosts(user_id, host_id)            -- 授权关系，联合主键
 
-sessions(id, user_id, host_id, client_ip, started_at, ended_at, state)
+sessions(id, user_id, host_id, client_ip, started_at, ended_at, state, mode)
 
 audit_logs(id, ts, user_id, action, target, detail, client_ip)
 
 settings(key PRIMARY KEY, value)        -- 超时、限流、文件限制等
 ```
 
+`users.totp_secret` 是预留字段，当前没有实现双因素登录，只有 `has_totp` 一个只读标记；`users.max_sessions` 是每用户并发上限，默认 2、硬上限 32，前端标签数取自 `/api/me` 下发的值，不再自己写死。
+
 **性能模式新增字段**
 
 ```
-hosts     新增 modes TEXT DEFAULT 'rdp'        -- 'rdp' 或 'rdp,perf'
-          新增 perf_key BLOB                   -- 被控端公钥（批准时记录）
+hosts     新增 modes TEXT DEFAULT 'rdp'        -- 'rdp'、'perf' 或 'rdp,perf'
+          新增 perf_key BLOB                   -- 被控端公钥（首次握手时记录）
           新增 perf_secret BLOB                -- 重连密钥的校验值
           新增 perf_name TEXT, perf_os TEXT    -- 被控端报告的名称与系统
           新增 perf_last_seen INTEGER          -- 最近一次在线时间
-perf_pending(id, name, os, ip, first_seen, last_seen)   -- 待批准的被控端
 sessions  新增 mode TEXT                       -- 'rdp' 或 'perf'
-settings  新增键 perf.enabled、perf.max_per_host（默认 1）、perf.max_sessions（默认 2）
+settings  新增键 perf.enabled、perf.max_per_host（默认 1，上限 8）、perf.max_sessions（默认 2，上限 32）
 ```
+
+「待批准的被控端」不落库：它本来就是内存里的在线连接，进程重启后必须重新注册，落库只会留下清理不掉的过期记录；后台从 `perfgw` 注册表读待批准列表，批准时新建或关联一条 `hosts` 记录，并把控制码换成主机 id。
 
 主机 id 同时作为分配给被控端的控制码，所以 `hosts.id` 必须在 u32 范围内。
 
-数据库文件默认存放在 `/etc/rdpgw/data.db`（持久化分区）；若 Flash 磨损敏感，审计日志可配置到 `/mnt/usb` 或内存并定期压缩。
+数据库文件默认存放在 `/etc/deskgw/data.db`（`data_dir` 可改，需落在持久化分区）；注意这只解决数据库本身，审计和会话记录长期增长仍会写 overlay，Flash 磨损敏感时把 `data_dir` 指到 `/mnt/usb` 或外置存储。
 
 ## 6. 主要 API 一览
 
 | 方法 | 路径 | 说明 | 权限 |
 | --- | --- | --- | --- |
 | POST | /api/login, /api/logout | 登录/登出 | 公开/登录 |
-| GET | /api/me | 当前用户信息 | 登录 |
+| POST | /api/password | 自助改密（校验旧密码，保留当前会话，其余会话失效） | 登录 |
+| GET | /api/me | 当前用户信息与配额（`limits.max_sessions`，前端据此决定标签数） | 登录 |
 | GET | /api/hosts | 我可访问的主机及在线状态 | 登录 |
 | POST | /api/sessions | 创建连接会话，返回 ticket | 登录 |
 | WS | /ws/rdp?ticket= | RDP 字节流隧道 | 票据 |
-| \* | /api/files/\* | 文件操作 | 会话 |
+| \* | /api/files/\* | 文件操作（令牌失效返回 403/410，由前端就地重取，不跳登录页） | 会话 |
 | CRUD | /api/admin/hosts | 主机管理 | admin |
 | CRUD | /api/admin/users | 用户管理与授权 | admin |
-| GET/DELETE | /api/admin/sessions | 在线会话/强制下线 | admin |
-| GET | /api/admin/audit | 审计日志查询导出 | admin |
+| GET/DELETE | /api/admin/sessions | 在线会话/强制下线（分页，`limit`/`offset`） | admin |
+| GET | /api/admin/audit | 审计日志查询导出（`limit=0` 导出全量） | admin |
 | GET/PUT | /api/admin/settings | 系统设置 | admin |
 | WS | /ws/perf?ticket= | 性能模式：握手与密文转发（浏览器控制端） | 票据 |
-| POST | /api/admin/perf/pending | 待批准被控端的列表，及 POST …/{id}/approve 批准 | admin |
+| GET/POST | /api/admin/perf、/api/admin/perf/{code}/approve | 待批准被控端列表与批准 | admin |
 | POST | /api/perf/ticket | 性能模式：签发控制台连接票据（一次性，30 秒） | 登录 |
 
 ## 7. 安全设计
 
-1. **传输安全**：仅监听 HTTPS；证书支持自签名、上传自有证书，或通过 `acme.sh` 自动签发。HTTP 请求自动跳转 HTTPS。
+1. **传输安全**：仅监听 HTTPS；首次启动生成自签证书与密钥，路径由 UCI 指定，可自行放入正式证书替换后重启；HTTP 跳转监听需显式配置 `redirect_listen`（默认关闭），失败时只记警告、不影响主服务。
 2. **凭据不落地**：Windows 密码默认只存在浏览器内存，经 NLA 直接与 Windows 协商；文件通道凭据仅驻留内存、随会话销毁。
-3. **反 SSRF**：隧道目标只能来自数据库，且限制为私网地址；票据一次性、30 秒过期、绑定用户与 IP。
-4. **访问控制**：每次建立隧道与文件操作都重新校验用户-主机授权；管理接口强制 admin。
-5. **防暴力破解**：登录与票据接口限流，失败锁定，管理员可查看异常。
-6. **公网暴露建议**：强烈建议**不要把服务直接暴露公网**，优先通过 WireGuard/OpenVPN 接入；若必须暴露，需启用 TOTP、修改默认端口、配合 fail2ban 与防火墙来源 IP 限制。
+3. **反 SSRF**：隧道目标只能来自数据库，且限制为私网地址；唯一的例外是「仅性能模式」的主机——QUIC 由被控端主动接入，网关不外连，因此允许公网地址。票据一次性、30 秒过期、绑定用户与 IP。
+4. **访问控制**：每次建立隧道与文件操作都重新校验用户-主机授权；管理接口强制 admin。停用用户、撤销主机授权、关闭主机时会断开其在线隧道（按「同一用户 + 同一主机」匹配，不会误踢同一主机上的其他用户）。
+5. **防暴力破解**：登录与票据接口限流，失败计数 15 分钟窗口、5 次锁 10 分钟；管理员可查看异常。
+6. **公网暴露建议**：强烈建议**不要把服务直接暴露公网**，优先通过 WireGuard/OpenVPN 接入；若必须暴露，需修改默认端口、配合 fail2ban 与防火墙来源 IP 限制（TOTP 尚未实现，不能作为依赖）。
 7. **Windows 侧建议**：启用 NLA，使用强密码，禁用空密码登录，限制可远程登录的用户组。
 8. **安全头与 XSS**：严格 CSP、`X-Frame-Options: DENY`、输出转义；上传文件名做路径穿越检查（拒绝 `..`）。
 
@@ -509,29 +516,33 @@ settings  新增键 perf.enabled、perf.max_per_host（默认 1）、perf.max_se
 
 ## 8. OpenWrt 部署设计
 
-- **打包**：提供 `rdpgw_<ver>_<arch>.ipk` 与 LuCI 配置页 `luci-app-rdpgw`，通过 OpenWrt SDK / GitHub Actions 为 x86\_64、aarch64、armv7、mipsel 等架构交叉编译。
-- **服务管理**：`/etc/init.d/rdpgw` 使用 procd，崩溃自动拉起，日志走 `logd`（`logread -e rdpgw`）。
-- **配置**（UCI，`/etc/config/rdpgw`）：
+- **打包**：提供 `deskgw_<ver>_<arch>.ipk`（24.10）与 `deskgw-<ver>_r1_<arch>.apk`（25.12 / snapshot），含 LuCI 配置页 `luci-app-deskgw`；CI 实际交叉编译 `x86_64` 与 `aarch64_cortex-a53`（an7581）两种架构，其它架构可在 ImmortalWrt SDK 中自行编译。
+- **服务管理**：`/etc/init.d/deskgw` 使用 procd，崩溃自动拉起，日志走 `logd`（`logread -e deskgw`）。
+- **配置**（UCI，`/etc/config/deskgw`）：
 
 ```
-config rdpgw 'main'
+config deskgw 'main'
     option enabled '1'
     option listen '0.0.0.0:8443'
-    option cert '/etc/rdpgw/server.crt'
-    option key  '/etc/rdpgw/server.key'
-    option data_dir '/etc/rdpgw'
+    option cert '/etc/deskgw/server.crt'
+    option key  '/etc/deskgw/server.key'
+    option data_dir '/etc/deskgw'
     option session_idle_min '30'
     option max_upload_mb '2048'
+    option redirect_listen ''
+    option gomemlimit ''
+    option perf_enabled '0'
+    option perf_listen '0.0.0.0:4433'
 ```
 
 - **端口**：默认 8443，避免与 LuCI（uhttpd 80/443）冲突；防火墙默认仅放行 LAN 区域，公网访问需用户手动开放。
-- **存储与资源**：二进制建议使用 UPX 压缩；设备 Flash 不足时可安装到 USB（extroot）。最低建议：128MB 内存、16MB Flash（压缩后）。
-- **升级**：`opkg upgrade` 保留 `/etc/config/rdpgw` 与数据库；数据库带 schema 版本号，启动时自动迁移。
-- **LuCI 集成**：提供启停开关、监听端口、证书名称，基本设置末尾另有内存软上限与 HTTP 跳转监听两项高级参数，并一键跳转到管理后台；性能模式单独分区，含启用开关、QUIC 监听地址（建议绑 LAN），以及证书、私钥、控制端身份私钥三条只读路径与备份警告。改完需重启服务。被控端对接参数（`server`、`server_fp`、`[[paired]].key`）是运行时派生值，只在管理后台「性能模式」页展示，不放 LuCI。状态页（在线会话数、版本）尚未做，暂时只能进管理后台看。
+- **存储与资源**：二进制建议使用 UPX 压缩；设备 Flash 不足时可安装到 USB（extroot）。最低建议：128MB 内存、16MB Flash（压缩后）。`data_dir` 在 overlay 上，审计与会话记录持续写入会带来闪存磨损，长期运行建议把 `data_dir` 指到外置存储。
+- **升级**：`opkg upgrade` 保留 `/etc/config/deskgw` 与数据库；数据库带 schema 版本号，启动时自动迁移。`session_idle_min`、`max_upload_mb` 只在数据库尚无对应设置时作为初始值写入，之后以管理后台为准。
+- **LuCI 集成**：提供启停开关、监听端口、证书名称，基本设置末尾另有内存软上限与 HTTP 跳转监听两项高级参数，并一键跳转到管理后台；性能模式单独分区，含启用开关、QUIC 监听地址（建议绑 LAN），以及证书、私钥、控制端身份私钥三条只读路径与备份警告。改完需重启服务。被控端对接参数（`server`、`server_fp`、`[[paired]].key`）是运行时派生值，只在管理后台「性能模式」页展示，不放 LuCI。管理后台的状态页显示版本、运行时长、在线会话数、主机与用户数、性能模式状态。
 
 **性能模式部署补充**
 
-- 不新增进程：perfgw 随 rdpgw 启动，多监听一个 UDP 端口（默认 4433），防火墙只对 LAN 区域放行。
+- 不新增进程：perfgw 随 deskgw 启动，多监听一个 UDP 端口（默认 4433），防火墙只对 LAN 区域放行。
 - 证书：首次启动自动生成自签证书和密钥（`perf_cert`、`perf_key`），后台显示证书指纹，供构建被控端安装包使用。
 - 控制端密钥：首次启动生成 X25519 密钥（`perf_identity`，权限 600），后台显示公钥，供预置被控端的 `[[paired]]`。
 - 内核 UDP 缓冲：LuCI「性能模式」分区提供开关（默认开启）与缓冲上限（默认 8MiB，可改）。服务启动时由 `/usr/libexec/deskgw/udp-tune.sh` 写入 `net.core.rmem_max` / `wmem_max` 并持久化到 `/etc/sysctl.conf`，用标记块管理、重复调用会覆盖旧值；关闭时移除该块。不设的话高码率视频会因缓冲被填满而卡顿。
@@ -556,22 +567,25 @@ config rdpgw 'main'
 ## 10. 项目目录结构
 
 ```
-rdpgw/
-├── cmd/rdpgw/main.go          # 入口
+deskgw/
+├── cmd/deskgw/main.go         # 入口
 ├── internal/
-│   ├── auth/                  # 登录、会话、限流、TOTP
+│   ├── auth/                  # 登录、会话、CSRF、限流
 │   ├── user/ host/            # 用户、主机、授权
 │   ├── tunnel/                # WS↔TCP RDP 隧道、票据
+│   ├── perfgw/                # 性能模式：QUIC 接入、握手、注册表、名额
 │   ├── filegw/                # SMB 文件网关
 │   ├── audit/                 # 审计
 │   ├── store/                 # SQLite 访问与迁移
+│   ├── httpx/ textutil/       # 同源校验、截断与路径等公共小工具
 │   └── api/                   # REST 路由与中间件
-├── web/                       # Vue3 前端（构建后 embed）
+├── web/                       # Vue3 前端（构建后 embed），性能控制端在 src/perf/
+├── wasm/                      # 裁剪后的 IronRDP WASM 客户端
 ├── openwrt/                   # Makefile、init 脚本、UCI 默认配置、luci-app
-└── docs/                      # 部署、Windows 侧配置说明
+└── docs/                      # 设计方案、性能模式协议说明
 ```
 
-性能模式新增目录：`internal/perfgw/`（接入、握手、转发）、`web/perf-controller/`（浏览器控制端，TypeScript）、`third_party/airhand-console/`（摘用的前端界面部分，锁定上游版本）、`testdata/perf/`（真实被控端抓取的协议样本）。
+性能模式的浏览器控制端在 `web/src/perf/`（TypeScript，WebCodecs 解码 + WebCrypto 解密，运行在 Worker 里），握手与消息编码的黄金向量内联在 `internal/perfgw/*_test.go`，由 Rust 侧生成后逐字节对齐。
 
 ## 11. 开发里程碑
 
@@ -587,6 +601,8 @@ rdpgw/
 | M8 | perfgw（接入、批准、握手、密钥下发、密文转发与背压）与浏览器控制端（解密、帧与消息处理、确认与丢帧恢复）、票据与限额、审计 | 5 周 |
 | M9 | 前端界面适配：主机列表、接入浏览器控制端、去掉不需要的功能 | 1 周 |
 | M10 | 性能模式 OpenWrt 打包（UCI、sysctl、证书与密钥生成）、被控端安装包脚本、负载与安全测试、文档 | 1 周 |
+
+M1–M10 均已实现并随包发布，上表保留为立项时的排期与验收口径。
 
 ## 12. 风险与应对
 

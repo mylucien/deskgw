@@ -218,6 +218,29 @@ func Update(db *sql.DB, id int64, u User, password string, hostIDs []int64) erro
 	return tx.Commit()
 }
 
+// SetPassword 只改密码哈希，用于用户自助改密。
+func SetPassword(db *sql.DB, id int64, password string) error {
+	if len(password) < 8 {
+		return errors.New("密码至少 8 位")
+	}
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		return err
+	}
+	res, err := db.Exec(`UPDATE users SET pass_hash=? WHERE id=?`, hash, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // Delete 删除用户。
 func Delete(db *sql.DB, id int64) error {
 	res, err := db.Exec(`DELETE FROM users WHERE id = ?`, id)

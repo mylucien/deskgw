@@ -8,8 +8,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	smb2 "github.com/hirochachacha/go-smb2"
 )
 
 // ErrUploadOffset 表示分片偏移与已写入位置不一致。
@@ -32,28 +30,43 @@ const (
 // 文件的话，上传中途断开会把用户原有文件变成残缺文件。
 type Upload struct {
 	conn   *Conn
-	file   *smb2.File
+	file   *File
 	share  string
 	final  string
 	tmp    string
 	mu     sync.Mutex
 	offset int64
+	// size 是 begin 时调用方声明的文件大小。-1 表示未声明（旧接口），
+	// finish 时按实际写入量提交。
+	size   int64
 	closed bool
 }
 
 // BeginUpload 建立上传会话，在目标目录下创建临时文件。
-func BeginUpload(address string, port int, share, path string, creds Credentials) (*Upload, error) {
+// 返回的 exists 表示目标文件已经存在，调用方据此决定是否需要用户确认覆盖。
+func BeginUpload(address string, port int, share, path string, size int64, creds Credentials) (*Upload, bool, error) {
 	conn, err := Connect(address, port, share, creds)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	exists := false
+	if info, err := conn.Stat(path); err == nil && info != nil && !info.IsDir() {
+		exists = true
 	}
 	tmp := tempName(path)
 	f, err := conn.OpenWrite(tmp, 0)
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, false, err
 	}
-	return &Upload{conn: conn, file: f, share: share, final: path, tmp: tmp}, nil
+	return &Upload{conn: conn, file: f, share: share, final: path, tmp: tmp, size: size}, exists, nil
+}
+
+// Size 返回 begin 时声明的大小，-1 表示未声明。
+func (u *Upload) Size() int64 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.size
 }
 
 // tempName 生成同目录下的临时文件名，带随机后缀避免并发上传互相覆盖。
@@ -118,8 +131,10 @@ func (u *Upload) TargetPath() string { return u.final }
 
 // Commit 关闭临时文件并把它改名到目标路径。
 //
-// Windows 的 SMB rename 不覆盖已存在文件，先删目标再改名；两步之间有
-// 极短窗口，但比「一开始就截断原文件」安全得多。
+// Windows 的 SMB rename 不覆盖已存在文件。原实现先删目标再改名：改名失败
+// （权限、目标被占用、磁盘满）时 discardLocked 会把临时文件也删掉，新旧文件
+// 一起消失。现在改成「把旧文件挪成备份 → 改名 → 删备份」：任何一步失败都能
+// 把旧文件放回原处，最多留下一个 .deskgw-bak 文件。
 func (u *Upload) Commit() error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -135,10 +150,24 @@ func (u *Upload) Commit() error {
 			return err
 		}
 	}
-	_ = u.conn.share.Remove(u.final)
+	var backup string
+	if _, err := u.conn.share.Stat(u.final); err == nil {
+		backup = tempName(u.final) + ".bak"
+		if err := u.conn.share.Rename(u.final, backup); err != nil {
+			u.discardLocked()
+			return err
+		}
+	}
 	if err := u.conn.share.Rename(u.tmp, u.final); err != nil {
+		if backup != "" {
+			// 放回旧文件；失败也只能把备份留下，至少数据还在。
+			_ = u.conn.share.Rename(backup, u.final)
+		}
 		u.discardLocked()
 		return err
+	}
+	if backup != "" {
+		_ = u.conn.share.Remove(backup)
 	}
 	u.tmp = ""
 	u.conn.Close()

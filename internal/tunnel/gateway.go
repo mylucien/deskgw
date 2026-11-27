@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +18,8 @@ import (
 
 	"github.com/mylucien/deskgw/internal/auth"
 	"github.com/mylucien/deskgw/internal/host"
+	"github.com/mylucien/deskgw/internal/httpx"
+	"github.com/mylucien/deskgw/internal/textutil"
 )
 
 const (
@@ -75,29 +76,7 @@ func NewGateway(db *sql.DB, tickets *TicketManager, auditFn func(userID any, act
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 32 * 1024,
-	CheckOrigin:     checkOrigin,
-}
-
-// checkOrigin 只接受同源的 http(s) 页面发起的 WebSocket。
-// 校验 scheme 可挡住 file://、chrome-extension:// 等非 Web 来源；
-// TLS 直连时还要求 Origin 必须是 https，避免从明文页面借道。
-func checkOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
-	}
-	i := strings.Index(origin, "://")
-	if i < 0 {
-		return false
-	}
-	scheme := strings.ToLower(origin[:i])
-	if scheme != "http" && scheme != "https" {
-		return false
-	}
-	if r.TLS != nil && scheme != "https" {
-		return false
-	}
-	return strings.EqualFold(origin[i+3:], r.Host)
+	CheckOrigin:     httpx.SameOrigin,
 }
 
 // Serve 处理一次 WebSocket 升级与字节转发。调用方已完成登录态校验。
@@ -152,7 +131,7 @@ func (g *Gateway) Serve(w http.ResponseWriter, r *http.Request, sess *auth.Sessi
 	// 标签、手机切网）时，网关这边的 TCP 可能还残留到读超时，远端仍认为旧会话
 	// 在线，新连接的 NLA 会被拒（STATUS_LOGON_FAILURE），表现为「必须重启网关
 	// 服务才能再连」。新隧道就绪后先收掉指向同一主机的旧隧道，让远端立即释放。
-	if n := g.supersedeHost(ticket.HostID, ticket.SessionID); n > 0 {
+	if n := g.supersedeHost(ticket.HostID, ticket.UserID, ticket.SessionID); n > 0 {
 		g.audit(sess.UserID, "rdp.supersede", h.Name,
 			fmt.Sprintf("关闭 %d 条同主机旧隧道", n), ticket.ClientIP)
 	}
@@ -272,11 +251,15 @@ func (g *Gateway) CloseHost(hostID int64) int {
 	return g.closeWhere(func(e *liveSession) bool { return e.hostID == hostID })
 }
 
-// supersedeHost 收掉指向同一主机的其他在线隧道，返回关闭数量。
+// supersedeHost 收掉同一用户指向同一主机的其他在线隧道，返回关闭数量。
 // 新连接自己通过 keepID 排除在外。
-func (g *Gateway) supersedeHost(hostID, keepID int64) int {
+//
+// 只按主机关闭会把别人的会话一起踢掉：B 连主机 X，A 正在用的 X 就断了。
+// 同一用户的两个标签连同一台机器仍然互斥（远端只允许一个交互式会话），
+// 但跨用户不再相互影响。
+func (g *Gateway) supersedeHost(hostID, userID, keepID int64) int {
 	return g.closeWhere(func(e *liveSession) bool {
-		return e.hostID == hostID && e.id != keepID
+		return e.hostID == hostID && e.userID == userID && e.id != keepID
 	})
 }
 
@@ -333,7 +316,7 @@ func (g *Gateway) markActive(sessionID int64, ip string) bool {
 
 func (g *Gateway) endSession(sessionID int64, state, detail string) {
 	res, err := g.db.Exec(`UPDATE sessions SET state=?, ended_at=?, detail=? WHERE id=? AND ended_at IS NULL`,
-		state, time.Now().Unix(), clipDetail(detail), sessionID)
+		state, time.Now().Unix(), textutil.Clip(detail, maxDetail), sessionID)
 	if err != nil {
 		return
 	}
@@ -363,31 +346,9 @@ func (g *Gateway) closeWithReason(ws *websocket.Conn, sessionID int64, state, re
 // 不截断会给数据库留一个可以反复写入的放大点。
 const maxDetail = 512
 
-// clipDetail 截断失败原因，并避免把 UTF-8 字符切一半。
-func clipDetail(s string) string {
-	if len(s) <= maxDetail {
-		return s
-	}
-	cut := maxDetail
-	for cut > 0 && s[cut]&0xC0 == 0x80 {
-		cut--
-	}
-	return s[:cut]
-}
-
 // trimReason 把原因截断到 close 帧允许的长度（123 字节）；
-// 若截断点落在 UTF-8 字符中间则回退到字符边界，避免出现乱码。
-func trimReason(s string) string {
-	const max = 120
-	if len(s) <= max {
-		return s
-	}
-	cut := max
-	for cut > 0 && s[cut]&0xC0 == 0x80 {
-		cut--
-	}
-	return s[:cut]
-}
+// 截断点落在 UTF-8 字符中间时回退到字符边界，避免出现乱码。
+func trimReason(s string) string { return textutil.Clip(s, 120) }
 
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

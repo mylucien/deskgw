@@ -10,6 +10,7 @@ import (
 
 	"github.com/mylucien/deskgw/internal/host"
 	"github.com/mylucien/deskgw/internal/perfgw"
+	"github.com/mylucien/deskgw/internal/textutil"
 )
 
 // wirePerfConsole 把性能模式接到 API：票据、主机信息、会话记录与审计都
@@ -85,7 +86,7 @@ func (s *Server) perfTicket(w http.ResponseWriter, r *http.Request) {
 	if !permitted {
 		return
 	}
-	if !hasMode(h.Modes, "perf") {
+	if !textutil.HasMode(h.Modes, "perf") {
 		// 没开性能模式的主机不暴露「它存在但不可用」，与 RDP 那边一致。
 		fail(w, http.StatusNotFound, "notFound", "这台主机没有启用性能模式")
 		return
@@ -181,6 +182,7 @@ func (s *Server) perfApprove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var id int64
+	created := false
 	if in.HostID > 0 {
 		h, err := host.Get(s.db, in.HostID)
 		if err != nil {
@@ -189,10 +191,10 @@ func (s *Server) perfApprove(w http.ResponseWriter, r *http.Request) {
 		}
 		id = h.ID
 		// 关联已有主机时把 perf 加进连接方式，否则用户在主机列表里看不到入口。
-		if !hasMode(h.Modes, "perf") {
+		if !textutil.HasMode(h.Modes, "perf") {
 			h.Modes = strings.Trim(h.Modes+",perf", ",")
 			if err := host.Update(s.db, id, h); err != nil {
-				fail(w, http.StatusBadRequest, "invalid", err.Error())
+				fail(w, http.StatusBadRequest, "invalid", userMessage(err))
 				return
 			}
 		}
@@ -209,10 +211,10 @@ func (s *Server) perfApprove(w http.ResponseWriter, r *http.Request) {
 			Group: in.Group, Note: in.Note,
 		}
 		if err := host.Create(s.db, &h); err != nil {
-			fail(w, http.StatusBadRequest, "invalid", err.Error())
+			fail(w, http.StatusBadRequest, "invalid", userMessage(err))
 			return
 		}
-		id = h.ID
+		id, created = h.ID, true
 	}
 
 	if err := host.SetPerfMeta(s.db, id, p.Name, p.OS, p.LastSeen); err != nil {
@@ -220,20 +222,14 @@ func (s *Server) perfApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.perf.Approve(uint32(code), id); err != nil {
-		// 主机行已经写好了，但控制码没换：记录还在待批准列表里，管理员可以重试。
-		fail(w, http.StatusConflict, "conflict", err.Error())
+		// 批准没成功（控制码已经变了、或者主机 id 被占）：把刚建的主机删掉，
+		// 否则管理员每重试一次就多一条重复记录，还得手工清理。
+		if created {
+			_ = host.Delete(s.db, id)
+		}
+		fail(w, http.StatusConflict, "conflict", userMessage(err))
 		return
 	}
 	writeAudit(s, idFromContext(r), "perf.approve", p.Name, p.IP, clientIP(r))
 	ok(w, map[string]any{"host_id": id})
-}
-
-// hasMode 判断连接方式里有没有某一项。
-func hasMode(modes, want string) bool {
-	for _, m := range strings.Split(modes, ",") {
-		if strings.TrimSpace(m) == want {
-			return true
-		}
-	}
-	return false
 }

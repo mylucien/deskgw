@@ -1,8 +1,16 @@
 // 多标签会话状态。凭据仅存内存，标签关闭即清除，不写 localStorage / URL。
-import { reactive } from 'vue'
+import { reactive, ref } from 'vue'
 import type { Credentials } from './rdp'
 
-export const MAX_TABS = 4
+// 标签上限取自服务端的并发配额（/api/me 的 limits.max_sessions）。
+// 默认值只在还没拿到 /me 时兜底；真正的准入由服务端票据接口决定。
+export const maxTabs = ref(2)
+const HARD_MAX_TABS = 32
+
+export function setMaxTabs(n: number) {
+  if (!Number.isFinite(n) || n <= 0) return
+  maxTabs.value = Math.min(Math.round(n), HARD_MAX_TABS)
+}
 
 export interface TabInfo {
   key: string
@@ -22,8 +30,8 @@ export const workspace = reactive<{ tabs: TabInfo[]; active: string }>({
 })
 
 export function openTab(info: Omit<TabInfo, 'key' | 'status'>): TabInfo {
-  if (workspace.tabs.length >= MAX_TABS) {
-    throw new Error(`最多同时打开 ${MAX_TABS} 个会话，请先关闭一个标签`)
+  if (workspace.tabs.length >= maxTabs.value) {
+    throw new Error(`最多同时打开 ${maxTabs.value} 个会话，请先关闭一个标签`)
   }
   const key = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : String(Date.now() + Math.random())
   const tab: TabInfo = { ...info, key, status: 'connecting' }

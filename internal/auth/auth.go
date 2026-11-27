@@ -38,6 +38,11 @@ const (
 	// maxFailureKeysHard 是硬上限：软上限只淘汰未锁定条目，
 	// 涨到硬上限才会动锁定中的条目。灌表挤掉别人锁定的成本因此翻倍。
 	maxFailureKeysHard = maxFailureKeys * 2
+
+	// failureWindow 是失败计数的有效期。没有它，一年多以前累计的 4 次失败
+	// 会和今天的一次输入凑成锁定：正常用户偶发输错也会被逐渐推向锁定，
+	// 而且永远无法恢复。窗口外重新计数。
+	failureWindow = 15 * time.Minute
 )
 
 // argonSlots 限制同时进行的 argon2 计算数量。每次校验要占约 19MB 内存，
@@ -320,6 +325,9 @@ func (m *Manager) bumpLocked(table map[string]*failure, key string, threshold in
 		}
 		f = &failure{}
 		table[key] = f
+	} else if f.count > 0 && now.Sub(f.last) > failureWindow {
+		// 计数太旧：重新开始，不让几年前的失败叠加到这次上。
+		f.count = 0
 	}
 	f.last = now
 	f.count++
@@ -355,6 +363,32 @@ func (m *Manager) Clear(key string) {
 	m.mu.Lock()
 	delete(m.failures, key)
 	m.mu.Unlock()
+}
+
+// ClearIP 清除来源 IP 的跨用户名失败计数。
+// 登录成功说明这个出口不是攻击来源，继续累计只会误伤同一 NAT 后的其他人。
+func (m *Manager) ClearIP(ip string) {
+	if ip == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.ipFailures, ip)
+	m.mu.Unlock()
+}
+
+// RevokeUserExcept 注销某个用户的登录会话，但保留 keepToken。
+// 用户改自己的密码时用它：其余设备上的旧登录要失效，当前这台不该被踢出去。
+func (m *Manager) RevokeUserExcept(userID int64, keepToken string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for tok, s := range m.sessions {
+		if s.UserID == userID && tok != keepToken {
+			delete(m.sessions, tok)
+			n++
+		}
+	}
+	return n
 }
 
 // ActiveSessions 返回当前会话数，供后台状态页使用。

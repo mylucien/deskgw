@@ -25,6 +25,15 @@ func Handler() http.Handler {
 	fileServer := http.FileServer(http.FS(sub))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
+		// 没命中的 /api/* 不能回落到 index.html：前端只会拿到 200 + HTML，
+		// 报出「请求失败 (200)」这种看不出问题的错误。接口就该是 404 JSON。
+		if strings.HasPrefix(p, "api/") {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"ok":false,"error":{"code":"notFound","message":"接口不存在"}}`))
+			return
+		}
 		if p != "" && p != "." {
 			// 只把真实文件交给 FileServer：目录（例如 /assets/）会触发目录列表，
 			// 泄露构建产物清单，这里统一回退到 SPA 首页。

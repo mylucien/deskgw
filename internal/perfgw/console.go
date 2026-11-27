@@ -14,11 +14,13 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/mylucien/deskgw/internal/httpx"
+	"github.com/mylucien/deskgw/internal/textutil"
 )
 
 const (
@@ -67,10 +69,10 @@ type Console struct {
 	tickets *TicketManager
 	limits  *Limits
 
-	// live 是当前在跑的会话（键是 sessions 表的 id），用于僵尸清理判断与
-	// 管理员强制下线。值是关闭这个会话的函数。
+	// live 是当前在跑的会话（键是 sessions 表的 id），用于僵尸清理判断、
+	// 管理员强制下线，以及按用户/主机批量断开。userID 与 hostID 用来匹配。
 	mu   sync.Mutex
-	live map[int64]func()
+	live map[int64]liveConsole
 
 	// Host 按 id 取主机信息，error 表示主机不可用。
 	Host func(id int64) (HostInfo, error)
@@ -84,7 +86,14 @@ type Console struct {
 
 // NewConsole 构造控制台接入点。Host / Begin / End / Audit 由调用方设置。
 func NewConsole(srv *Server, tickets *TicketManager, limits *Limits) *Console {
-	return &Console{srv: srv, tickets: tickets, limits: limits, live: map[int64]func(){}}
+	return &Console{srv: srv, tickets: tickets, limits: limits, live: map[int64]liveConsole{}}
+}
+
+// liveConsole 是一条正在跑的控制台会话。close 用于强制断开。
+type liveConsole struct {
+	userID int64
+	hostID int64
+	close  func()
 }
 
 // LiveIDs 返回当前在跑的会话 id 集合，供僵尸清理判断。
@@ -101,18 +110,43 @@ func (c *Console) LiveIDs() map[int64]bool {
 // CloseSession 强制结束一条会话，返回是否命中。
 func (c *Console) CloseSession(id int64) bool {
 	c.mu.Lock()
-	fn := c.live[id]
+	e := c.live[id]
 	c.mu.Unlock()
-	if fn == nil {
+	if e.close == nil {
 		return false
 	}
-	fn()
+	e.close()
 	return true
 }
 
-func (c *Console) addLive(id int64, fn func()) {
+// CloseHost 断开指向某台主机的全部性能模式会话，返回断开数量。
+func (c *Console) CloseHost(hostID int64) int {
+	return c.closeWhere(func(e liveConsole) bool { return e.hostID == hostID })
+}
+
+// CloseUser 断开某个用户的全部性能模式会话，返回断开数量。
+func (c *Console) CloseUser(userID int64) int {
+	return c.closeWhere(func(e liveConsole) bool { return e.userID == userID })
+}
+
+func (c *Console) closeWhere(match func(liveConsole) bool) int {
 	c.mu.Lock()
-	c.live[id] = fn
+	var targets []func()
+	for _, e := range c.live {
+		if match(e) {
+			targets = append(targets, e.close)
+		}
+	}
+	c.mu.Unlock()
+	for _, fn := range targets {
+		fn()
+	}
+	return len(targets)
+}
+
+func (c *Console) addLive(id, userID, hostID int64, fn func()) {
+	c.mu.Lock()
+	c.live[id] = liveConsole{userID: userID, hostID: hostID, close: fn}
 	c.mu.Unlock()
 }
 
@@ -131,28 +165,7 @@ func (c *Console) Tickets() *TicketManager { return c.tickets }
 var consoleUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 32 * 1024,
-	CheckOrigin:     checkConsoleOrigin,
-}
-
-// checkConsoleOrigin 只接受同源的 http(s) 页面。与 RDP 隧道同一套规则：
-// 挡掉 file:// 与扩展页面，TLS 直连时还要求 Origin 是 https。
-func checkConsoleOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
-	}
-	i := strings.Index(origin, "://")
-	if i < 0 {
-		return false
-	}
-	scheme := strings.ToLower(origin[:i])
-	if scheme != "http" && scheme != "https" {
-		return false
-	}
-	if r.TLS != nil && scheme != "https" {
-		return false
-	}
-	return strings.EqualFold(origin[i+3:], r.Host)
+	CheckOrigin:     httpx.SameOrigin,
 }
 
 // Serve 处理一次控制台连接。调用方已完成登录态校验。
@@ -167,7 +180,7 @@ func (c *Console) Serve(w http.ResponseWriter, r *http.Request, cl ConsoleClient
 		return
 	}
 	info, err := c.Host(tk.HostID)
-	if err != nil || !info.Enabled || !hasMode(info.Modes, "perf") {
+	if err != nil || !info.Enabled || !textutil.HasMode(info.Modes, "perf") {
 		c.failBefore(w, tk, cl, "codeNotFound", "主机不存在或已停用", http.StatusNotFound)
 		return
 	}
@@ -202,7 +215,7 @@ func (c *Console) Serve(w http.ResponseWriter, r *http.Request, cl ConsoleClient
 	started := time.Now()
 	// 被控端托盘上显示的控制端名称用登录名，方便本机用户知道是谁连进来的。
 	intro := browserIntro()
-	if name := clip(cl.Username, 32); name != "" {
+	if name := textutil.Runes(cl.Username, 32); name != "" {
 		intro.name = name
 	}
 	sess, err := c.srv.StartSession(uint32(info.ID), sessionPeer{
@@ -241,7 +254,7 @@ func (c *Console) Serve(w http.ResponseWriter, r *http.Request, cl ConsoleClient
 	c.audit(cl.UserID, "perf.connect", info.Name, cl.ClientIP, cl.ClientIP)
 
 	rl := newRelay(sess, ws, newRateLimiter())
-	c.addLive(tk.SessionID, func() { rl.stop("管理员强制下线") })
+	c.addLive(tk.SessionID, cl.UserID, info.ID, func() { rl.stop("管理员强制下线") })
 	defer c.removeLive(tk.SessionID)
 	done := make(chan struct{})
 	go func() {
@@ -468,14 +481,4 @@ func (c *Console) audit(userID int64, action, target, detail, ip string) {
 	if c.Audit != nil {
 		c.Audit(userID, action, target, detail, ip)
 	}
-}
-
-// hasMode 判断连接方式字符串里有没有某一项。
-func hasMode(modes, want string) bool {
-	for _, m := range strings.Split(modes, ",") {
-		if strings.TrimSpace(m) == want {
-			return true
-		}
-	}
-	return false
 }

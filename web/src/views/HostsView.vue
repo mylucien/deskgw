@@ -6,7 +6,11 @@
         <p class="muted">可访问的局域网 Windows 主机。连接方式在后台「主机管理」中配置。</p>
       </div>
       <div class="filters">
-        <input v-model="query" placeholder="搜索名称 / 地址 / 分组" />
+        <input v-model="query" placeholder="搜索名称 / 地址 / 分组 / 备注" />
+        <button @click="load" :disabled="loading">{{ loading ? '刷新中…' : '刷新' }}</button>
+        <button v-if="workspace.tabs.length" class="primary" @click="backToWorkspace">
+          返回工作区（{{ workspace.tabs.length }}）
+        </button>
       </div>
     </div>
 
@@ -30,7 +34,7 @@
         </dl>
         <div class="host-actions">
           <button class="primary" :disabled="!h.enabled || !modes(h.modes).includes('rdp')"
-            @click="openDialog(h)">连接（RDP）</button>
+            :title="rdpTitle(h)" @click="openDialog(h)">连接（RDP）</button>
           <button v-if="modes(h.modes).includes('perf')"
             :disabled="!h.enabled || perfBusy === h.id"
             :title="h.enabled ? '端到端加密连接，路由器看不到画面' : '主机已停用'"
@@ -64,7 +68,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { get, post } from '../api'
-import { openTab, workspace, MAX_TABS } from '../sessionTabs'
+import { openTab, workspace, maxTabs } from '../sessionTabs'
 import { openPerf } from '../perf'
 
 interface Host {
@@ -93,6 +97,12 @@ const filtered = computed(() => {
 })
 function modes(s: string) { return s.split(',').map(x => x.trim()).filter(Boolean) }
 function modeName(m: string) { return m === 'perf' ? '性能模式' : 'RDP' }
+// 只有性能模式的主机没有 RDP 入口，灰掉的按钮必须说清原因。
+function rdpTitle(h: Host) {
+  if (!h.enabled) return '主机已停用'
+  if (!modes(h.modes).includes('rdp')) return '这台主机只启用了性能模式，请用右侧按钮连接'
+  return '通过网关建立 RDP 隧道'
+}
 
 function openDialog(h: Host) {
   target.value = h
@@ -109,8 +119,8 @@ function closeDialog() {
 
 async function submit() {
   if (!target.value || submitting.value) return
-  if (workspace.tabs.length >= MAX_TABS) {
-    dialogError.value = `最多同时打开 ${MAX_TABS} 个会话，请先关闭一个标签`
+  if (workspace.tabs.length >= maxTabs.value) {
+    dialogError.value = `最多同时打开 ${maxTabs.value} 个会话，请先关闭一个标签`
     return
   }
   submitting.value = true
@@ -152,14 +162,13 @@ async function startPerf(h: Host) {
   }
 }
 
-onMounted(async () => {
-  // ?depth=32 是临时的色深 A/B 开关。凭据不落 URL，会话页也就没有 query，
-  // 所以在这里把选择记进 sessionStorage，由连接时读取。
-  const depthQuery = new URLSearchParams(window.location.search).get('depth')
-  if (depthQuery === '32' || depthQuery === '16') {
-    try { sessionStorage.setItem('deskgw.depth', depthQuery) } catch { /* 隐私模式 */ }
-  }
+// 离开会话页只隐藏、不卸载（App.vue 对 /session 用了 keep-alive），
+// 所以从主机列表回到工作区不会重连，标签仍旧可用。
+function backToWorkspace() {
+  router.push({ name: 'session' })
+}
 
+onMounted(async () => {
   // 空闲时预热 WASM：4.4MB 的下载与编译压在点「连接」之后会白等半秒到一秒。
   // 用动态导入，主机列表页的首屏 bundle 不必为它多背一份胶水代码；延迟 1.2s
   // 是为了不和列表请求、首屏渲染抢带宽。失败留给真正连接时再报。
@@ -168,10 +177,20 @@ onMounted(async () => {
     if ((navigator as any).connection?.saveData) return
     void import('../rdp').then((m) => m.ensureWasm()).catch(() => {})
   }, 1200)
-  try { hosts.value = await get<Host[]>('/hosts') }
-  catch (e: any) { error.value = e.message }
-  finally { loading.value = false }
+  await load()
 })
+
+async function load() {
+  loading.value = true
+  try {
+    hosts.value = await get<Host[]>('/hosts')
+    error.value = ''
+  } catch (e: any) {
+    error.value = e.message
+  } finally {
+    loading.value = false
+  }
+}
 </script>
 
 <style scoped>

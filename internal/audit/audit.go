@@ -4,6 +4,7 @@ package audit
 import (
 	"database/sql"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -59,11 +60,19 @@ func buildQuery(userID int64, action, keyword string) (string, []any) {
 		args = append(args, action)
 	}
 	if keyword != "" {
-		q += ` AND (a.target LIKE ? OR a.detail LIKE ? OR u.username LIKE ?)`
-		kw := "%" + keyword + "%"
+		q += ` AND (a.target LIKE ? ESCAPE '\' OR a.detail LIKE ? ESCAPE '\' OR u.username LIKE ? ESCAPE '\')`
+		kw := "%" + escapeLike(keyword) + "%"
 		args = append(args, kw, kw, kw)
 	}
 	return q, args
+}
+
+// escapeLike 转义 LIKE 的通配符。
+// 不转义时搜 "_" 会匹配任意单字符、搜 "%" 会匹配全部记录，
+// 用户以为在做精确搜索，实际拿到的是整张表。
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 func scanEvent(s interface{ Scan(dest ...any) error }) (Event, error) {
@@ -111,15 +120,13 @@ func List(db *sql.DB, userID int64, action, keyword string, limit, offset int) (
 // 审计写入全部堵死。这里按主键倒序分批，每批读进内存后立即关闭 rows，
 // 连接归还后再交给回调慢慢写；单批上限几百行，内存可以忽略。
 func Each(db *sql.DB, userID int64, action, keyword string, limit int, fn func(Event) error) error {
-	if limit <= 0 || limit > 200000 {
-		limit = 200000
-	}
+	// limit <= 0 表示不设上限：导出必须给出完整数据，README 承诺过「不截断」。
 	const batchSize = 500
 	lastID := int64(math.MaxInt64)
 	remaining := limit
-	for remaining > 0 {
+	for {
 		n := batchSize
-		if remaining < n {
+		if remaining > 0 && remaining < n {
 			n = remaining
 		}
 		q, args := buildQuery(userID, action, keyword)
@@ -138,12 +145,16 @@ func Each(db *sql.DB, userID int64, action, keyword string, limit int, fn func(E
 			}
 		}
 		lastID = batch[len(batch)-1].ID
-		remaining -= len(batch)
+		if remaining > 0 {
+			remaining -= len(batch)
+			if remaining <= 0 {
+				return nil
+			}
+		}
 		if len(batch) < n {
 			return nil
 		}
 	}
-	return nil
 }
 
 func queryEvents(db *sql.DB, q string, args ...any) ([]Event, error) {

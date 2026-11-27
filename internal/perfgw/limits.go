@@ -46,12 +46,21 @@ func NewLimits(max, perHost int) *Limits {
 }
 
 // Set 修改上限。已经占用的名额不受影响，新限额立即对后续连接生效。
+//
+// 超出硬上限时夹到硬上限，而不是退回默认值：后台填了 9 就悄悄变成 1，
+// 管理员只会看到「每台主机仍然只能开一个」却查不到原因。
 func (l *Limits) Set(max, perHost int) {
-	if max <= 0 || max > hardMaxSessions {
+	if max <= 0 {
 		max = defaultMaxSessions
 	}
-	if perHost <= 0 || perHost > hardMaxPerHost {
+	if max > hardMaxSessions {
+		max = hardMaxSessions
+	}
+	if perHost <= 0 {
 		perHost = defaultMaxPerHost
+	}
+	if perHost > hardMaxPerHost {
+		perHost = hardMaxPerHost
 	}
 	if perHost > max {
 		perHost = max

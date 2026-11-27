@@ -152,14 +152,6 @@ var schemaV1 = []string{
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	)`,
-	`CREATE TABLE IF NOT EXISTS perf_pending (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL DEFAULT '',
-		os TEXT NOT NULL DEFAULT '',
-		ip TEXT NOT NULL DEFAULT '',
-		first_seen INTEGER NOT NULL,
-		last_seen INTEGER NOT NULL
-	)`,
 	`CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(ts)`,
 	`CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state)`,
 }

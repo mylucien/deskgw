@@ -8,7 +8,6 @@ import init, {
   DeviceEvent,
   InputTransaction,
   RotationUnit,
-  setColorDepth,
 } from './wasm/pkg/ironrdp_web.js'
 import type { Session, SessionTerminationInfo } from './wasm/pkg/ironrdp_web.js'
 
@@ -169,6 +168,13 @@ export function isLogonFailure(e: unknown): boolean {
   return /LogonFailure|STATUS_LOGON_FAILURE|0xc000006d/i.test(describeError(e))
 }
 
+// 目标机证书指纹与本地记录不一致。Windows 自签 RDP 证书会随系统策略轮换，
+// 轮换后所有客户端都会连不上；界面要提供「信任新证书」的出口，
+// 否则用户只能清掉整个站点的数据。
+export function isFingerprintMismatch(e: unknown): boolean {
+  return /指纹已变化|fingerprint mismatch|fingerprint changed/i.test(describeError(e))
+}
+
 // 远端桌面尺寸不能直接用浏览器 CSS 像素：手机 DPR 高、CSS 尺寸小（例如 390×780），
 // 这个值会被 Windows 收缩到最小分辨率，画面比例也对不上容器。这里按容器宽高比换算，
 // 短边不低于 640，长边不超过 maxLong，8 像素对齐（RDP 桌面尺寸的常见约束）。
@@ -223,17 +229,7 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   // 就绪后再补这一行日志。
   const healthDone = reportServerVersion(log)
 
-  // 临时 A/B 开关：主机列表页带 ?depth=32 打开一次，选择会记在 sessionStorage
-  // 里供后续连接读取。服务器只在 32bpp 会话里真正下发 RemoteFX 帧，16bpp 下
-  // 能力集里宣告的 RemoteFX 不会生效。默认 16，保持既有行为直到实测确认。
-  let depth = '16'
-  try { depth = sessionStorage.getItem('deskgw.depth') || '16' } catch { /* 隐私模式 */ }
-  const wideColor = depth === '32'
-
   await ensureWasm()
-  // 必须在 wasm 初始化之后调用：这些导出函数直接操作实例内存。
-  setColorDepth(wideColor ? 32 : 16)
-  if (wideColor) log('info', '色深 32 位（RemoteFX 实验），文字边缘轻微变软表示编码器已生效')
   await healthDone
   log('info', '正在初始化 RDP 协议栈')
 

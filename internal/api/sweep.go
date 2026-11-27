@@ -81,14 +81,33 @@ func (s *Server) finishSession(id int64, state string) {
 	}
 }
 
+// sessionRetentionDays 是会话记录的保留天数。
+//
+// sessions 表原来只增不减：每次连接留一行，路由器闪存有限，几年后
+// 后台的会话列表和计数查询都会被这张表拖慢。审计留 90 天，会话记录
+// 同样按 90 天清理，需要长期留存的证据看审计。
+const sessionRetentionDays = 90
+
+// purgeOldSessions 删除超过保留期的会话记录。
+func (s *Server) purgeOldSessions() {
+	cutoff := time.Now().AddDate(0, 0, -sessionRetentionDays).Unix()
+	_, _ = s.db.Exec(`DELETE FROM sessions WHERE COALESCE(ended_at, started_at) < ?`, cutoff)
+}
+
 // startSessionSweeper 先同步清理一次遗留记录，再启动周期扫描。
 func (s *Server) startSessionSweeper() {
 	s.sweepOnStartup()
+	s.purgeOldSessions()
 	go func() {
 		ticker := time.NewTicker(sweepInterval)
 		defer ticker.Stop()
+		lastPurge := time.Now()
 		for range ticker.C {
 			s.sweepStaleSessions()
+			if time.Since(lastPurge) >= 24*time.Hour {
+				lastPurge = time.Now()
+				s.purgeOldSessions()
+			}
 		}
 	}()
 }

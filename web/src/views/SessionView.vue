@@ -33,7 +33,7 @@
       role="dialog" aria-label="会话菜单" ref="panelEl">
       <div class="p-top">
         <span class="p-cap">会话</span>
-        <span class="p-ver">{{ workspace.tabs.length }} / {{ MAX_TABS }}</span>
+        <span class="p-ver">{{ workspace.tabs.length }} / {{ maxTabs }}</span>
         <button class="p-x" @click="closeMenu()" aria-label="收起">×</button>
       </div>
 
@@ -48,7 +48,7 @@
       </div>
       <p v-else class="p-empty">没有打开的会话</p>
 
-      <button class="p-add" :disabled="workspace.tabs.length >= MAX_TABS" @click="goHosts">＋ 新建连接</button>
+      <button class="p-add" :disabled="workspace.tabs.length >= maxTabs" @click="goHosts">＋ 新建连接</button>
 
       <template v-if="api && workspace.tabs.length">
         <div class="p-div">当前会话</div>
@@ -95,7 +95,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowReactive } from 'vue'
 import { useRouter } from 'vue-router'
 import RdpCanvas from './RdpCanvas.vue'
-import { workspace, closeTab, closeAllTabs, MAX_TABS } from '../sessionTabs'
+import { workspace, closeTab, closeAllTabs, maxTabs } from '../sessionTabs'
 import type { TabInfo } from '../sessionTabs'
 
 // RdpCanvas 通过 defineExpose 暴露的操作面。状态仍归各标签所有，
@@ -317,14 +317,16 @@ function close(key: string) {
 }
 function goHosts() {
   menuOpen.value = false
-  if (workspace.tabs.length >= MAX_TABS) {
-    notice.value = `最多同时打开 ${MAX_TABS} 个会话，请先关闭一个标签`
+  // 离开会话页不会再卸载标签（App.vue 对 /session 用了 keep-alive），
+  // 所以这里只做上限提示，不再顺手清空工作区。
+  if (workspace.tabs.length >= maxTabs.value) {
+    notice.value = `最多同时打开 ${maxTabs.value} 个会话，请先关闭一个标签`
     return
   }
   router.push({ name: 'hosts' })
 }
-// 离开工作区会卸载全部 RdpCanvas，WASM 会话与票据随之失效。
-// 因此退出即结束所有会话，避免留下点开就报错的死标签。
+// 「退出工作区」是明确表达「结束全部会话」的入口（面板里单独一个按钮），
+// 与「去主机列表新建连接」区分开：后者保留现有标签。
 function exitWorkspace() {
   menuOpen.value = false
   closeAllTabs()
@@ -351,7 +353,15 @@ function onKey(e: KeyboardEvent) {
 }
 
 onMounted(() => {
-  if (workspace.tabs.length >= MAX_TABS) notice.value = `最多同时打开 ${MAX_TABS} 个会话`
+  if (workspace.tabs.length >= maxTabs.value) notice.value = `最多同时打开 ${maxTabs.value} 个会话`
+  // 悬浮按钮被隐藏后只剩一条 16px 的把手，下次进来没有任何提示，
+  // 用户会以为入口丢了。进入会话页时提示一次，点把手即可恢复。
+  if (fabHidden.value && !notice.value) {
+    notice.value = '悬浮按钮已隐藏，点屏幕边缘的细条可恢复'
+    window.setTimeout(() => {
+      if (notice.value === '悬浮按钮已隐藏，点屏幕边缘的细条可恢复') notice.value = ''
+    }, 5000)
+  }
   readSafeBottom()
   const savedPos = localStorage.getItem(POS_KEY)
   if (savedPos) {

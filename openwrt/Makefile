@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=deskgw
-PKG_VERSION:=0.3.36
+PKG_VERSION:=0.3.37
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=mylucien
@@ -87,6 +87,15 @@ define Package/deskgw/postinst
 	[ -x /etc/uci-defaults/95-deskgw ] && /etc/uci-defaults/95-deskgw || true
 	/etc/init.d/deskgw enable
 	/etc/init.d/deskgw restart
+}
+exit 0
+endef
+
+define Package/deskgw/prerm
+#!/bin/sh
+# 卸载时还原内核 UDP 缓冲参数：安装时写进去的 sysctl 块不该留在系统里。
+[ -n "$${IPKG_INSTROOT}" ] || {
+	[ -x /usr/libexec/deskgw/udp-tune.sh ] && /usr/libexec/deskgw/udp-tune.sh 0 >/dev/null 2>&1
 }
 exit 0
 endef

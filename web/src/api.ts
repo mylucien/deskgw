@@ -5,14 +5,30 @@ function csrf(): string {
 
 export interface ApiError extends Error {
   code?: string
+  status?: number
+  /** 服务端附带的错误详情（例如分片上传期望的 offset）。 */
+  data?: any
 }
 
-// 登录态在服务端滑动过期；任一接口返回 401 说明会话已失效，
-// 直接回登录页，避免页面停留在"看似可用、点击全失败"的状态。
-function redirectIfUnauthorized(status: number) {
-  if (status !== 401) return
+// 只有「登录态失效」才回登录页。
+//
+// 原实现把任何 401 都当成登录过期：文件接口用 401 表示令牌过期或关联会话
+// 已结束，上传中关掉文件面板就触发整页跳转，所有标签的远程会话一起断开。
+// 现在文件接口改用 403/410，这里也只认 code=unauthorized。
+function redirectIfUnauthorized(status: number, code?: string) {
+  if (status !== 401 || code !== 'unauthorized') return
   if (location.pathname === '/login') return
   location.assign('/login')
+}
+
+function toError(res: Response, payload: any, fallback: string): ApiError {
+  const code = payload?.error?.code
+  redirectIfUnauthorized(res.status, code)
+  const err: ApiError = new Error(payload?.error?.message || `${fallback} (${res.status})`)
+  err.code = code
+  err.status = res.status
+  err.data = payload?.error
+  return err
 }
 
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
@@ -28,12 +44,7 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
   })
   let payload: any
   try { payload = await res.json() } catch { payload = null }
-  if (!res.ok || !payload?.ok) {
-    redirectIfUnauthorized(res.status)
-    const err: ApiError = new Error(payload?.error?.message || `请求失败 (${res.status})`)
-    err.code = payload?.error?.code
-    throw err
-  }
+  if (!res.ok || !payload?.ok) throw toError(res, payload, '请求失败')
   return payload.data as T
 }
 
@@ -52,11 +63,6 @@ export async function uploadChunk<T = any>(p: string, chunk: Blob, headers: Reco
   const res = await fetch('/api' + p, { method: 'POST', headers: h, body: chunk, credentials: 'same-origin' })
   let payload: any
   try { payload = await res.json() } catch { payload = null }
-  if (!res.ok || !payload?.ok) {
-    redirectIfUnauthorized(res.status)
-    const err: ApiError = new Error(payload?.error?.message || `上传失败 (${res.status})`)
-    err.code = payload?.error?.code
-    throw err
-  }
+  if (!res.ok || !payload?.ok) throw toError(res, payload, '上传失败')
   return payload.data as T
 }

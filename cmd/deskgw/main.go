@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -56,6 +57,10 @@ func run(cfg config.Config) error {
 	if err := ensureInitialUser(st.DB, cfg); err != nil {
 		return err
 	}
+	// 把 UCI 的值作为「首次默认值」写进数据库。之后以数据库为准：
+	// 两个来源各存一份、谁优先说不清，正是「后台保存过一次，LuCI 就永远失效」
+	// 这类问题的根源。现在语义明确：UCI 只在没有数据库记录时生效。
+	seedSettings(st.DB, cfg)
 	certFile, keyFile, err := ensureCert(cfg)
 	if err != nil {
 		return err
@@ -140,25 +145,39 @@ func run(cfg config.Config) error {
 	}()
 
 	if cfg.RedirectListen != "" {
+		// 跳转只是便利功能：端口被占、权限不足时只记日志，不能让整个网关退出。
+		// 原实现把它接进 errCh，80 端口被 LuCI（uhttpd）占用时服务就起不来。
+		redir := &http.Server{
+			Addr: cfg.RedirectListen,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// 端口一律取 HTTPS 的实际监听端口，不能沿用请求里的端口：
+				// HTTP 跳转监听 8080 时，请求 Host 是 :8080，而 HTTPS 在 :8443。
+				host := r.Host
+				if h, _, err := net.SplitHostPort(host); err == nil {
+					host = h
+				}
+				host = strings.Trim(host, "[]")
+				if _, port, err := net.SplitHostPort(cfg.Listen); err == nil && port != "" && port != "443" {
+					// JoinHostPort 会给 IPv6 补方括号；手工拼字符串会得到
+					// https://fe80::1:8443 这种无法解析的地址。
+					host = net.JoinHostPort(host, port)
+				} else if strings.Contains(host, ":") {
+					host = "[" + host + "]"
+				}
+				http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
+			}),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
 		go func() {
-			redir := &http.Server{
-				Addr: cfg.RedirectListen,
-				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					// 端口一律取 HTTPS 的实际监听端口，不能沿用请求里的端口：
-					// HTTP 跳转监听 8080 时，请求 Host 是 :8080，而 HTTPS 在 :8443。
-					host := r.Host
-					if h, _, err := net.SplitHostPort(host); err == nil {
-						host = h
-					}
-					if _, port, err := net.SplitHostPort(cfg.Listen); err == nil && port != "" && port != "443" {
-						host = net.JoinHostPort(host, port)
-					}
-					http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
-				}),
-				ReadHeaderTimeout: 5 * time.Second,
-			}
 			log.Printf("deskgw HTTP 跳转已启动: %s", cfg.RedirectListen)
-			errCh <- redir.ListenAndServe()
+			if err := redir.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("警告: HTTP 跳转监听失败（不影响主服务）: %v", err)
+			}
+		}()
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = redir.Shutdown(ctx)
 		}()
 	}
 
@@ -175,6 +194,23 @@ func run(cfg config.Config) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return srv.Shutdown(ctx)
+}
+
+// seedSettings 在设置表里补齐缺失项，值取自 UCI（经环境变量传入）。
+// 已存在的键不动：管理员在后台改过之后，重启不能把值又拉回 UCI 的旧值。
+func seedSettings(db *sql.DB, cfg config.Config) {
+	defaults := map[string]string{
+		"session_idle_min":  strconv.Itoa(cfg.SessionIdleMin),
+		"max_upload_mb":     strconv.Itoa(cfg.MaxUploadMB),
+		"perf.max_sessions": "2",
+		"perf.max_per_host": "1",
+	}
+	for k, v := range defaults {
+		if _, err := db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO NOTHING`, k, v); err != nil {
+			log.Printf("警告: 写入默认设置 %s 失败: %v", k, err)
+		}
+	}
 }
 
 // ensureInitialUser 在没有用户时创建初始管理员。

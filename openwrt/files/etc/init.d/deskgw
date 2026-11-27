@@ -34,8 +34,10 @@ start_service() {
 	config_get perf_udp_buf_mb main perf_udp_buf_mb '8'
 
 	# 性能模式的 UDP 缓冲：由 helper 写入内核并持久化到 /etc/sysctl.conf。
+	# 只在性能模式开启时才动内核参数：普通模式下每次启动都改 net.core.*mem_max
+	# 并往 sysctl.conf 里写块，属于没有收益的副作用。
 	# helper 失败只记日志，不让网关服务起不来。
-	if [ "$perf_udp_tune" -eq 1 ]; then
+	if [ "$perf_enabled" -eq 1 ] && [ "$perf_udp_tune" -eq 1 ]; then
 		/usr/libexec/deskgw/udp-tune.sh "$perf_udp_buf_mb" || echo "deskgw: UDP 缓冲设置失败" >&2
 	else
 		/usr/libexec/deskgw/udp-tune.sh 0 >/dev/null 2>&1 || true

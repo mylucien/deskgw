@@ -94,21 +94,23 @@ func TestTicketUnknownToken(t *testing.T) {
 	}
 }
 
-// 新连接建立时只收掉指向同一主机的旧隧道，别的目标和它自己都要留着。
+// 新连接只收掉「同一用户 + 同一主机」的旧隧道：别的目标、别的用户、
+// 以及它自己都要留着。按主机关闭会把别人正在用的会话一起踢掉。
 func TestSupersedeHost(t *testing.T) {
 	g := NewGateway(nil, nil, nil, nil)
 	var closed []int64
-	mk := func(id, hostID int64) {
-		e := &liveSession{id: id, hostID: hostID}
+	mk := func(id, hostID, userID int64) {
+		e := &liveSession{id: id, hostID: hostID, userID: userID}
 		e.closeFn = func() { closed = append(closed, id) }
 		g.addLive(e)
 	}
-	mk(1, 100) // 同主机旧隧道，应被关闭
-	mk(2, 100) // 本次新连接，应保留
-	mk(3, 200) // 其他主机，应保留
+	mk(1, 100, 7) // 同一用户、同一主机的旧隧道，应被关闭
+	mk(2, 100, 7) // 本次新连接，应保留
+	mk(3, 200, 7) // 其他主机，应保留
+	mk(4, 100, 8) // 另一个用户连同一台主机，应保留
 
-	if n := g.supersedeHost(100, 2); n != 1 {
-		t.Fatalf("应关闭 1 条同主机旧隧道，实际 %d", n)
+	if n := g.supersedeHost(100, 7, 2); n != 1 {
+		t.Fatalf("应关闭 1 条同用户同主机旧隧道，实际 %d", n)
 	}
 	if len(closed) != 1 || closed[0] != 1 {
 		t.Fatalf("应只关闭 id=1，实际 %v", closed)

@@ -14,7 +14,7 @@ import (
 func base() host.Host {
 	return host.Host{
 		Name: "office-pc", Address: "192.168.1.10",
-		RDPPort: 3389, SBMPort: 445, Enabled: true, Modes: "rdp",
+		RDPPort: 3389, SMBPort: 445, Enabled: true, Modes: "rdp",
 	}
 }
 
@@ -69,7 +69,7 @@ func TestValidateFields(t *testing.T) {
 		{"名称过长", func(h *host.Host) { h.Name = strings.Repeat("a", 65) }, false},
 		{"RDP 端口为 0", func(h *host.Host) { h.RDPPort = 0 }, false},
 		{"RDP 端口越界", func(h *host.Host) { h.RDPPort = 65536 }, false},
-		{"SMB 端口越界", func(h *host.Host) { h.SBMPort = 70000 }, false},
+		{"SMB 端口越界", func(h *host.Host) { h.SMBPort = 70000 }, false},
 		{"方式未知", func(h *host.Host) { h.Modes = "vnc" }, false},
 		{"多方式带空格", func(h *host.Host) { h.Modes = "rdp, perf" }, true},
 	}

@@ -11,6 +11,16 @@
             <div v-if="logs.length" class="logbox">
               <p v-for="(l, i) in logs" :key="i" class="logline">[{{ l.level }}] {{ l.message }}</p>
             </div>
+            <div v-if="canReconnect" class="overlay-actions">
+              <!-- 指纹变了要给出明确出口，否则只能去清站点数据 -->
+              <button v-if="fpMismatch" class="primary" :disabled="reconnecting" @click="trustCert">
+                {{ reconnecting ? '重连中…' : '信任新证书并重连' }}
+              </button>
+              <button :class="{ primary: !fpMismatch }" :disabled="reconnecting" @click="reconnect">
+                {{ reconnecting ? '重连中…' : '重新连接' }}
+              </button>
+              <button v-if="fpMismatch" @click="close">关闭标签</button>
+            </div>
           </div>
         </div>
       </div>
@@ -21,7 +31,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { connectRdp, describeError, isLogonFailure, pickDesktopSize, resolveWsUrl } from '../rdp'
+import { connectRdp, describeError, isFingerprintMismatch, isLogonFailure, pickDesktopSize, resolveWsUrl } from '../rdp'
 import type { InputMode, RdpSession } from '../rdp'
 import { post } from '../api'
 import { closeTab, wipeCreds } from '../sessionTabs'
@@ -45,6 +55,12 @@ const logs = ref<{ level: string; message: string }[]>([])
 const showFiles = ref(false)
 // iOS Safari（iPhone）没有网页全屏 API，退化成分页内的沉浸模式。
 const immersive = ref(false)
+// 连接失败或远端结束后保留标签与内存中的凭据，允许一键重连：
+// 之前「已断开」状态从未被赋值，正常退出也显示成「连接失败」，
+// 用户只能重新走一遍主机列表 + 输密码。
+const canReconnect = ref(false)
+const fpMismatch = ref(false)
+const reconnecting = ref(false)
 let session: RdpSession | null = null
 // 自动重试是异步的，期间组件可能已被卸载，落笔前要检查。
 let unmounted = false
@@ -224,17 +240,18 @@ async function connectWithRetry(): Promise<RdpSession> {
   }
 }
 
-onMounted(async () => {
-  window.addEventListener('resize', scheduleFit)
-  document.addEventListener('fullscreenchange', onFullscreenChange)
-  await nextTick()
-  fitViewport()
+// 建立会话。首次连接与之后的重连走同一条路径。
+async function connect() {
   const creds = props.tab.creds
   if (!props.tab.wsPath || !creds.username || !creds.password) {
     props.tab.status = 'error'
     detail.value = '连接信息缺失，请从主机列表重新发起连接'
     return
   }
+  props.tab.status = 'connecting'
+  detail.value = '正在建立 RDP 隧道…'
+  canReconnect.value = false
+  fpMismatch.value = false
   try {
     addLog('info', '正在加载 RDP 协议组件…')
     const s = await connectWithRetry()
@@ -248,16 +265,50 @@ onMounted(async () => {
     s.terminated.then((reason) => {
       if (session === s) session = null
       connected.value = false
-      if (props.tab.status !== 'disconnected') {
-        props.tab.status = 'error'
-        detail.value = '会话已结束：' + reason
-      }
+      if (unmounted) return
+      // 远端关会话、网络中断都会走到这里。标签留着，凭据也还在内存里。
+      props.tab.status = 'disconnected'
+      detail.value = '会话已结束：' + reason
+      canReconnect.value = true
     })
   } catch (e: unknown) {
     props.tab.status = 'error'
     detail.value = '连接失败：' + (describeError(e) || '未知错误')
+    fpMismatch.value = isFingerprintMismatch(e)
+    canReconnect.value = true
     addLog('error', detail.value)
   }
+}
+
+// 重连要换一张新票据：旧票据是一次性的，而且失败的那次已经收尾了。
+async function reconnect() {
+  if (reconnecting.value) return
+  reconnecting.value = true
+  try {
+    const t = await post<SessionTicket>('/sessions', { host_id: props.tab.hostId })
+    props.tab.sessionId = t.session_id
+    props.tab.wsPath = t.ws_path
+    logs.value = []
+    await connect()
+  } catch (e: any) {
+    detail.value = '重连失败：' + (e.message || '未知错误')
+  } finally {
+    reconnecting.value = false
+  }
+}
+
+// 信任目标机的新证书：清掉本地记录后按 TOFU 重新取指纹。
+function trustCert() {
+  try { localStorage.removeItem('deskgw.cert.host-' + props.tab.hostId) } catch { /* 隐私模式 */ }
+  void reconnect()
+}
+
+onMounted(async () => {
+  window.addEventListener('resize', scheduleFit)
+  document.addEventListener('fullscreenchange', onFullscreenChange)
+  await nextTick()
+  fitViewport()
+  await connect()
 })
 
 onBeforeUnmount(() => {
@@ -291,4 +342,6 @@ canvas { display: block; max-width: 100%; max-height: 100%; width: auto; height:
 .logbox { background: #101216; border-radius: 8px; padding: 10px; max-height: 160px;
   overflow: auto; text-align: left; margin-top: 12px; }
 .logline { margin: 0 0 3px; font: 12px/1.5 ui-monospace, monospace; color: #9ca3af; }
+.overlay-actions { display: flex; justify-content: center; gap: 8px; margin-top: 14px; }
+.overlay-actions button { padding: 7px 14px; font-size: 13px; }
 </style>

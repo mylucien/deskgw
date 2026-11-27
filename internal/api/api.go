@@ -23,6 +23,7 @@ import (
 	"github.com/mylucien/deskgw/internal/filegw"
 	"github.com/mylucien/deskgw/internal/host"
 	"github.com/mylucien/deskgw/internal/perfgw"
+	"github.com/mylucien/deskgw/internal/textutil"
 	"github.com/mylucien/deskgw/internal/tunnel"
 	"github.com/mylucien/deskgw/internal/user"
 	"github.com/mylucien/deskgw/web"
@@ -31,12 +32,19 @@ import (
 const sessionCookie = "deskgw_session"
 const csrfCookie = "deskgw_csrf"
 
+// defaultMaxSessions 与 users 表的默认值一致。
+const defaultMaxSessions = 2
+
+// maxSessionsHard 与后台输入框、Limits 的上限保持一致，
+// 避免 UI 允许填 32、服务端却按 8 处理。
+const maxSessionsHard = 32
+
 // dummyHash 是格式合法的 argon2id 串（原始哈希全零），仅用于用户名不存在时
 // 消耗与真实校验相同的 CPU 时间，消除可枚举用户的时序差异。
 const dummyHash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 // serverVersion 与 openwrt/Makefile 的 PKG_VERSION 保持一致，CI 会校验两者相同。
-const serverVersion = "0.3.36"
+const serverVersion = "0.3.37"
 
 // exportWriteTimeout 是审计导出每批写入的时限。客户端停止读取时，
 // 写操作会一直阻塞，handler 和数据库连接都释放不掉。
@@ -115,6 +123,7 @@ func New(db *sql.DB, mgr *auth.Manager, cfg config.Config, perf *perfgw.Server) 
 		r.Use(s.requireSession)
 		r.Use(s.requireCSRF)
 		r.Post("/api/logout", s.logout)
+		r.Post("/api/password", s.changePassword)
 		r.Get("/api/me", s.me)
 		r.Get("/api/hosts", s.myHosts)
 		r.Post("/api/sessions", s.createSession)
@@ -286,7 +295,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnauthorized, "invalidCredentials", "用户名或密码错误")
 		return
 	}
+	// 成功登录同时清掉两个维度：账号维度的连续失败，以及该出口 IP 的累计失败。
+	// 后者不清的话，同一个 NAT 后的正常用户会被别人的爆破拖到 50 次锁定。
 	s.auth.Clear(key)
+	s.auth.ClearIP(ip)
 	tok, err := s.auth.Create(u.ID, u.Username, u.Role)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "serverError", "创建会话失败")
@@ -316,7 +328,51 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnauthorized, "unauthorized", "用户已不存在")
 		return
 	}
-	ok(w, map[string]any{"user": u, "csrf": csrfFrom(r.Context())})
+	// 前端的标签数上限必须与后端的并发配额一致，否则会出现「面板显示 4 个、
+	// 第 3 个就被服务端拒绝」的矛盾。这里把生效值一并返回。
+	limit := u.MaxSessions
+	if limit <= 0 {
+		limit = defaultMaxSessions
+	}
+	ok(w, map[string]any{
+		"user": u, "csrf": csrfFrom(r.Context()),
+		"limits": map[string]any{"max_sessions": limit},
+	})
+}
+
+// changePassword 让登录用户改自己的密码。管理员给他人改密走 updateUser，
+// 但普通用户没有自助入口时只能找管理员，README 承诺过这一点。
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
+	sess := fromContext(r.Context())
+	var in struct {
+		Old string `json:"old_password"`
+		New string `json:"new_password"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		fail(w, http.StatusBadRequest, "badRequest", "请求格式不正确")
+		return
+	}
+	if len(in.New) < 8 {
+		fail(w, http.StatusBadRequest, "invalid", "新密码至少 8 位")
+		return
+	}
+	u, hash, err := user.GetByUsername(s.db, sess.Username)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if !auth.VerifyPassword(hash, in.Old) {
+		fail(w, http.StatusForbidden, "invalidCredentials", "当前密码不正确")
+		return
+	}
+	if err := user.SetPassword(s.db, u.ID, in.New); err != nil {
+		fail(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+	// 旧密码签发的其他登录态一并失效，只保留当前这台。
+	s.auth.RevokeUserExcept(u.ID, sess.Token)
+	writeAudit(s, u.ID, "user.password", u.Username, "self", clientIP(r))
+	ok(w, map[string]any{})
 }
 
 // createSession 校验权限与并发上限后签发一次性 RDP 连接票据。
@@ -389,7 +445,10 @@ func (s *Server) newPendingSession(w http.ResponseWriter, sess *auth.Session, ho
 	}
 	limit := u.MaxSessions
 	if limit <= 0 {
-		limit = 2
+		limit = defaultMaxSessions
+	}
+	if limit > maxSessionsHard {
+		limit = maxSessionsHard
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -486,11 +545,15 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.MaxSessions <= 0 {
-		in.MaxSessions = 2
+		in.MaxSessions = defaultMaxSessions
+	}
+	if in.MaxSessions > maxSessionsHard {
+		fail(w, http.StatusBadRequest, "invalid", "并发会话上限须在 1–32 之间")
+		return
 	}
 	id, err := user.Create(s.db, inputToUser(in), in.Password, in.HostIDs)
 	if err != nil {
-		fail(w, http.StatusBadRequest, "invalid", err.Error())
+		fail(w, http.StatusBadRequest, "invalid", userMessage(err))
 		return
 	}
 	writeAudit(s, idFromContext(r), "user.create", in.Username, "", clientIP(r))
@@ -509,7 +572,11 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if in.MaxSessions <= 0 {
-		in.MaxSessions = 2
+		in.MaxSessions = defaultMaxSessions
+	}
+	if in.MaxSessions > maxSessionsHard {
+		fail(w, http.StatusBadRequest, "invalid", "并发会话上限须在 1–32 之间")
+		return
 	}
 	target, err := user.Get(s.db, id)
 	if err != nil {
@@ -535,7 +602,20 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 	// 角色、启用状态或密码变化后，旧登录态必须失效：
 	// 会话里缓存了角色，降权后旧 Cookie 仍能访问管理接口。
 	if !in.Enabled || in.Role != target.Role || in.Password != "" {
-		s.auth.RevokeUser(id)
+		if sess := fromContext(r.Context()); sess != nil && sess.UserID == id {
+			// 管理员改自己的密码：保留当前这台的登录态，其余设备踢掉。
+			s.auth.RevokeUserExcept(id, sess.Token)
+		} else {
+			s.auth.RevokeUser(id)
+		}
+	}
+	// 停用或降权后，已经建立的远程会话也要断开：否则被停用的账号可以
+	// 继续用旧标签操作远端的桌面，直到自己关掉为止。
+	if !in.Enabled || in.Role != target.Role {
+		s.gateway.CloseUser(id)
+		if s.perfConsole != nil {
+			s.perfConsole.CloseUser(id)
+		}
 	}
 	writeAudit(s, idFromContext(r), "user.update", in.Username, "", clientIP(r))
 	ok(w, map[string]any{})
@@ -574,6 +654,9 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	s.auth.RevokeUser(id)
 	s.gateway.CloseUser(id)
+	if s.perfConsole != nil {
+		s.perfConsole.CloseUser(id)
+	}
 	writeAudit(s, idFromContext(r), "user.delete", strconv.FormatInt(id, 10), "", clientIP(r))
 	ok(w, map[string]any{})
 }
@@ -596,7 +679,7 @@ func (s *Server) createHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := host.Create(s.db, &h); err != nil {
-		fail(w, http.StatusBadRequest, "invalid", err.Error())
+		fail(w, http.StatusBadRequest, "invalid", userMessage(err))
 		return
 	}
 	writeAudit(s, idFromContext(r), "host.create", h.Name, h.Address, clientIP(r))
@@ -614,12 +697,25 @@ func (s *Server) updateHost(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "badRequest", err.Error())
 		return
 	}
+	// 先取旧值：只有地址、端口或启用状态真的变了，隧道才需要断。
+	// 原来的实现无条件断开，改一条备注也会把正在用的人踢下线。
+	old, oldErr := host.Get(s.db, id)
 	if err := host.Update(s.db, id, h); err != nil {
 		writeErr(w, err)
 		return
 	}
-	// 主机的地址或端口变化后，指向旧目标的隧道不应继续存在。
-	s.gateway.CloseHost(id)
+	changed := oldErr != nil || old.Address != h.Address || old.RDPPort != h.RDPPort ||
+		old.SMBPort != h.SMBPort || old.Enabled != h.Enabled
+	if changed {
+		s.gateway.CloseHost(id)
+		if s.perfConsole != nil {
+			s.perfConsole.CloseHost(id)
+		}
+	}
+	// 去掉 perf 连接方式后，别再让已批准的被控端挂在注册表里。
+	if oldErr == nil && textutil.HasMode(old.Modes, "perf") && !textutil.HasMode(h.Modes, "perf") && s.perf != nil {
+		s.perf.Forget(uint32(id))
+	}
 	writeAudit(s, idFromContext(r), "host.update", h.Name, h.Address, clientIP(r))
 	ok(w, map[string]any{})
 }
@@ -634,6 +730,15 @@ func (s *Server) deleteHost(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// 删了主机就要把指向它的隧道一起收掉，否则会话会继续跑到用户自己关标签；
+	// 性能模式的注册表也要清，否则主键被复用后新的批准会报「id 已被占用」。
+	s.gateway.CloseHost(id)
+	if s.perfConsole != nil {
+		s.perfConsole.CloseHost(id)
+	}
+	if s.perf != nil {
+		s.perf.Forget(uint32(id))
+	}
 	writeAudit(s, idFromContext(r), "host.delete", strconv.FormatInt(id, 10), "", clientIP(r))
 	ok(w, map[string]any{})
 }
@@ -646,8 +751,8 @@ func readHost(r *http.Request) (host.Host, error) {
 	if h.RDPPort == 0 {
 		h.RDPPort = 3389
 	}
-	if h.SBMPort == 0 {
-		h.SBMPort = 445
+	if h.SMBPort == 0 {
+		h.SMBPort = 445
 	}
 	if h.Modes == "" {
 		h.Modes = "rdp"
@@ -687,7 +792,7 @@ func (s *Server) exportAudit(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Now().Add(exportWriteTimeout))
 	count := 0
-	err := audit.Each(s.db, uid, q.Get("action"), q.Get("q"), 200000, func(e audit.Event) error {
+	err := audit.Each(s.db, uid, q.Get("action"), q.Get("q"), 0, func(e audit.Event) error {
 		var b strings.Builder
 		row := []string{
 			time.Unix(e.TS, 0).Format("2006-01-02 15:04:05"),
@@ -750,15 +855,29 @@ type sessionView struct {
 }
 
 func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
 	if limit <= 0 || limit > 200 {
 		limit = 50
+	}
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sessions`).Scan(&total); err != nil {
+		serverError(w, err)
+		return
 	}
 	rows, err := s.db.Query(`SELECT se.id, COALESCE(u.username,''), se.host_id,
 		COALESCE(h.name,''), se.client_ip, se.started_at, se.ended_at, se.state, se.mode, se.detail
 		FROM sessions se LEFT JOIN users u ON u.id=se.user_id
 		LEFT JOIN hosts h ON h.id=se.host_id
-		ORDER BY se.id DESC LIMIT ?`, limit)
+		ORDER BY se.id DESC LIMIT ? OFFSET ?`, limit, offset)
+	if err != nil {
+		serverError(w, err)
+		return
+	}
 	if err != nil {
 		serverError(w, err)
 		return
@@ -788,6 +907,9 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{
 		"web_sessions": s.auth.ActiveSessions(),
 		"sessions":     out,
+		"total":        total,
+		"limit":        limit,
+		"offset":       offset,
 	})
 }
 
@@ -833,7 +955,14 @@ var allowedSettings = map[string]bool{
 }
 
 func (s *Server) getSettings(w http.ResponseWriter, _ *http.Request) {
-	out := map[string]string{}
+	// 以生效值为底：UCI 只是首次启动的初始值，没在后台保存过时数据库里没有记录，
+	// 前端不该拿到空对象再自己编 30/2048 这些写死的默认值。
+	out := map[string]string{
+		"session_idle_min":  strconv.Itoa(s.cfg.SessionIdleMin),
+		"max_upload_mb":     strconv.Itoa(s.cfg.MaxUploadMB),
+		"perf.max_sessions": "2",
+		"perf.max_per_host": "1",
+	}
 	rows, err := s.db.Query(`SELECT key, value FROM settings ORDER BY key`)
 	if err != nil {
 		serverError(w, err)
@@ -878,8 +1007,12 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if k == "perf.max_sessions" || k == "perf.max_per_host" {
 			n, e := strconv.Atoi(v)
-			if e != nil || n <= 0 || n > 32 {
+			if e != nil || n <= 0 || n > maxSessionsHard {
 				fail(w, http.StatusBadRequest, "invalid", "性能模式名额须为 1–32 之间的整数")
+				return
+			}
+			if k == "perf.max_per_host" && n > 8 {
+				fail(w, http.StatusBadRequest, "invalid", "每台主机的同时会话数不能超过 8")
 				return
 			}
 		}
@@ -907,10 +1040,10 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 性能模式的并发上限同理：改完立刻对下一次连接生效。
-	if _, exists := in["perf.max_sessions"]; exists {
-		s.reloadPerfLimits()
-	}
-	if _, exists := in["perf.max_per_host"]; exists {
+	// 两个键可能同时提交，只重载一次就够。
+	_, hasPerfMax := in["perf.max_sessions"]
+	_, hasPerfHost := in["perf.max_per_host"]
+	if hasPerfMax || hasPerfHost {
 		s.reloadPerfLimits()
 	}
 	writeAudit(s, idFromContext(r), "settings.update", strings.Join(keysOf(in), ","), "", clientIP(r))
@@ -937,7 +1070,30 @@ func writeErr(w http.ResponseWriter, err error) {
 		fail(w, http.StatusNotFound, "notFound", "对象不存在")
 		return
 	}
-	fail(w, http.StatusBadRequest, "invalid", err.Error())
+	fail(w, http.StatusBadRequest, "invalid", userMessage(err))
+}
+
+// userMessage 把数据库原始错误翻译成用户能看懂的话。
+// 直接把 "UNIQUE constraint failed: users.username" 甩给前端，等于把表名和
+// 索引结构一起暴露出去，普通用户也不知道该改什么。
+func userMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "UNIQUE constraint failed: users.username"):
+		return "用户名已存在"
+	case strings.Contains(msg, "UNIQUE constraint failed: hosts.id"):
+		return "主机 ID 已被占用，请换一个"
+	case strings.Contains(msg, "UNIQUE constraint failed"):
+		return "记录已存在"
+	case strings.Contains(msg, "FOREIGN KEY constraint failed"):
+		return "关联的主机或用户不存在"
+	case strings.Contains(msg, "database is locked"), strings.Contains(msg, "database table is locked"):
+		return "数据库正忙，请稍后重试"
+	}
+	return msg
 }
 
 // serverError 记录详细错误到日志，但只向客户端返回通用文案，
@@ -948,11 +1104,19 @@ func serverError(w http.ResponseWriter, err error) {
 }
 
 func fail(w http.ResponseWriter, status int, code, msg string) {
+	failWith(w, status, code, msg, nil)
+}
+
+// failWith 在错误体里附带结构化数据（例如分片上传期望的偏移量），
+// 前端不用从文案里正则抠数字。
+func failWith(w http.ResponseWriter, status int, code, msg string, extra map[string]any) {
+	body := map[string]any{"code": code, "message": msg}
+	for k, v := range extra {
+		body[k] = v
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ok": false, "error": map[string]string{"code": code, "message": msg},
-	})
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": body})
 }
 
 func ok(w http.ResponseWriter, data any) {

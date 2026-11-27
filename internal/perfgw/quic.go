@@ -321,6 +321,19 @@ func (s *Server) Approve(code uint32, hostID int64) error {
 	return nil
 }
 
+// Forget 丢掉一台主机的注册记录，并断开它的在线连接。
+// 后台删主机或在连接方式里去掉 perf 时调用：注册表按主机 id 认人，
+// 留着旧条目会让新主机（id 被复用时）一接入就撞上「id 已被占用」。
+func (s *Server) Forget(hostID uint32) {
+	s.reg.drop(hostID)
+	s.cmu.Lock()
+	hc := s.conns[hostID]
+	s.cmu.Unlock()
+	if hc != nil {
+		_ = hc.conn.CloseWithError(0, "host removed")
+	}
+}
+
 // Pending 是一条待批准记录。
 type Pending struct {
 	Code      uint32

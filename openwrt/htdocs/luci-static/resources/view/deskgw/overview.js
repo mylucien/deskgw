@@ -28,7 +28,9 @@ return view.extend({
 		o.rmempty = true;
 
 		o = s.option(form.Value, 'data_dir', _('数据目录'),
-			_('存放证书、SQLite 数据库与初始管理员密码的目录。须可写且能持久保留。'));
+			_('存放证书、SQLite 数据库与初始管理员密码的目录。须可写且能持久保留。' +
+			  '注意：默认值 /etc/deskgw 在 overlay 上，审计、会话与 WAL 会持续写入闪存；' +
+			  '长期运行建议改到外部存储（如 /mnt/usb/deskgw）并确保挂载先于本服务。'));
 		o.placeholder = '/etc/deskgw';
 		o.rmempty = false;
 
@@ -38,11 +40,14 @@ return view.extend({
 		o.value('0', _('停用'));
 		o.default = '1';
 
-		o = s.option(form.Value, 'session_idle_min', _('会话空闲超时（分钟）'));
+		o = s.option(form.Value, 'session_idle_min', _('会话空闲超时（分钟）'),
+			_('仅在后台从未保存过设置时作为初始值。后台「设置」页保存过一次后以数据库为准，' +
+			  '这里的修改不再生效；要改请到后台设置页。'));
 		o.datatype = 'uinteger';
 		o.default = '30';
 
-		o = s.option(form.Value, 'max_upload_mb', _('单文件上传上限（MB）'));
+		o = s.option(form.Value, 'max_upload_mb', _('单文件上传上限（MB）'),
+			_('同上：仅在后台从未保存过设置时作为初始值，之后以数据库为准。'));
 		o.datatype = 'uinteger';
 		o.default = '2048';
 
@@ -86,8 +91,10 @@ return view.extend({
 		o.readonly = true;
 
 		o = s.option(form.Flag, 'perf_udp_tune', _('优化 UDP 接收缓冲'),
-			_('服务启动时将内核的 UDP 收发缓冲上限调整为下方指定值，并写入 /etc/sysctl.conf 以在重启后继续生效。' +
-			  '高码率视频传输依赖较大的接收缓冲；缓冲不足会导致丢包与画面卡顿。关闭后不修改内核参数，重启服务时移除此前写入的配置。'));
+			_('仅在启用性能模式时生效：服务启动时把内核的 UDP 收发缓冲上限调整为下方指定值，' +
+			  '并写入 /etc/sysctl.conf 以便重启后继续生效。' +
+			  '高码率视频传输依赖较大的接收缓冲；缓冲不足会导致丢包与画面卡顿。' +
+			  '关闭性能模式或关闭本项时，会移除此前写入的 sysctl 配置（内核当前值保留到下次重启）。'));
 		o.default = '1';
 
 		o = s.option(form.Value, 'perf_udp_buf_mb', _('UDP 缓冲上限（MiB）'),

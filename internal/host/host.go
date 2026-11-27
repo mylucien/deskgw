@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
+
+	"github.com/mylucien/deskgw/internal/textutil"
 )
 
 // Host 对应 hosts 表；凭据不落盘。
@@ -15,7 +18,7 @@ type Host struct {
 	Name      string `json:"name"`
 	Address   string `json:"address"`
 	RDPPort   int    `json:"rdp_port"`
-	SBMPort   int    `json:"smb_port"`
+	SMBPort   int    `json:"smb_port"`
 	Group     string `json:"group_name"`
 	Note      string `json:"note"`
 	Enabled   bool   `json:"enabled"`
@@ -34,7 +37,7 @@ const columns = `id, name, address, rdp_port, smb_port, group_name, note, enable
 func scanHost(s scanner) (Host, error) {
 	var h Host
 	var enabled int
-	err := s.Scan(&h.ID, &h.Name, &h.Address, &h.RDPPort, &h.SBMPort, &h.Group, &h.Note,
+	err := s.Scan(&h.ID, &h.Name, &h.Address, &h.RDPPort, &h.SMBPort, &h.Group, &h.Note,
 		&enabled, &h.Modes, &h.PerfName, &h.PerfOS, &h.LastSeen, &h.CreatedAt)
 	h.Enabled = enabled != 0
 	return h, err
@@ -83,13 +86,15 @@ func Get(db *sql.DB, id int64) (Host, error) {
 	return scanHost(db.QueryRow(`SELECT `+columns+` FROM hosts WHERE id = ?`, id))
 }
 
-// Validate 校验主机字段。地址必须是私网 IP，防止 SSRF。
+// Validate 校验主机字段。RDP 目标的地址必须是私网 IP，防止 SSRF。
 // ID 允许为 0，表示新增时由数据库自动分配。
 func Validate(h Host) error {
 	if h.ID < 0 || h.ID > 4294967295 {
 		return errors.New("主机 ID 须在 1–4294967295 之间（用作被控端控制码）")
 	}
-	if h.Name == "" || len(h.Name) > 64 {
+	// 按字符而不是字节判断：提示写的是「64 字符」，中文名按字节算只有 21 字，
+	// 用户会觉得限制莫名其妙。
+	if h.Name == "" || textutil.RuneLen(h.Name) > 64 {
 		return errors.New("主机名称不能为空且不超过 64 字符")
 	}
 	ip := net.ParseIP(h.Address)
@@ -101,17 +106,20 @@ func Validate(h Host) error {
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() {
 		return errors.New("地址不能是回环、未指定、组播或链路本地地址")
 	}
-	// 允许 RFC1918、IPv6 ULA 以及 100.64.0.0/10（CGNAT，Tailscale/ZeroTier 等常用）。
-	if !ip.IsPrivate() && !isCGNAT(ip) {
-		return errors.New("地址必须属于私网段，公网地址被拒绝")
-	}
-	if h.RDPPort < 1 || h.RDPPort > 65535 || h.SBMPort < 1 || h.SBMPort > 65535 {
-		return errors.New("端口须在 1–65535 之间")
-	}
 	if h.Modes == "" {
 		h.Modes = "rdp"
 	}
-	for _, m := range splitModes(h.Modes) {
+	perfOnly := h.Modes == "perf"
+	// 允许 RFC1918、IPv6 ULA 以及 100.64.0.0/10（CGNAT，Tailscale/ZeroTier 等常用）。
+	// 纯性能模式的主机没有网关主动外连的路径（QUIC 由被控端主动接入），
+	// 公网地址是正常用法，不该按 RDP 的规则拒掉。
+	if !ip.IsPrivate() && !isCGNAT(ip) && !perfOnly {
+		return errors.New("地址必须属于私网段；只有「仅性能模式」的主机可以用公网地址")
+	}
+	if h.RDPPort < 1 || h.RDPPort > 65535 || h.SMBPort < 1 || h.SMBPort > 65535 {
+		return errors.New("端口须在 1–65535 之间")
+	}
+	for _, m := range textutil.SplitList(h.Modes) {
 		if m != "rdp" && m != "perf" {
 			return errors.New("连接方式只能是 rdp 或 perf")
 		}
@@ -129,53 +137,40 @@ func isCGNAT(ip net.IP) bool {
 	return v4[0] == 100 && v4[1]&0xC0 == 64
 }
 
-func splitModes(s string) []string {
-	out := []string{}
-	start := 0
-	for i := 0; i <= len(s); i++ {
-		if i == len(s) || s[i] == ',' {
-			part := s[start:i]
-			start = i + 1
-			for len(part) > 0 && part[0] == ' ' {
-				part = part[1:]
-			}
-			for len(part) > 0 && part[len(part)-1] == ' ' {
-				part = part[:len(part)-1]
-			}
-			if part != "" {
-				out = append(out, part)
-			}
-		}
-	}
-	return out
-}
-
 // Create 新增主机。ID 为 0 时自动分配（后续可用作被控端控制码）。
+//
+// 分配方式是「最大 id + 1」并记到 settings.hosts.next_id，不用 SQLite 的
+// rowid 复用：删掉最大 id 后下一次插入会重新拿到它，而性能模式的注册表、
+// 被控端托盘上的控制码都按这个 id 认人，复用等于把新主机冒充成旧主机。
 func Create(db *sql.DB, h *Host) error {
 	if err := Validate(*h); err != nil {
 		return err
 	}
-	var (
-		res sql.Result
-		err error
-	)
-	if h.ID == 0 {
-		res, err = db.Exec(`INSERT INTO hosts
-			(name, address, rdp_port, smb_port, group_name, note, enabled, modes, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			h.Name, h.Address, h.RDPPort, h.SBMPort, h.Group, h.Note, b(h.Enabled), h.Modes, time.Now().Unix())
-	} else {
-		res, err = db.Exec(`INSERT INTO hosts
-			(id, name, address, rdp_port, smb_port, group_name, note, enabled, modes, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			h.ID, h.Name, h.Address, h.RDPPort, h.SBMPort, h.Group, h.Note, b(h.Enabled), h.Modes, time.Now().Unix())
+	if h.Modes == "" {
+		h.Modes = "rdp"
 	}
+	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+
+	id := h.ID
+	if id == 0 {
+		if id, err = nextID(tx); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO hosts
+		(id, name, address, rdp_port, smb_port, group_name, note, enabled, modes, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, h.Name, h.Address, h.RDPPort, h.SMBPort, h.Group, h.Note,
+		b(h.Enabled), h.Modes, time.Now().Unix()); err != nil {
+		return err
+	}
 	if h.ID == 0 {
-		id, err := res.LastInsertId()
-		if err != nil {
+		if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES ('hosts.next_id', ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, strconv.FormatInt(id+1, 10)); err != nil {
 			return err
 		}
 		h.ID = id
@@ -183,7 +178,25 @@ func Create(db *sql.DB, h *Host) error {
 	if h.ID < 1 || h.ID > 4294967295 {
 		return errors.New("主机 ID 超出 1–4294967295 范围")
 	}
-	return nil
+	return tx.Commit()
+}
+
+// nextID 返回一个从未用过的主机 id。调用方已开事务。
+func nextID(tx *sql.Tx) (int64, error) {
+	var maxID int64
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(id),0) FROM hosts`).Scan(&maxID); err != nil {
+		return 0, err
+	}
+	var saved string
+	err := tx.QueryRow(`SELECT value FROM settings WHERE key='hosts.next_id'`).Scan(&saved)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	next := maxID + 1
+	if n, e := strconv.ParseInt(saved, 10, 64); e == nil && n > next {
+		next = n
+	}
+	return next, nil
 }
 
 // Update 更新主机资料，保留性能模式字段。
@@ -191,9 +204,12 @@ func Update(db *sql.DB, id int64, h Host) error {
 	if err := Validate(h); err != nil {
 		return err
 	}
+	if h.Modes == "" {
+		h.Modes = "rdp"
+	}
 	res, err := db.Exec(`UPDATE hosts SET name=?, address=?, rdp_port=?, smb_port=?,
 		group_name=?, note=?, enabled=?, modes=? WHERE id=?`,
-		h.Name, h.Address, h.RDPPort, h.SBMPort, h.Group, h.Note, b(h.Enabled), h.Modes, id)
+		h.Name, h.Address, h.RDPPort, h.SMBPort, h.Group, h.Note, b(h.Enabled), h.Modes, id)
 	if err != nil {
 		return err
 	}

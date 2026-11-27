@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/mylucien/deskgw/internal/textutil"
 )
 
 var (
@@ -67,7 +69,7 @@ func newRegistry() *registry {
 func (g *registry) claim(rc *reclaim, name, os, ip string, now int64, adopt func(uint32, [16]byte) bool) (*pending, bool, error) {
 	// 名称与系统由对端填写，最长可以到一条信令帧的上限。截断到 64 个字符：
 	// 界面显示足够，也不至于让一批未批准的连接把路由器的内存占满。
-	name, os = clip(name, 64), clip(os, 64)
+	name, os = textutil.Runes(name, 64), textutil.Runes(os, 64)
 	if rc != nil {
 		if p := g.reclaim(rc, name, os, ip, now); p != nil {
 			return p, false, nil
@@ -274,16 +276,4 @@ func newSecret() ([16]byte, error) {
 		return s, err
 	}
 	return s, nil
-}
-
-// clip 把字符串按字符（不是字节）截断到 n 个。
-func clip(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n])
 }
