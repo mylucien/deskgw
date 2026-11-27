@@ -46,6 +46,18 @@ return view.extend({
 		o.datatype = 'uinteger';
 		o.default = '2048';
 
+		o = s.option(form.Value, 'gomemlimit', _('Go 内存软上限（高级）'),
+			_('Go 运行时的内存软上限，例如 160MiB。留空则按物理内存的 40% 自动计算，' +
+			  '下限 96MiB、上限 256MiB。小内存路由器上不设的话，几次并发登录就可能把内存顶到 OOM。'));
+		o.placeholder = _('留空则自动计算（96–256MiB）');
+		o.rmempty = true;
+
+		o = s.option(form.Value, 'redirect_listen', _('HTTP 跳转监听地址（高级）'),
+			_('留空关闭。填写后在该地址上监听明文 HTTP，并跳转到 HTTPS 监听端口，' +
+			  '例如 0.0.0.0:80。只适合局域网，注意不要和主监听端口冲突。'));
+		o.placeholder = _('留空则关闭');
+		o.rmempty = true;
+
 		s = m.section(form.NamedSection, 'main', 'deskgw', _('性能模式'),
 			_('接收 Airhand 被控端的 QUIC 连接。修改后点页面底部的「重启服务」生效。'));
 
