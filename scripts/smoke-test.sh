@@ -132,14 +132,18 @@ python3 "$SCRIPT_DIR/rdp-tunnel-test.py" https://127.0.0.1:18443 smoke-test-pw |
 ok
 
 echo "== 10. 文件网关鉴权 =="
-# 无文件令牌访问文件接口应被拒（令牌校验在任何 SMB 连接之前发生）
-code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" \
+# 无文件令牌访问文件接口应被拒（令牌校验在任何 SMB 连接之前发生）。
+# 刻意不用 401：401 会让前端整页跳登录，令牌过期只该就地重取，所以约定
+# 返回 403 + code=fileToken；会话结束则返回 410 + code=session。
+code=$(curl -ksS -o "$WORK/ft.json" -w '%{http_code}' -b "$WORK/jar" \
 	'https://127.0.0.1:18443/api/files/list?path=')
-[ "$code" = "401" ] || fail "无文件令牌访问应返回 401，实际 $code"
+[ "$code" = "403" ] || fail "无文件令牌访问应返回 403，实际 $code"
+grep -q 'fileToken' "$WORK/ft.json" || fail "无文件令牌的响应缺少 fileToken 错误码"
 # 伪造令牌应被拒
-code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" -H 'X-File-Token: bogus' \
+code=$(curl -ksS -o "$WORK/ft.json" -w '%{http_code}' -b "$WORK/jar" -H 'X-File-Token: bogus' \
 	'https://127.0.0.1:18443/api/files/list?path=')
-[ "$code" = "401" ] || fail "伪造文件令牌应返回 401，实际 $code"
+[ "$code" = "403" ] || fail "伪造文件令牌应返回 403，实际 $code"
+grep -q 'fileToken' "$WORK/ft.json" || fail "伪造令牌的响应缺少 fileToken 错误码"
 # 签发令牌需要有效会话；不存在的会话应返回 404
 code=$(curl -ksS -o /dev/null -w '%{http_code}' -b "$WORK/jar" \
 	-H 'Content-Type: application/json' -H "X-CSRF-Token: $CSRF" \
