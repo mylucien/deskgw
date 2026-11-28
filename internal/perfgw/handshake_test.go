@@ -334,8 +334,17 @@ func TestHandshakeErrorText(t *testing.T) {
 	if !errors.Is(err, errRefused) {
 		t.Fatalf("应当是拒绝，得到 %v", err)
 	}
+	// code 1 是「不认识路由器的公钥」：只有这一种才该提示重新批准。
+	// 放宽成「所有 IK 失败都算密钥问题」会把网络抖动误报成换机，诱导管理员
+	// 重新批准、重新信任首次见到的密钥，等于用抖动拆掉 TOFU。
+	if !errors.Is(err, errKeyUnrecognized) {
+		t.Fatalf("code 1 应当带 errKeyUnrecognized，得到 %v", err)
+	}
 	if err := handshakeError(99); !bytes.Contains([]byte(err.Error()), []byte("99")) {
 		t.Fatalf("未知原因应当带上编号: %v", err)
+	}
+	if err := handshakeError(3); errors.Is(err, errKeyUnrecognized) {
+		t.Fatalf("其他拒绝原因不该被当成密钥问题: %v", err)
 	}
 }
 

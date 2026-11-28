@@ -41,6 +41,10 @@ var (
 	errPairingRequired = errors.New("被控端没有预置路由器的公钥")
 	// errVersion 表示会话版本对不上。
 	errVersion = errors.New("被控端的会话版本不匹配")
+	// errKeyUnrecognized 是被控端明确说「不认识路由器的 static 公钥」。
+	// IK 里这条几乎只意味着它重装过/换了机器；用它把「真正需要重新批准」
+	// 和「网络抖动」区分开。
+	errKeyUnrecognized = errors.New("被控端不认识路由器的公钥")
 )
 
 // refusal 是被控端拒绝的原因（HostVerdict.refused）。
@@ -65,9 +69,13 @@ func refusalError(r refusal) error {
 // handshakeError 把被控端回的 HandshakeError 变成错误。它是明文，服务器也能伪造，
 // 所以只用来给管理员提示，不改变任何信任判断。
 func handshakeError(code uint64) error {
+	if code == 1 {
+		// 它解不开我们用「已记录的公钥」做的那一跳：被控端重装、换机，或者
+		// 有人冒充。单独挂一个哨兵，让上层只在这一种情况下提示重新批准。
+		return fmt.Errorf("%w：%w（可能重装过，或者有人冒充）", errRefused, errKeyUnrecognized)
+	}
 	reason := map[uint64]string{
 		0: "不认识的握手模式",
-		1: "被控端不认识路由器的公钥（可能重装过，或者有人冒充）",
 		2: "配对码不对",
 		3: "被控端现在不接受配对",
 		4: "握手消息格式不对",

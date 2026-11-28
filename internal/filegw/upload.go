@@ -151,23 +151,26 @@ func (u *Upload) Commit() error {
 		}
 	}
 	var backup string
-	if _, err := u.conn.share.Stat(u.final); err == nil {
+	// 一律走 Conn 的包装方法：它们会在单次操作期间挂上 SMB 期限，目标机卡死
+	// （休眠、网络分区、安全软件拦截）时到点报错，而不是把整个收尾永久挂住。
+	// 直接用 u.conn.share.* 会绕过这层保护。
+	if _, err := u.conn.Stat(u.final); err == nil {
 		backup = tempName(u.final) + ".bak"
-		if err := u.conn.share.Rename(u.final, backup); err != nil {
+		if err := u.conn.Rename(u.final, backup); err != nil {
 			u.discardLocked()
 			return err
 		}
 	}
-	if err := u.conn.share.Rename(u.tmp, u.final); err != nil {
+	if err := u.conn.Rename(u.tmp, u.final); err != nil {
 		if backup != "" {
 			// 放回旧文件；失败也只能把备份留下，至少数据还在。
-			_ = u.conn.share.Rename(backup, u.final)
+			_ = u.conn.Rename(backup, u.final)
 		}
 		u.discardLocked()
 		return err
 	}
 	if backup != "" {
-		_ = u.conn.share.Remove(backup)
+		_ = u.conn.Remove(backup)
 	}
 	u.tmp = ""
 	u.conn.Close()
@@ -177,7 +180,7 @@ func (u *Upload) Commit() error {
 // discardLocked 删除临时文件并释放连接。调用方必须持有 u.mu。
 func (u *Upload) discardLocked() {
 	if u.tmp != "" {
-		_ = u.conn.share.Remove(u.tmp)
+		_ = u.conn.Remove(u.tmp)
 		u.tmp = ""
 	}
 	u.conn.Close()
@@ -201,7 +204,7 @@ func (u *Upload) Close() {
 		_ = f.Close()
 	}
 	if u.tmp != "" {
-		_ = u.conn.share.Remove(u.tmp)
+		_ = u.conn.Remove(u.tmp)
 		u.tmp = ""
 	}
 	u.conn.Close()

@@ -378,12 +378,13 @@ func (s *Server) StartSession(code uint32, peer sessionPeer, intro controllerInt
 		},
 	})
 	if err != nil {
-		// 记录过公钥（IK）却走不下去，几乎只有一种可能：被控端重装过、换了
-		// 机器，或者库里的公钥已经不是它的了。原来的实现把这种失败当
-		// serverError/incompatible，页面显示「两端版本不一致」，用户永远找不到
-		// 「重新批准」这个出口。明确拒绝类的错误保持原样。
-		if peerKey != nil && !errors.Is(err, errRefused) && !errors.Is(err, errVersion) &&
-			!errors.Is(err, errPairingRequired) {
+		// 只在「握手本身说明密钥不对」时才归到公钥问题：
+		//   - errNoise：用旧公钥算出来的 DH 对不上，解不开对方的握手消息；
+		//   - errKeyUnrecognized：被控端明确回「不认识路由器的公钥」。
+		// 拨号超时、控制流没开、连接被重置这些是网络故障，保持原样——把它们
+		// 也报成「密钥不一致」会诱导管理员去重新批准，而重新批准会清掉记录、
+		// 重新信任首次见到的密钥，等于用一次网络抖动拆掉了 TOFU。
+		if peerKey != nil && (errors.Is(err, errNoise) || errors.Is(err, errKeyUnrecognized)) {
 			return nil, fmt.Errorf("%w（%v）", errPeerKey, err)
 		}
 		return nil, err

@@ -104,6 +104,9 @@
       :aria-hidden="!menuOpen" role="dialog" aria-label="会话菜单" ref="panelEl"
       @mousedown.prevent>
       <div class="p-top">
+        <!-- 返回主机列表放在顶栏：面板内容一长（画质/按键/显示/账号），底部的
+             按钮就被挤出滚动区，用户会以为只能先断开才能回去。 -->
+        <button class="p-back" @click="leave" aria-label="返回主机列表" title="返回主机列表">←</button>
         <span class="p-cap">性能模式 · {{ ready?.host.name || perfSession.current?.hostName || '未连接' }}</span>
         <span v-if="ready" class="p-ok">加密</span>
         <button class="p-x" @click="closeMenu" aria-label="收起">×</button>
@@ -121,7 +124,7 @@
              里给一次，所以选屏靠重连生效。这里给出可点的入口，别让人以为
              画面是坏的。 -->
         <div v-if="displays.length > 1" class="p-sub">
-          显示器 {{ displays.length }} 个 · 被控端在显示 {{ currentDisplay + 1 }}
+          显示器 {{ displays.length }} 个 · 被控端在显示 {{ shownDisplayNo || currentDisplay + 1 }}
           <div class="seg seg-disp">
             <button v-for="(d, i) in displays" :key="i" :class="{ on: displayIndex === i }"
               :title="`${d.name || '屏幕 ' + (i + 1)} · ${d.width}×${d.height}`"
@@ -180,7 +183,7 @@
 
       <div class="p-foot">
         <button v-if="state === 'ready'" class="danger" @click="hangup">断开连接</button>
-        <button @click="leave">返回主机列表</button>
+        <button v-else @click="leave">返回主机列表</button>
         <button v-if="isAdmin" @click="goAdmin">管理后台</button>
       </div>
     </div>
@@ -220,9 +223,24 @@ const hostHostname = ref('')
 // 被控端报告的显示器列表与当前显示的那一块。
 const displays = ref<DisplayInfo[]>([])
 const currentDisplay = ref(0)
-// 想看的显示器序号：握手时写进 ControllerIntro.view，换屏靠重连生效。
+// 想看的显示器：ack 里显示的是数组下标，真正发给网关的必须是被控端的 index。
 const displayIndex = ref(0)
 const switchingDisplay = ref(false)
+/**
+ * 发给网关的显示器编号。
+ *
+ * 被控端插拔过显示器后 index 可能不再是 0..n-1 的连续值（例如 [1,3]），
+ * 直接拿下标当编号会选错屏。数组里没有对应项时退回 0（被控端主屏）。
+ */
+function displaySendIndex(): number {
+  return displays.value[displayIndex.value]?.index ?? 0
+}
+
+/** current 是被控端的 index，换算成列表里第几块（1 起）；对不上返回 0。 */
+const shownDisplayNo = computed(() => {
+  const i = displays.value.findIndex((d) => d.index === currentDisplay.value)
+  return i >= 0 ? i + 1 : 0
+})
 // ready 之后迟迟没有首帧（锁屏、UAC、采集没起来）时给一句提示。
 const firstFrameStuck = ref(false)
 const frameSize = reactive({ w: 0, h: 0 })
@@ -339,6 +357,7 @@ const hints: Record<string, string> = {
   limit: '网关的并发名额满了，稍后再试或调高后台的限额。',
   disabled: '性能模式没有启用，检查网关的 perf.enabled。',
   serverError: '网关连不上被控端（拨号超时或链路中断），稍后重试；持续失败请看网关日志。',
+  decoderError: '浏览器解不开这路画面：需要支持 WebCodecs 的 Chrome/Edge（较新版本），或用普通 RDP 模式。',
   connectFailed: '连接没有建立：票据一次性有效，网关也可能拒绝了升级。点「重新连接」换一张票据再试。',
 }
 const hint = computed(() => hints[errorKind.value] || '')
@@ -625,6 +644,23 @@ let raf = 0
 // 被控端对光标的三种说法（协议 CursorVisibility）：0 隐藏（游戏里转视角）、
 // 1 显示且由控制端画、2 已经画在画面里。只有 0 才发相对移动，2 照常发绝对坐标。
 const cursorMode = ref<0 | 1 | 2>(1)
+
+/**
+ * 释放指针锁定。
+ *
+ * 相对移动模式（cursorMode 0）下 pointdown 会 requestPointerLock，但之前整个
+ * 文件没有任何 exitPointerLock：游戏退出、光标恢复、断开连接、页面切走之后
+ * 仍然锁着，clientX/Y 不再更新，指针卡死在原位，用户只能按 Esc 才解得开。
+ */
+function exitCursorLock() {
+  if (!document.pointerLockElement) return
+  try {
+    document.exitPointerLock?.()
+  } catch {
+    /* 浏览器在非用户手势里可能拒绝，退出后重试即可 */
+  }
+}
+
 // 自绘光标的兜底箭头：触屏没有系统光标；桌面收到远端形状时也自绘。
 // 桌面还没收到形状时用系统默认箭头（cursorStyle），不自绘。
 const showVirtualCursor = computed(() => hasFrame.value && cursorMode.value !== 0 && (
@@ -1272,6 +1308,14 @@ function onRemoteClipboard(text: string) {
   else pendingRemote = text
 }
 
+/** 事件目标是不是「页面自己的」输入控件（不是画面的隐藏输入代理）。 */
+function isPageInput(el: EventTarget | null): boolean {
+  const t = el as HTMLElement | null
+  if (!t || t === ime.value) return false
+  const tag = t.tagName
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable === true
+}
+
 /**
  * 粘贴（Ctrl/Cmd+V）。
  *
@@ -1281,6 +1325,10 @@ function onRemoteClipboard(text: string) {
  */
 function onPaste(ev: ClipboardEvent) {
   if (state.value !== 'ready') return
+  // 这一页还能打开「改密码」弹窗：目标是真的输入框时必须让浏览器照常粘贴。
+  // 之前无条件 preventDefault + 转发，等于把管理员的新密码推给被控端再补一次
+  // Ctrl+V，用户既改不了密码又泄露了密码。隐藏的输入代理不算，它就是要拦的。
+  if (isPageInput(ev.target)) return
   const text = ev.clipboardData?.getData('text/plain') || ''
   if (!text) return
   // 不让它落进隐藏的输入框（否则会当成一次 Text 输入又发一遍）。
@@ -1313,7 +1361,7 @@ async function pasteFromClipboard() {
     }
   } catch {
     // 多半是权限被拒（或页面不在安全上下文）。别静默失败，否则又像「按了没反应」。
-    setBanner('浏览器拒绝了剪贴板权限：允许后重按 Ctrl+V，或切到「文本」模式粘贴。')
+    setBanner('浏览器拒绝了剪贴板权限：在地址栏的权限图标里允许「读取剪贴板」后重按 Ctrl+V，或切到「文本」模式粘贴。')
   }
 }
 
@@ -1329,6 +1377,8 @@ function onBlur() {
   releaseAll()
   releaseTouches()
   releaseGesture()
+  // 切到别的窗口时锁着的指针会挡住所有鼠标操作，先松开；回来点一下画面再锁。
+  exitCursorLock()
 }
 
 function onVisibility() {
@@ -1336,6 +1386,7 @@ function onVisibility() {
     releaseAll()
     releaseTouches()
     releaseGesture()
+    exitCursorLock()
   }
 }
 
@@ -1442,7 +1493,11 @@ function onEvent(ev: HostEvent) {
     // 1 = 显示着，用本地光标；2 = 被控端已经把光标画进画面，藏本地光标；
     // 0 = 隐藏，藏本地光标并改发相对移动。
     const v = ev.visibility
-    cursorMode.value = v === 1 ? 1 : v === 2 ? 2 : 0
+    const nextMode = v === 1 ? 1 : v === 2 ? 2 : 0
+    // 被控端把光标交还给系统了（典型是游戏退出）：必须主动解锁。锁定状态下
+    // clientX/Y 不再随鼠标更新，指针会卡在锁定前的位置，用户只能按 Esc 逃出来。
+    if (nextMode !== 0) exitCursorLock()
+    cursorMode.value = nextMode
     // Cursor 带的形状引用才是当前该用哪个；-1 表示没有形状，退回系统箭头。
     wantedSlot = ev.slot
     wantedGen = ev.generation
@@ -1502,10 +1557,13 @@ function connect() {
       state.value = 'ended'
     },
     onFatal: (message) => {
+      // 解码器起不来是 Worker 层的事，没有 kind；补一个，否则 hint 是空的，
+      // 页面只剩一句英文原文。
+      errorKind.value = 'decoderError'
       errorText.value = message
       state.value = 'error'
     },
-  }, displayIndex.value)
+  }, displaySendIndex())
 }
 
 /** 换显示器：协议只认握手时给的 view，改完重连一次才生效。 */
@@ -1528,6 +1586,8 @@ function shutdown() {
   keyboardUp.value = false
   // 断开时把软键盘一起收掉，别留一个没有会话的键盘。
   ime.value?.blur()
+  // 指针锁同理：会话都没了还锁着指针，浏览器标签页会变得没法操作。
+  exitCursorLock()
   displays.value = []
   currentDisplay.value = 0
   // 先把按下的键、触摸点松开再断，免得被控端留下按住的状态。
@@ -1700,11 +1760,18 @@ onBeforeUnmount(() => {
 .panel.open { opacity: 1; transform: none; pointer-events: auto; }
 .p-top { display: flex; align-items: center; gap: 8px; padding: 11px 12px 9px;
   border-bottom: 1px solid rgba(255, 255, 255, .07); flex: none; }
-.p-cap { font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.p-cap { font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  /* flex 项默认 min-width:auto，不加这条省略号不生效，长主机名会把面板撑开。 */
+  min-width: 0; }
 .p-ok { margin-left: auto; font-size: 11px; color: #4ade80; border: 1px solid rgba(74, 222, 128, .35);
   border-radius: 4px; padding: 1px 5px; flex: none; }
 .p-x { width: 24px; height: 24px; border: 0; padding: 0; background: transparent;
   color: #98a1b0; cursor: pointer; font-size: 16px; line-height: 1; flex: none; }
+/* 与关闭按钮同尺寸；放在标题左边，任何面板高度下都点得到。 */
+.p-back { width: 24px; height: 24px; border: 0; padding: 0; background: transparent;
+  color: #98a1b0; cursor: pointer; font-size: 15px; line-height: 1; flex: none;
+  margin-left: -4px; }
+.p-back:hover, .p-x:hover { color: #e5e7eb; }
 .p-meta { padding: 10px 12px 4px; font-size: 12px; line-height: 1.7; color: #9ca3af;
   font-variant-numeric: tabular-nums; flex: none; }
 .p-meta b { color: #e5e7eb; letter-spacing: .5px; }
