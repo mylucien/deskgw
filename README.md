@@ -82,6 +82,8 @@ config deskgw 'main'
 
 `session_idle_min` 与 `max_upload_mb` 只在后台「设置」里还没有保存过时作为初始值写入数据库，之后以数据库为准——两处都能改会导致「改了这个那个不生效」，所以只保留一个权威来源。`perf_enabled` 只在启动时读，改完要重启服务；`perf_udp_tune` 仅在 `perf_enabled=1` 时生效，卸载包时会撤销写入的 sysctl 配置。
 
+`data_dir` 默认是 `/etc/deskgw`（OpenWrt 上是 overlay 分区）。证书、SQLite 数据库、初始管理员密码都放这里，审计和会话会持续写入，长期运行对 eMMC/闪存不友好。要改到外部存储（例如 `/mnt/usb/deskgw`）时，注意两点：目录必须能被 root 写，且挂载要早于本服务启动（否则服务会先在 overlay 上重建一份空库，挂载完成后旧的数据库仍然被占用）。启动日志里会打印当前使用的目录。
+
 ## 目录结构
 
 ```

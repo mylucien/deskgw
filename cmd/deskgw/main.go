@@ -48,6 +48,13 @@ func run(cfg config.Config) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return fmt.Errorf("创建数据目录: %w", err)
 	}
+	// 默认目录在 /etc（OpenWrt 上是 overlay）：审计、会话、SQLite 的 WAL 会持续
+	// 写闪存，长期运行对 eMMC/闪存不友好。不改默认值——老用户升级后数据会
+	// 「消失」——但必须在启动日志里留一句，否则只有打开 LuCI 才知道能改。
+	if cfg.DataDir == "/etc/deskgw" {
+		log.Printf("提示: 数据目录是默认值 /etc/deskgw（overlay 上，会持续写闪存）；" +
+			"长期运行建议改到外部存储，例如 /mnt/usb/deskgw，并让它先于本服务挂载")
+	}
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		return err
