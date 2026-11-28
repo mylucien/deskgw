@@ -251,6 +251,18 @@ func (g *Gateway) CloseHost(hostID int64) int {
 	return g.closeWhere(func(e *liveSession) bool { return e.hostID == hostID })
 }
 
+// CloseUserHosts 断开某个用户指向指定主机的会话，返回断开数量。
+//
+// 撤销某台主机的授权时用：只断被收走的那几台，别的会话不跟着掉。
+func (g *Gateway) CloseUserHosts(userID int64, lost map[int64]bool) int {
+	if len(lost) == 0 {
+		return 0
+	}
+	return g.closeWhere(func(e *liveSession) bool {
+		return e.userID == userID && lost[e.hostID]
+	})
+}
+
 // supersedeHost 收掉同一用户指向同一主机的其他在线隧道，返回关闭数量。
 // 新连接自己通过 keepID 排除在外。
 //

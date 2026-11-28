@@ -8,6 +8,7 @@ import init, {
   DeviceEvent,
   InputTransaction,
   RotationUnit,
+  setColorDepth,
 } from './wasm/pkg/ironrdp_web.js'
 import type { Session, SessionTerminationInfo } from './wasm/pkg/ironrdp_web.js'
 
@@ -44,6 +45,11 @@ export interface RdpOptions {
   credentials: Credentials
   width: number
   height: number
+  /**
+   * 会话颜色深度，默认 32。16 位省一点带宽，但渐变壁纸与照片会有色带，
+   * 只在链路实在吃紧时才值得选。
+   */
+  colorDepth?: 16 | 32
   /** 是否启用剪贴板同步，跟随用户权限 allow_clipboard。 */
   allowClipboard?: boolean
   /**
@@ -147,6 +153,18 @@ function scancodeOf(e: KeyboardEvent): number | null {
 // “[object Object]”，故障原因完全丢失。这里把能拿到的字段都摊开，
 // 依次尝试 Error.message、对象的 message、JSON，最后才退回 String。
 export function describeError(e: unknown): string {
+  const msg = rawErrorText(e)
+  // rustls 只做 TLS 1.2/1.3，也不支持静态 RSA 密钥交换与 CBC 套件。默认只开
+  // TLS 1.0 的 Windows 7 / Server 2008 R2 一定握手失败，但错误只写「TLS」，
+  // 用户看不出是被控端系统太老。这里补一句能指导操作的说明。
+  if (/tls/i.test(msg) && /(handshake|unsupported|protocol|version|alert|eof)/i.test(msg)) {
+    return msg + '（被控端可能只支持 TLS 1.0 或 RSA 密钥交换/CBC 套件：需要 Windows 8.1 及以上，'
+      + '或在该机器上启用 TLS 1.2）'
+  }
+  return msg
+}
+
+function rawErrorText(e: unknown): string {
   if (e instanceof Error) return e.message || e.name || String(e)
   if (typeof e === 'string') return e
   if (e && typeof e === 'object') {
@@ -358,6 +376,9 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   let expectedFp = ''
   try { expectedFp = localStorage.getItem(fpKey) || '' } catch { /* 隐私模式 */ }
   if (expectedFp) builder.expectedFingerprint(expectedFp)
+  // 颜色深度要在 connect 之前设：wasm 侧的 COLOR_DEPTH 是进程级静态量，
+  // 每次建立会话时读一次。之前默认 16 位，画面在渐变上一眼就能看出色带。
+  try { setColorDepth(opts.colorDepth === 16 ? 16 : 32) } catch { /* 旧产物没有这个导出 */ }
   builder.desktopSize(new DesktopSize(opts.width, opts.height))
   builder.renderCanvas(opts.canvas)
   builder.extension(new Extension('enable_credssp', true))
@@ -524,6 +545,10 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   runPromise.then((info) => {
     if (!stopped) finish(info.reason() || 'remote-closed')
   }).catch((e: unknown) => {
+    // run 抛错时底层 TLS/WebSocket 还开在 Rust 里：不主动收尾就只能等 wasm
+    // 对象被 GC，网关那边的会话也会跟着多挂一会儿。发一次 TerminateSession
+    // 让写任务正常断开。
+    try { active.shutdown() } catch { /* 已经断了 */ }
     if (!stopped) finish(describeError(e) || 'session-error')
   })
 
@@ -565,11 +590,32 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
 
   // 软键盘只能由显式操作唤出。之前每次点画布都 focus 一次 textarea，手机上
   // 表现为「点哪都弹出键盘」，键盘还会挤压可视高度、触发远端改分辨率。
-  const focusSink = () => { try { sink.focus({ preventScroll: true }) } catch { /* ignore */ } }
+  const focusSink = () => {
+    // 已经聚焦时也要重新聚焦一次：安卓和部分平板上用软键盘的返回键收起键盘，
+    // 只是把键盘关掉，焦点还留在 textarea 里。这时再调 focus()，浏览器认为
+    // 「焦点没变」，不会弹键盘 —— 就是「点了键盘按钮但没反应」的根因。
+    // 先 blur 再 focus，浏览器才当成一次新的聚焦。
+    if (document.activeElement === sink) {
+      try { sink.blur() } catch { /* ignore */ }
+    }
+    try { sink.focus({ preventScroll: true }) } catch { /* ignore */ }
+    // Chrome（安卓）提供显式的虚拟键盘接口，focus 之后补一刀成功率更高。
+    const vk = (navigator as Navigator & { virtualKeyboard?: { show?: () => void } }).virtualKeyboard
+    if (vk?.show) {
+      try { vk.show() } catch { /* 不支持就算了，靠 focus 本身 */ }
+    }
+  }
   const focus = () => { if (!touchDevice) focusSink() }
   const notifyKeyboard = (open?: boolean) => {
     const value = open === undefined ? document.activeElement === sink : open
     try { opts.onKeyboard?.(value) } catch { /* 界面回调抛错不影响输入 */ }
+  }
+  // 软键盘弹收只改可视区高度，不触发 window.resize；安卓用返回键收键盘也不会
+  // 触发 blur。不跟着修正的话「键盘开着」会一直留着，按钮得点两次才弹得出来。
+  const onVisualViewport = () => {
+    const vv = window.visualViewport
+    if (!vv) return
+    notifyKeyboard(document.activeElement === sink && window.innerHeight - vv.height > 120)
   }
   // 输入法候选框出现在 caret 处，把 textarea 挪到手指位置，候选框才跟着视线。
   const positionSink = (clientX: number, clientY: number) => {
@@ -1023,6 +1069,8 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
   sink.addEventListener('compositionend', onCompositionEnd)
   sink.addEventListener('input', onInput)
   sink.addEventListener('blur', onBlur)
+  window.visualViewport?.addEventListener('resize', onVisualViewport)
+  window.visualViewport?.addEventListener('scroll', onVisualViewport)
 
   const detach = () => {
     if (moveRaf) { cancelAnimationFrame(moveRaf); moveRaf = 0 }
@@ -1049,6 +1097,8 @@ export async function connectRdp(opts: RdpOptions): Promise<RdpSession> {
     sink.removeEventListener('compositionend', onCompositionEnd)
     sink.removeEventListener('input', onInput)
     sink.removeEventListener('blur', onBlur)
+    window.visualViewport?.removeEventListener('resize', onVisualViewport)
+    window.visualViewport?.removeEventListener('scroll', onVisualViewport)
     sink.remove()
     cursorEl.remove()
     canvas.style.cursor = ''

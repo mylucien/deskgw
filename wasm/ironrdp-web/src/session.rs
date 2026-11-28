@@ -471,6 +471,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
         // (e.g., the proxy hostname could not be resolved, proxy service is not running), but errors are neved
         // bubbled up in practice, so instead we poll the WebSocket state until we know its connected (i.e., the
         // WebSocket handshake is a success and user data can be exchanged).
+        //
+        // 轮询必须有总时限：网络黑洞或网关挂住时 state 会一直停在 Connecting，
+        // 界面就永远停在「连接中」，用户既不知道失败也不会重试。
+        const WS_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+        let mut waited = Duration::ZERO;
         loop {
             match ws.state() {
                 websocket::State::Closing | websocket::State::Closed => {
@@ -481,8 +486,16 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     .with_kind(IronErrorKind::ProxyConnect));
                 }
                 websocket::State::Connecting => {
+                    if waited >= WS_OPEN_TIMEOUT {
+                        return Err(IronError::from(anyhow::anyhow!(
+                            "连接 {proxy_address} 超时：WebSocket 在 {} 秒内没有打开",
+                            WS_OPEN_TIMEOUT.as_secs()
+                        ))
+                        .with_kind(IronErrorKind::ProxyConnect));
+                    }
                     trace!("WebSocket is connecting to proxy at {proxy_address}...");
                     gloo_timers::future::sleep(Duration::from_millis(50)).await;
+                    waited += Duration::from_millis(50);
                 }
                 websocket::State::Open => {
                     debug!("WebSocket connected to {proxy_address} with success");
@@ -1476,8 +1489,9 @@ fn parse_file_metadata_array(files: JsValue) -> Result<Vec<FileMetadata>, IronEr
 /// 桌面协商色深，由前端在连接前通过 `setColorDepth` 设定。
 ///
 /// 服务器只有在 32bpp 会话里才会下发 RemoteFX 帧。16bpp 下能力集里虽然
-/// 宣告了 RemoteFX，服务器仍会退回位图 RLE，压缩率差一个数量级。
-static COLOR_DEPTH: AtomicU16 = AtomicU16::new(16);
+/// 宣告了 RemoteFX，服务器仍会退回位图 RLE，压缩率差一个数量级；画面在
+/// 渐变与照片上也会出现明显色带。所以默认 32，16 只作为弱网时的选项。
+static COLOR_DEPTH: AtomicU16 = AtomicU16::new(32);
 
 /// 设置后续连接的协商色深。只接受 32，其余值一律按 16 处理。
 #[wasm_bindgen::prelude::wasm_bindgen(js_name = setColorDepth)]
@@ -1707,7 +1721,8 @@ async fn connect(
     if let Some(expected) = expected_fingerprint.as_deref() {
         if !expected.eq_ignore_ascii_case(&tls_info.fingerprint) {
             return Err(IronError::from(anyhow::anyhow!(
-                "远程主机证书指纹已变化：期望 {expected}，实际 {}。若确认主机已重装系统，请在连接对话框中清除已记录的指纹。",
+                "远程主机证书指纹已变化：期望 {expected}，实际 {}。若确认主机已重装系统，\
+                 请点「信任新证书并重连」；否则可能是中间人，先核对指纹再决定。",
                 tls_info.fingerprint
             )));
         }

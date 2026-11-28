@@ -616,9 +616,38 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 		if s.perfConsole != nil {
 			s.perfConsole.CloseUser(id)
 		}
+	} else if lost := lostGrants(target.HostIDs, in.HostIDs); len(lost) > 0 {
+		// 只收走了部分主机的授权：断掉这些主机上的会话，其他会话留着。
+		// 之前只在停用/改角色时断，于是「取消勾选某台主机」对已经在跑
+		// 的 RDP / 性能模式会话完全无效，用户还能继续操作到下一次重连。
+		s.gateway.CloseUserHosts(id, lost)
+		if s.perfConsole != nil {
+			s.perfConsole.CloseUserHosts(id, lost)
+		}
 	}
 	writeAudit(s, idFromContext(r), "user.update", in.Username, "", clientIP(r))
 	ok(w, map[string]any{})
+}
+
+// lostGrants 返回「原来授权过、这次被取消」的主机集合。
+func lostGrants(oldIDs, newIDs []int64) map[int64]bool {
+	if len(oldIDs) == 0 {
+		return nil
+	}
+	keep := make(map[int64]bool, len(newIDs))
+	for _, id := range newIDs {
+		keep[id] = true
+	}
+	var lost map[int64]bool
+	for _, id := range oldIDs {
+		if !keep[id] {
+			if lost == nil {
+				lost = make(map[int64]bool, 2)
+			}
+			lost[id] = true
+		}
+	}
+	return lost
 }
 
 func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
@@ -706,6 +735,11 @@ func (s *Server) updateHost(w http.ResponseWriter, r *http.Request) {
 	}
 	changed := oldErr != nil || old.Address != h.Address || old.RDPPort != h.RDPPort ||
 		old.SMBPort != h.SMBPort || old.Enabled != h.Enabled
+	// 连接方式里去掉 rdp 也要断：不然已经在跑的隧道不会看 Modes，
+	// 继续跑到用户自己关标签，等于「停用了还能用」。
+	if oldErr == nil && textutil.HasMode(old.Modes, "rdp") && !textutil.HasMode(h.Modes, "rdp") {
+		changed = true
+	}
 	if changed {
 		s.gateway.CloseHost(id)
 		if s.perfConsole != nil {

@@ -378,6 +378,14 @@ func (s *Server) StartSession(code uint32, peer sessionPeer, intro controllerInt
 		},
 	})
 	if err != nil {
+		// 记录过公钥（IK）却走不下去，几乎只有一种可能：被控端重装过、换了
+		// 机器，或者库里的公钥已经不是它的了。原来的实现把这种失败当
+		// serverError/incompatible，页面显示「两端版本不一致」，用户永远找不到
+		// 「重新批准」这个出口。明确拒绝类的错误保持原样。
+		if peerKey != nil && !errors.Is(err, errRefused) && !errors.Is(err, errVersion) &&
+			!errors.Is(err, errPairingRequired) {
+			return nil, fmt.Errorf("%w（%v）", errPeerKey, err)
+		}
 		return nil, err
 	}
 	// 握手用的读超时到此为止：控制流后面要一直挂着等被控端的消息。

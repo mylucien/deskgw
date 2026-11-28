@@ -167,6 +167,38 @@ function goUp() {
 function join(dir: string, name: string) { return dir ? dir + '\\' + name : name }
 const fullPath = (name: string) => join(path.value, name)
 
+/**
+ * 发一个分片，网络层失败时重试几次。
+ *
+ * 原来除 409（offset 不一致）之外的任何错误都直接抛出去，整条上传 abort：
+ * Wi-Fi 抖一下、路由器 NAT 表满一下，几 GB 的进度就全没了。fetch 在网络层
+ * 失败时抛的是 TypeError（没有 status），5xx 也值得重试；令牌过期、配额
+ * 不足、路径非法这些重试没用，立刻抛。
+ */
+async function sendChunk(q: string, blob: Blob, hdrs: Record<string, string>) {
+  const maxAttempts = 4
+  let last: any
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await uploadChunk<{ offset: number }>(q, blob, hdrs)
+    } catch (e: any) {
+      last = e
+      const retryable = !e?.status || e.status >= 500
+      if (!retryable) throw e
+      if (attempt < maxAttempts) await new Promise((r) => window.setTimeout(r, 400 * attempt))
+    }
+  }
+  throw last
+}
+
+/** 传完/失败后过一会儿把这条记录摘掉，否则列表只会越积越长。 */
+function autoClear(tr: Transfer, ms: number) {
+  window.setTimeout(() => {
+    const i = transfers.value.findIndex((x) => x.id === tr.id)
+    if (i >= 0 && !transfers.value[i].cancellable) transfers.value.splice(i, 1)
+  }, ms)
+}
+
 async function onFiles(ev: Event) {
   const input = ev.target as HTMLInputElement
   const files = Array.from(input.files || [])
@@ -198,6 +230,7 @@ async function onFiles(ev: Event) {
         // 同名文件不再静默覆盖：先问一句。
         if (!window.confirm(`目标目录已有「${file.name}」，覆盖吗？`)) {
           tr.state = '已取消'; tr.pct = 0
+          autoClear(tr, 3000)
           continue
         }
         b = await begin(true)
@@ -210,7 +243,7 @@ async function onFiles(ev: Event) {
         const end = Math.min(offset + chunkSize, file.size)
         const q = '/files/upload/chunk?upload_id=' + encodeURIComponent(uploadId) + '&offset=' + offset
         try {
-          const r = await uploadChunk<{ offset: number }>(q, file.slice(offset, end), h())
+          const r = await sendChunk(q, file.slice(offset, end), h())
           offset = r.offset
         } catch (e: any) {
           // 服务端偏移和本地不一致（上一次分片其实写成功了）：从它给的
@@ -226,8 +259,11 @@ async function onFiles(ev: Event) {
       if (tr.cancelled) throw new Error('已取消')
       await post('/files/upload/finish', { upload_id: uploadId }, h())
       tr.state = '完成'; tr.pct = 100
+      autoClear(tr, 4000)
     } catch (e: any) {
       tr.state = '失败：' + (e?.message || '上传错误')
+      // 失败原因要留一会儿给人看，但别永远堆在列表里。
+      autoClear(tr, 30000)
       if (uploadId) {
         try { await post('/files/upload/abort', { upload_id: uploadId }, h()) } catch { /* ignore */ }
       }

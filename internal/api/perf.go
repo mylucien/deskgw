@@ -221,6 +221,12 @@ func (s *Server) perfApprove(w http.ResponseWriter, r *http.Request) {
 		serverError(w, err)
 		return
 	}
+	// 批准同时忘掉旧公钥：被控端重装过时旧公钥永远不会再对上，只有清掉才能
+	// 让下一次握手重新学。没重装的主机代价也只是多一个 XX 往返。
+	if err := host.ClearPerfKey(s.db, id); err != nil {
+		serverError(w, err)
+		return
+	}
 	if err := s.perf.Approve(uint32(code), id); err != nil {
 		// 批准没成功（控制码已经变了、或者主机 id 被占）：把刚建的主机删掉，
 		// 否则管理员每重试一次就多一条重复记录，还得手工清理。

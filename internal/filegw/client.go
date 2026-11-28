@@ -18,13 +18,16 @@ import (
 // 大文件分片上传会瞬时打满，必须设上限保护路由器与目标主机。
 const maxConns = 24
 
-// idleTimeout 是单次 SMB 读写的空闲上限。
+// idleTimeout 是单次 SMB 读写的期限（只在操作期间生效，做完就摘掉）。
 //
 // Connect 只给拨号与挂载设了超时，之后会把 deadline 清掉；目标主机卡住
 // （休眠、网络分区、安全软件拦截）时，读写会永久阻塞，一条连接就长期占着
-// 全局 24 个名额之一，几十次之后整个文件功能不可用。每次读写前把期限往后
-// 推一段，只要还有进展就不会误杀。
-const idleTimeout = 60 * time.Second
+// 全局 24 个名额之一，几十次之后整个文件功能不可用。每次操作前给一个期限，
+// 只要单次操作有进展就不会误杀。
+//
+// 注意它是「单次操作」的期限，不是「空闲多久断开」：分片上传之间的停顿不该
+// 受影响，所以操作结束就 relax。
+const idleTimeout = 120 * time.Second
 
 var connSlots = make(chan struct{}, maxConns)
 
@@ -151,7 +154,19 @@ func (c *Conn) touch() {
 	}
 }
 
-// File 是 *smb2.File 的薄包装：每次读写前把连接的空闲期限往后推，
+// relax 在操作结束后摘掉期限。
+//
+// go-smb2 每条连接有一个常驻的接收 goroutine，只要 deadline 还挂着，它就会在
+// 期限到点时读到超时并把整条连接废掉 —— 哪怕上层根本没在传输。分片上传之间
+// 的停顿（用户切走、网络慢）超过 idleTimeout 就会撞上这个，表现为「上传到
+// 一半莫名失败」。所以期限只在一次操作期间生效，做完立刻清掉。
+func (c *Conn) relax() {
+	if c.tcp != nil {
+		_ = c.tcp.SetDeadline(time.Time{})
+	}
+}
+
+// File 是 *smb2.File 的薄包装：每次读写期间挂一个期限，结束后摘掉，
 // 让卡死的目标机在 idleTimeout 后报错而不是一直挂着。
 type File struct {
 	f *smb2.File
@@ -160,33 +175,39 @@ type File struct {
 
 func (f *File) Read(p []byte) (int, error) {
 	f.c.touch()
+	defer f.c.relax()
 	return f.f.Read(p)
 }
 
 func (f *File) Write(p []byte) (int, error) {
 	f.c.touch()
+	defer f.c.relax()
 	return f.f.Write(p)
 }
 
 func (f *File) Seek(offset int64, whence int) (int64, error) {
 	f.c.touch()
+	defer f.c.relax()
 	return f.f.Seek(offset, whence)
 }
 
 func (f *File) Stat() (os.FileInfo, error) {
 	f.c.touch()
+	defer f.c.relax()
 	return f.f.Stat()
 }
 
 func (f *File) Close() error {
-	// 关闭不清 deadline：Close 也可能阻塞，让它受同一个上限约束。
+	// Close 也会阻塞（要等服务端回 close 应答），所以同样带期限。
 	f.c.touch()
+	defer f.c.relax()
 	return f.f.Close()
 }
 
 // List 返回目录下的条目。
 func (c *Conn) List(dir string) ([]Entry, error) {
 	c.touch()
+	defer c.relax()
 	infos, err := c.share.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -207,12 +228,14 @@ func (c *Conn) List(dir string) ([]Entry, error) {
 // Stat 返回文件信息。
 func (c *Conn) Stat(path string) (os.FileInfo, error) {
 	c.touch()
+	defer c.relax()
 	return c.share.Stat(path)
 }
 
 // OpenRead 以只读方式打开文件，供下载流式读取。
 func (c *Conn) OpenRead(path string) (*File, error) {
 	c.touch()
+	defer c.relax()
 	f, err := c.share.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
@@ -223,6 +246,7 @@ func (c *Conn) OpenRead(path string) (*File, error) {
 // OpenWrite 打开文件用于写入。offset>0 时不截断，用于断点续传。
 func (c *Conn) OpenWrite(path string, offset int64) (*File, error) {
 	c.touch()
+	defer c.relax()
 	flag := os.O_WRONLY | os.O_CREATE
 	if offset == 0 {
 		flag |= os.O_TRUNC
@@ -243,17 +267,20 @@ func (c *Conn) OpenWrite(path string, offset int64) (*File, error) {
 // Mkdir 创建目录。
 func (c *Conn) Mkdir(path string) error {
 	c.touch()
+	defer c.relax()
 	return c.share.Mkdir(path, 0777)
 }
 
 // Rename 重命名文件或目录。
 func (c *Conn) Rename(oldPath, newPath string) error {
 	c.touch()
+	defer c.relax()
 	return c.share.Rename(oldPath, newPath)
 }
 
 // Remove 删除文件或空目录。
 func (c *Conn) Remove(path string) error {
 	c.touch()
+	defer c.relax()
 	return c.share.Remove(path)
 }

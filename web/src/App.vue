@@ -1,6 +1,6 @@
 <template>
   <div class="shell">
-    <header v-if="state.user && !inSession" class="topbar">
+    <header v-if="state.user && !hideChrome" class="topbar">
       <div class="brand">
         <span class="logo">DG</span>
         <span>deskgw <small>远程桌面网关</small></span>
@@ -47,22 +47,33 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { state, applyMe } from './state'
 import { get, post } from './api'
-import { closeAllTabs, setMaxTabs } from './sessionTabs'
+import { setMaxTabs, workspace } from './sessionTabs'
+import { perfSession } from './perf'
+import { pwdOpen, openPasswordDialog, closePasswordDialog, logoutNow } from './account'
 import { useRouter, useRoute } from 'vue-router'
 
 const router = useRouter()
 const route = useRoute()
-const inSession = computed(() => route.name === 'session')
+// 会话页与性能模式都是「整屏远程画面」：顶部状态条让位给画面，其中的导航、
+// 账号与退出都挪进了各自的悬浮面板（性能模式在 PerfView 的面板里）。
+const hideChrome = computed(() => route.name === 'session' || route.name === 'perf')
 
 // 标签上限跟随服务端配额。
 watch(() => state.limits.max_sessions, (n) => setMaxTabs(n), { immediate: true })
 
 // 登录态是滑动的：只有 HTTP 请求才会续期。在 RDP 里连续用半小时以上，
 // 服务端会话就过期了，下一次点文件面板或返回列表直接被踢回登录页。
-// 页面前台时每 4 分钟碰一次 /api/me，既续期也顺带同步配额变化。
+// 每 4 分钟碰一次 /api/me，既续期也顺带同步配额变化。
+//
+// 后台标签页不能停：原来 hidden 就直接跳过，于是 RDP 标签挂后台半小时后
+// 会话过期，切回来那一次 /me 拿 401，整页跳登录，所有会话和标签一起丢。
+// 后台定时器会被浏览器降频到约每分钟一次，4 分钟的间隔照样成立；没有会话的
+// 纯浏览页才跳过，省得白耗。
 let heartbeat: number | undefined
 function beat() {
-  if (!state.user || document.visibilityState === 'hidden') return
+  if (!state.user) return
+  const busy = workspace.tabs.length > 0 || perfSession.current !== null
+  if (document.visibilityState === 'hidden' && !busy) return
   get<{ user: any; limits: any }>('/me')
     .then((r) => { if (state.user) applyMe(r) })
     .catch(() => { /* 真的过期时 api.ts 会统一跳登录页 */ })
@@ -82,17 +93,23 @@ onBeforeUnmount(() => {
 })
 
 // ---- 自助改密 ----
-const pwdOpen = ref(false)
+// 弹窗开在 App 里，但「改密码」的入口散落在各页（顶栏、性能模式的悬浮面板），
+// 所以开关放在 account.ts 里共享。
 const pwdBusy = ref(false)
 const pwdError = ref('')
 const pwd = reactive({ old: '', next: '', confirm: '' })
-function openPassword() {
+function resetPwd() {
   pwd.old = ''; pwd.next = ''; pwd.confirm = ''; pwdError.value = ''
-  pwdOpen.value = true
+}
+// 从别的页面打开的也要清成空白，不能带上一次没输完的内容。
+watch(pwdOpen, (v) => { if (v) resetPwd() })
+function openPassword() {
+  resetPwd()
+  openPasswordDialog()
 }
 function closePassword() {
-  pwdOpen.value = false
-  pwd.old = ''; pwd.next = ''; pwd.confirm = ''
+  closePasswordDialog()
+  resetPwd()
 }
 async function savePassword() {
   pwdError.value = ''
@@ -110,10 +127,7 @@ async function savePassword() {
 }
 
 async function logout() {
-  // 先断开标签：关闭 WASM 会话、断开 WS 并擦除内存中的 Windows 凭据。
-  closeAllTabs()
-  try { await post('/logout') } catch { /* ignore */ }
-  state.user = null
+  await logoutNow()
   router.push({ name: 'login' })
 }
 </script>

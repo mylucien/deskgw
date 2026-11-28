@@ -117,11 +117,13 @@ func TestErrorKind(t *testing.T) {
 		err  error
 		want string
 	}{
-		{errHostOffline, "codeNotFound"},
-		{errNotApproved, "codeNotFound"},
+		{errHostOffline, "hostOffline"},
+		{errNotApproved, "notApproved"},
 		{errHostBusy, "hostBusy"},
 		{errFull, "limit"},
 		{errKeyChanged, "hostKeyChanged"},
+		{errPeerKey, "hostKeyChanged"},
+		{errBadHost, "codeNotFound"},
 		{errPairingRequired, "pairingRequired"},
 		{errVersion, "incompatible"},
 		{errNoise, "incompatible"},

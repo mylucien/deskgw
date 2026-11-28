@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +39,9 @@ const (
 	// 局域网里都是善意设备。
 	connBurst  = 12
 	connWindow = 60
+	// headerTimeout 是读 9 字节会话头的上限。被控端开流之后会立刻写头，
+	// 5 秒还没到就说明这条流不值得等，取消它继续分拣。
+	headerTimeout = 5 * time.Second
 )
 
 // pendingTTL 供清理循环使用，单位秒。
@@ -94,6 +98,11 @@ type hostConn struct {
 	// 里的会话号分发，否则两个会话会互相抢流。
 	smu  sync.Mutex
 	subs map[uint64]chan sessionStream
+
+	// dgs 与之同理，分拣控制数据报：ReceiveDatagram 也是整条连接共用的，
+	// 每个会话各自读会让 Pong/Ack/Report 落到错误的会话上。
+	dmu sync.Mutex
+	dgs map[uint64]chan []byte
 }
 
 // sessionStream 是被控端新开的一条单向流以及它的通道号（流头已经读掉）。
@@ -140,10 +149,14 @@ func (h *hostConn) demux() {
 			return
 		}
 		var hdr [sessionHeaderLen]byte
+		// 会话头必须限时读完：AcceptUniStream 是串行的，某条流永远不发头就会
+		// 把这条连接上的所有分发都卡住（连别的会话的画面也一起停）。
+		_ = rs.SetReadDeadline(time.Now().Add(headerTimeout))
 		if _, err := io.ReadFull(rs, hdr[:]); err != nil {
 			rs.CancelRead(0)
 			continue
 		}
+		_ = rs.SetReadDeadline(time.Time{})
 		sid, lane, err := decodeSessionHeader(hdr[:])
 		if err != nil {
 			rs.CancelRead(0)
@@ -170,6 +183,57 @@ func (h *hostConn) sendSignal(msg []byte) error {
 	h.wmu.Lock()
 	defer h.wmu.Unlock()
 	return writeFrame(h.sig, msg)
+}
+
+// subscribeDatagram 给一个会话开一条数据报分发通道。缓冲几包，免得会话侧
+// 处理慢时把心跳整批丢掉。
+func (h *hostConn) subscribeDatagram(sid uint64) chan []byte {
+	ch := make(chan []byte, 16)
+	h.dmu.Lock()
+	h.dgs[sid] = ch
+	h.dmu.Unlock()
+	return ch
+}
+
+// unsubscribeDatagram 注销数据报分发通道并关闭它，让读取方退出。
+func (h *hostConn) unsubscribeDatagram(sid uint64) {
+	h.dmu.Lock()
+	if ch, ok := h.dgs[sid]; ok {
+		delete(h.dgs, sid)
+		close(ch)
+	}
+	h.dmu.Unlock()
+}
+
+// readDatagrams 是这条连接上唯一的数据报读者，按会话号分发给订阅者。
+//
+// 发送与注销都在 dmu 下做，通道关闭后不会再有写入，也就不会 panic。
+func (h *hostConn) readDatagrams() {
+	for {
+		b, err := h.conn.ReceiveDatagram(h.conn.Context())
+		if err != nil {
+			return
+		}
+		if len(b) < sessionHeaderLen || len(b) > datagramMax {
+			continue
+		}
+		if b[8] != kindControlDatagram {
+			continue
+		}
+		sid := binary.LittleEndian.Uint64(b[:8])
+		// 复制一份再分发：quic-go 的接收缓冲会被复用，消费者是异步的。
+		payload := make([]byte, len(b)-sessionHeaderLen)
+		copy(payload, b[sessionHeaderLen:])
+		h.dmu.Lock()
+		if ch := h.dgs[sid]; ch != nil {
+			select {
+			case ch <- payload:
+			default:
+				// 会话侧来不及时丢掉这一包：Ping/Ack 下个周期还会再发。
+			}
+		}
+		h.dmu.Unlock()
+	}
 }
 
 // New 读取（或生成）证书并绑定 UDP 端口。端口占用时返回错误，是否让整个
@@ -430,8 +494,10 @@ func (s *Server) serve(conn *quic.Conn) {
 	hc := &hostConn{
 		code: p.code, name: p.name, os: p.os, ip: ip, conn: conn, sig: st,
 		subs: map[uint64]chan sessionStream{},
+		dgs:  map[uint64]chan []byte{},
 	}
 	go hc.demux()
+	go hc.readDatagrams()
 
 	s.cmu.Lock()
 	old := s.conns[p.code]
@@ -478,13 +544,24 @@ func (s *Server) serve(conn *quic.Conn) {
 	}
 }
 
-// detach 只在当前连接仍属于这个控制码时清理，避免把新连接的状态删掉。
+// detach 只在当前连接仍属于这个控制码时清理。
+//
+// 关键是不能无条件把注册表标成离线：被控端重启时，新连接往往先接上、旧连接
+// 过几秒才超时退出，旧连接一退就把新连接标成离线，待批准项从列表消失；
+// 已批准的主机则会被 StartSession 判成「未批准」，页面显示被控端不在线，
+// 直到它下一次重连。
 func (s *Server) detach(code uint32, conn *quic.Conn, name string) {
 	s.cmu.Lock()
-	if hc := s.conns[code]; hc != nil && hc.conn == conn {
+	cur := s.conns[code]
+	owner := cur != nil && cur.conn == conn
+	if owner {
 		delete(s.conns, code)
 	}
 	s.cmu.Unlock()
+	if !owner {
+		log.Printf("性能模式：被控端旧连接退出 %s（控制码 %d），在线状态交给新连接", name, code)
+		return
+	}
 	s.reg.setOnline(code, false)
 	log.Printf("性能模式：被控端离线 %s（控制码 %d）", name, code)
 }

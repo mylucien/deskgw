@@ -1,5 +1,5 @@
 <template>
-  <div class="perf-page" ref="pageEl">
+  <div class="perf-page" ref="pageEl" :class="{ immersive }">
     <div class="stage" ref="stage">
       <canvas
         ref="canvas"
@@ -33,6 +33,8 @@
         class="ime"
         rows="1"
         tabindex="-1"
+        inputmode="text"
+        enterkeyhint="enter"
         autocomplete="off"
         autocorrect="off"
         autocapitalize="off"
@@ -40,7 +42,7 @@
         aria-hidden="true"
         @input="onImeInput"
         @compositionend="onCompositionEnd"
-        @paste="onPaste"
+        @focus="onImeFocus"
         @blur="onImeBlur"
       ></textarea>
 
@@ -76,12 +78,19 @@
             <h3>已连接，正在等画面</h3>
             <p class="muted">{{ waitingText }}</p>
             <p v-if="encoderName" class="muted small">编码器：{{ encoderName }}</p>
+            <p v-if="firstFrameStuck" class="muted small">
+              被控端可能锁屏、正在等 UAC 授权，或者画面采集没有启动。可以先断开重连。
+            </p>
           </template>
         </div>
       </div>
 
       <div v-if="banner" class="banner">{{ banner }}</div>
     </div>
+
+    <!-- 沉浸模式（浏览器不支持元素全屏时的退路）没有系统全屏的退出途径，
+         留一个贴顶的退出按钮，免得用户只能刷新页面。 -->
+    <button v-if="immersive" class="exit-fs" @click="exitImmersive">退出全屏</button>
 
     <!-- mousedown.prevent：按钮不抢焦点，点完面板还能继续打字。 -->
     <button class="fab" :class="{ on: menuOpen, drag: dragging }" :style="fabStyle"
@@ -108,6 +117,18 @@
           <span v-if="stats.errors">· 解码错误 {{ stats.errors }}</span>
         </div>
         <div v-if="hostHostname" class="p-sub">被控端：{{ hostHostname }}</div>
+        <!-- 多显示器：协议没有运行中切换的消息，view 只在握手（ControllerIntro）
+             里给一次，所以选屏靠重连生效。这里给出可点的入口，别让人以为
+             画面是坏的。 -->
+        <div v-if="displays.length > 1" class="p-sub">
+          显示器 {{ displays.length }} 个 · 被控端在显示 {{ currentDisplay + 1 }}
+          <div class="seg seg-disp">
+            <button v-for="(d, i) in displays" :key="i" :class="{ on: displayIndex === i }"
+              :title="`${d.name || '屏幕 ' + (i + 1)} · ${d.width}×${d.height}`"
+              @click="switchDisplay(i)">屏 {{ i + 1 }}</button>
+          </div>
+          <span v-if="switchingDisplay">正在切换到显示器 {{ displayIndex + 1 }}…</span>
+        </div>
       </div>
 
       <template v-if="state === 'ready'">
@@ -134,9 +155,33 @@
         <p v-if="!hostTouch" class="p-note">被控端不支持触摸，可使用指针</p>
       </template>
 
+      <!-- 全屏与软键盘是「看和输」两个最常用的动作，放在面板里而不是画面上，
+           免得挡住远端画面。触屏设备才需要软键盘按钮。 -->
+      <div class="p-div">显示</div>
+      <div class="seg" :class="{ seg1: !touchDevice }">
+        <button :class="{ on: isFullscreen }" :title="fullscreenTip" @click="toggleFullscreen">
+          {{ isFullscreen ? '退出全屏' : '全屏' }}
+        </button>
+        <button v-if="touchDevice" :class="{ on: keyboardUp }" :disabled="state !== 'ready'"
+          :title="keyMode === 'physical' ? '物理键模式不发送输入法内容' : '弹出系统输入法'"
+          @click="toggleKeyboard">{{ keyboardUp ? '收起键盘' : '键盘' }}</button>
+      </div>
+      <p v-if="touchDevice && keyMode === 'text'" class="p-note">
+        手机/平板点画面不会自动弹键盘：要打字时点上面的「键盘」。
+      </p>
+
+      <!-- 顶栏隐藏后，导航与账号入口都在这儿。 -->
+      <div class="p-div">账号</div>
+      <div class="p-account">
+        <span class="p-nm">{{ userName }}<i v-if="userRole" class="p-role">{{ userRole }}</i></span>
+        <button class="p-link" @click="openPasswordDialog">改密码</button>
+        <button class="p-link" @click="signOut">退出</button>
+      </div>
+
       <div class="p-foot">
+        <button v-if="state === 'ready'" class="danger" @click="hangup">断开连接</button>
         <button @click="leave">返回主机列表</button>
-        <button v-if="state === 'ready'" class="danger" @click="hangup">断开</button>
+        <button v-if="isAdmin" @click="goAdmin">管理后台</button>
       </div>
     </div>
   </div>
@@ -148,8 +193,11 @@ import { useRouter } from 'vue-router'
 import { perfSession, closePerf } from '../perf'
 import { connectPerf } from '../perf/client'
 import type { PerfConnection, PerfReady, PerfStats } from '../perf/client'
-import type { HostEvent, InputEvent, QualitySettings } from '../perf/messages'
+import type { DisplayInfo, HostEvent, InputEvent, QualitySettings } from '../perf/messages'
 import { post } from '../api'
+// 本文件里的 state 是会话状态机，登录态用别名，别搅在一起。
+import { state as appState } from '../state'
+import { openPasswordDialog, logoutNow } from '../account'
 
 type State = 'connecting' | 'ready' | 'error' | 'ended'
 
@@ -169,6 +217,14 @@ const banner = ref('')
 const encoderName = ref('')
 // 被控端自报的机器名，和后台登记的名字可能不一样，连着的时候两个都显示。
 const hostHostname = ref('')
+// 被控端报告的显示器列表与当前显示的那一块。
+const displays = ref<DisplayInfo[]>([])
+const currentDisplay = ref(0)
+// 想看的显示器序号：握手时写进 ControllerIntro.view，换屏靠重连生效。
+const displayIndex = ref(0)
+const switchingDisplay = ref(false)
+// ready 之后迟迟没有首帧（锁屏、UAC、采集没起来）时给一句提示。
+const firstFrameStuck = ref(false)
 const frameSize = reactive({ w: 0, h: 0 })
 const stats = reactive<PerfStats>({ fps: 0, kbps: 0, bytes: 0, dropped: 0, dropRate: 0, rtt: 0, errors: 0 })
 // 自绘光标的兜底图：还没收到被控端形状时用普通模式同款箭头。
@@ -268,14 +324,19 @@ const vh = ref(window.innerHeight)
 
 let conn: PerfConnection | null = null
 let bannerTimer = 0
+let firstFrameTimer = 0
+/** ready 之后等首帧的上限，超过就提示可能是锁屏/UAC。 */
+const FIRST_FRAME_WAIT_MS = 15_000
 
 const hints: Record<string, string> = {
-  codeNotFound: '被控端不在线：确认 Airhand 正在运行，且已连上这台网关。',
+  codeNotFound: '主机与票据对不上：返回主机列表重新进入。',
+  hostOffline: '被控端不在线：确认 Airhand 正在运行，且已连上这台网关。',
+  notApproved: '这台被控端还没在后台批准：到「性能模式」待批准列表里点批准。',
   hostBusy: '这台被控端已经有会话了，先结束那一个再试。',
   pairingRequired: '被控端的 config.toml 里没有这台网关的控制端公钥，补上 [[paired]] 后重启 Airhand。',
-  hostKeyChanged: '被控端换了身份密钥（重装或换机），需要在后台重新批准。',
+  hostKeyChanged: '被控端换了身份密钥（重装或换机），到后台的待批准列表里重新批准一次即可。',
   incompatible: '两端的会话版本不一致，升级到同一版本。',
-  limit: '达到并发上限，稍后再试或调高后台的限额。',
+  limit: '网关的并发名额满了，稍后再试或调高后台的限额。',
   disabled: '性能模式没有启用，检查网关的 perf.enabled。',
   serverError: '网关连不上被控端（拨号超时或链路中断），稍后重试；持续失败请看网关日志。',
   connectFailed: '连接没有建立：票据一次性有效，网关也可能拒绝了升级。点「重新连接」换一张票据再试。',
@@ -346,6 +407,129 @@ const panelStyle = computed(() => {
 })
 
 function closeMenu() { menuOpen.value = false }
+
+// ---- 全屏 ---------------------------------------------------------------
+//
+// 与 RDP 会话页同一套：先试元素全屏，浏览器不支持就退成「沉浸模式」。
+// iOS Safari 到现在也没实现元素的 requestFullscreen，只能靠沉浸模式把页面
+// 铺满可视区；真要连状态栏一起收掉，得「添加到主屏幕」后从 PWA 打开。
+const immersive = ref(false)
+const nativeFullscreen = ref(false)
+const isFullscreen = computed(() => immersive.value || nativeFullscreen.value)
+const fullscreenTip = computed(() =>
+  isFullscreen.value ? '退出全屏' : '铺满整个屏幕，把浏览器界面收起来',
+)
+
+/** 全屏切换会改画布尺寸，虚拟光标与悬浮按钮的位置都得重算。 */
+function afterFullscreen() {
+  nextTick(() => { measurePage(); drawVirtualCursor() })
+}
+
+function enterImmersive() {
+  immersive.value = true
+  afterFullscreen()
+  // 说清楚为什么没进真正的全屏，免得以为按钮坏了。
+  if (!document.fullscreenElement) {
+    setBanner('这台浏览器不支持原生全屏，已铺满整个页面；要真全屏请「添加到主屏幕」后再打开。')
+  }
+}
+
+function exitImmersive() {
+  immersive.value = false
+  afterFullscreen()
+}
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) {
+    // 老 Safari 用的是带前缀的那一套，两个都试一遍。
+    const exit = document.exitFullscreen?.bind(document)
+      || (document as Document & { webkitExitFullscreen?: () => void }).webkitExitFullscreen?.bind(document)
+    try { void Promise.resolve(exit?.()).catch(() => { /* 已经退出了 */ }) } catch { /* 同上 */ }
+    return
+  }
+  if (immersive.value) { exitImmersive(); return }
+  const el = pageEl.value as (HTMLDivElement & { webkitRequestFullscreen?: () => Promise<void> }) | null
+  if (!el) return
+  // 老一点的 Safari 只认 webkit 前缀那一版。
+  const req = el.requestFullscreen?.bind(el) || el.webkitRequestFullscreen?.bind(el)
+  // 进全屏就是要看画面，面板先收起来。
+  menuOpen.value = false
+  if (!req) { enterImmersive(); return }
+  try {
+    Promise.resolve(req()).catch(enterImmersive)
+  } catch {
+    enterImmersive()
+  }
+}
+
+function onFullscreenChange() {
+  nativeFullscreen.value = !!document.fullscreenElement
+  afterFullscreen()
+}
+
+// ---- 账号入口（顶栏隐藏后挪到这里） -------------------------------------
+const userName = computed(() => appState.user?.username || '未登录')
+const userRole = computed(() => appState.user?.role || '')
+const isAdmin = computed(() => appState.user?.role === 'admin')
+
+async function signOut() {
+  shutdown()
+  closePerf()
+  await logoutNow()
+  router.push({ name: 'login' })
+}
+
+function goAdmin() {
+  shutdown()
+  closePerf()
+  router.push({ name: 'admin' })
+}
+
+// ---- 软键盘（手机 / 平板） ----------------------------------------------
+//
+// 文本都经隐藏的 textarea 上屏（输入法候选框要跟手），但它在触屏上没有焦点，
+// 软键盘就不会出来；而「点画面就弹键盘」在手机上纯属误触，所以面板里单独留
+// 一个「键盘」按钮。安卓上用返回键收起键盘不会触发 blur，焦点还留在输入框上，
+// 靠 visualViewport 的高度变化把状态改回来，否则按钮一直显示「收起键盘」。
+const keyboardUp = ref(false)
+
+function onImeFocus() {
+  keyboardUp.value = true
+}
+
+function showKeyboard() {
+  if (state.value !== 'ready') return
+  if (keyMode.value === 'physical') {
+    setBanner('物理键模式不发送输入法内容，先切到「文本」再弹键盘。')
+    return
+  }
+  focusIme()
+  keyboardUp.value = true
+  // 面板盖着半屏，收起来才看得见远端。
+  menuOpen.value = false
+}
+
+function hideKeyboard() {
+  ime.value?.blur()
+  keyboardUp.value = false
+  canvas.value?.focus({ preventScroll: true })
+}
+
+function toggleKeyboard() {
+  if (keyboardUp.value) hideKeyboard()
+  else showKeyboard()
+}
+
+/** 软键盘弹收都要重新摆虚拟光标：可视区高度变了。 */
+function onViewportResize() {
+  const vv = window.visualViewport
+  if (!vv) return
+  if (document.activeElement !== ime.value) {
+    keyboardUp.value = false
+    return
+  }
+  keyboardUp.value = window.innerHeight - vv.height > 120
+}
 
 function onFabDown(e: PointerEvent) {
   if (e.pointerType === 'mouse' && e.button !== 0) return
@@ -506,7 +690,9 @@ function flushInput() {
   if (!pending.length) return
   const events = pending
   pending = []
-  conn?.sendInput(events, Math.round(performance.now() * 1000))
+  // 时间戳由 Worker 取：协议要求输入与 Ping 用同一个时钟，主线程与 Worker
+  // 是两个 realm，各自的 performance.now() 起点不同。
+  conn?.sendInput(events)
 }
 
 function push(ev: InputEvent) {
@@ -699,7 +885,8 @@ function onPointerDown(ev: PointerEvent) {
   if (isTouchPointer(ev)) {
     ev.preventDefault()
     // 焦点给画布而不是隐藏输入框：手机别弹软键盘，桌面键盘照常由 window 接。
-    canvas.value?.focus({ preventScroll: true })
+    // 但键盘已经弹着的时候别把焦点抢回来 —— 一抢软键盘就收起来，正在打的字就断了。
+    if (document.activeElement !== ime.value) canvas.value?.focus({ preventScroll: true })
     fingerPts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY })
     if (fingerPts.size >= 2) { beginScroll(); return }
     const now = Date.now()
@@ -745,6 +932,11 @@ function onPointerDown(ev: PointerEvent) {
   // 否则焦点还留在面板按钮上，onKey 会把按键让给按钮。
   if (keyMode.value === 'text' && ev.pointerType !== 'touch') focusIme(ev)
   else canvas.value?.focus({ preventScroll: true })
+  // 被控端藏了光标（游戏）时只发相对位移：不锁定指针的话，鼠标到窗口边缘
+  // 就停住，转视角会卡在边界上。锁定后浏览器不再夹住光标。
+  if (cursorMode.value === 0 && document.pointerLockElement !== canvas.value) {
+    canvas.value?.requestPointerLock?.()
+  }
   const p = point(ev)
   if (p && cursorMode.value !== 0) pushMove({ kind: 'move', x: p.x, y: p.y })
   const b = webButton[ev.button]
@@ -932,7 +1124,19 @@ function onKey(ev: KeyboardEvent, down: boolean) {
 
   // Ctrl+V（macOS 上是 Cmd+V）：不直接发物理键，先由 paste 事件把本地剪贴板
   // 推给被控端，再让它粘贴。否则被控端粘的是它自己的旧剪贴板。
-  if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && ev.code === 'KeyV') return
+  //
+  // 但 paste 只有焦点在可编辑元素上才会派发。物理键模式的焦点在 canvas 上，
+  // 浏览器不会派发 paste —— 这就是「物理键模式按 Ctrl+V 没反应」的原因。
+  // 这种情况下自己读剪贴板；文本模式走原来的 paste 事件，不重复读。
+  if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && ev.code === 'KeyV') {
+    const t = ev.target as HTMLElement | null
+    const editable = t?.tagName === 'TEXTAREA' || t?.tagName === 'INPUT' || t?.isContentEditable
+    if (down && !editable) {
+      ev.preventDefault()
+      void pasteFromClipboard()
+    }
+    return
+  }
 
   if (!down) {
     if (ev.code && heldKeys.delete(ev.code)) {
@@ -948,7 +1152,14 @@ function onKey(ev: KeyboardEvent, down: boolean) {
   ev.preventDefault()
 }
 
-/** 把输入代理挪到指针处（输入法候选框跟着走）并聚焦。 */
+/**
+ * 把输入代理挪到指针处（输入法候选框跟着走）并聚焦。
+ *
+ * 已经在焦点上时也要重新聚焦一次：安卓和部分平板上用软键盘的返回键收起键盘，
+ * 只是把键盘关掉，焦点仍留在输入框里。这时再调 focus()，浏览器认为「焦点没变」，
+ * 不会弹键盘 —— 这就是「有时候点了没反应、键盘不出来」的根因。先 blur 再 focus，
+ * 浏览器才会当成一次新的聚焦。
+ */
 function focusIme(ev?: { clientX: number; clientY: number }) {
   const el = ime.value
   const box = stage.value
@@ -960,13 +1171,30 @@ function focusIme(ev?: { clientX: number; clientY: number }) {
     el.style.left = x + 'px'
     el.style.top = y + 'px'
   }
-  if (document.activeElement !== el) el.focus({ preventScroll: true })
+  if (document.activeElement === el) el.blur()
+  el.focus({ preventScroll: true })
+  // 安卓 Chrome 提供显式的虚拟键盘接口，focus 之后补一刀成功率更高。
+  const vk = (navigator as Navigator & { virtualKeyboard?: { show?: () => void } }).virtualKeyboard
+  if (vk?.show) {
+    try { vk.show() } catch { /* 不支持就算了，靠 focus 本身 */ }
+  }
 }
 
 /** 把焦点还给画面。面板按钮点完（或用键盘选完）还能继续输入。 */
 function refocus() {
-  if (inputMode.value === 'pointer' && keyMode.value === 'text') focusIme()
-  else canvas.value?.focus({ preventScroll: true })
+  if (inputMode.value !== 'pointer' || keyMode.value !== 'text') {
+    canvas.value?.focus({ preventScroll: true })
+    return
+  }
+  // 触屏上 focusIme 会顺手把软键盘弹出来，点一下「画质」就弹键盘太吵；
+  // 但键盘已经开着时要把焦点留在输入框上，否则改个设置键盘就被收走了。
+  if (touchDevice && !keyboardUp.value) {
+    canvas.value?.focus({ preventScroll: true })
+    return
+  }
+  // 已经聚焦就不要再折腾：focusIme 的 blur+focus 会让软键盘先收再弹，闪一下。
+  if (document.activeElement === ime.value) return
+  focusIme()
 }
 
 /** 上屏的文本（含输入法、粘贴）走 ControllerMsg 的 Text，交给被控端按 Unicode 注入。 */
@@ -1003,6 +1231,7 @@ function onCompositionEnd() {
 }
 
 function onImeBlur() {
+  keyboardUp.value = false
   if (ime.value) ime.value.value = ''
 }
 
@@ -1011,8 +1240,9 @@ function onImeBlur() {
 // 被控端复制之后自动推到本地；本地粘贴时先把内容推过去再让被控端粘贴。
 // 不做「本地剪贴板一变就推」，那样要么轮询要权限，要么两头来回推。
 
-/** 上一次从被控端收到的文本，用来吃掉它自己推回来的重复内容。 */
+/** 上一次从被控端收到的文本，与收到的时刻。 */
 let lastRemote = ''
+let lastRemoteAt = 0
 /** 页面没有焦点时写入本地剪贴板会失败，先存着，下次点击画面再试。 */
 let pendingRemote = ''
 
@@ -1025,24 +1255,66 @@ async function writeLocalClipboard(text: string) {
   }
 }
 
+/**
+ * 被控端剪贴板变了。
+ *
+ * 去重只能按「短时间内内容相同」判：之前是「文本等于上次远端文本就丢」，
+ * 于是本地把内容改成别的之后，在远端再复制一次同样的内容就再也同步不过来。
+ * 同一条通知重复送达只可能连着来，1.5 秒的窗口足够吃掉重复而不误伤。
+ */
 function onRemoteClipboard(text: string) {
-  if (!text || text === lastRemote) return
+  if (!text) return
+  const now = Date.now()
+  if (text === lastRemote && now - lastRemoteAt < 1500) return
   lastRemote = text
+  lastRemoteAt = now
   if (document.hasFocus()) void writeLocalClipboard(text)
   else pendingRemote = text
 }
 
-/** 粘贴：本地剪贴板的内容先推给被控端，再发一次 Ctrl+V 让它自己粘。 */
+/**
+ * 粘贴（Ctrl/Cmd+V）。
+ *
+ * 监听挂在 window 上而不是隐藏的输入框上：物理键模式与触屏模式下指针按下
+ * 时焦点给的是 canvas，paste 事件落在 canvas / body 上，只挂 textarea 就永远
+ * 收不到 —— 表现为这两种模式下 Ctrl+V 既不发按键，也不推剪贴板。
+ */
 function onPaste(ev: ClipboardEvent) {
+  if (state.value !== 'ready') return
   const text = ev.clipboardData?.getData('text/plain') || ''
   if (!text) return
   // 不让它落进隐藏的输入框（否则会当成一次 Text 输入又发一遍）。
   ev.preventDefault()
-  conn?.sendClipboard(text)
-  lastRemote = text
-  // Ctrl 已经按下去了（物理键），这里只补 V，收尾交给真实的 keyup。
-  push({ kind: 'key', code: 'KeyV', down: true })
-  push({ kind: 'key', code: 'KeyV', down: false })
+  // 超过网关的单条上限会被截断：说一声，别让人以为粘丢了半截。
+  if (conn?.sendPaste(text)) {
+    setBanner('粘贴内容超过单条上限（约 1.5 MB），已截断。')
+  }
+}
+
+/**
+ * 直接读系统剪贴板。
+ *
+ * 物理键模式（以及触屏）下焦点在 canvas 上，浏览器不会派发 paste，只能自己读。
+ * readText 需要安全上下文（HTTPS，本站就是）和一次用户手势（keydown 算），
+ * 但权限被拒时只能提示；Safari 会弹「允许粘贴」。
+ */
+async function pasteFromClipboard() {
+  if (state.value !== 'ready') return
+  const read = navigator.clipboard?.readText?.bind(navigator.clipboard)
+  if (!read) {
+    setBanner('这个浏览器不支持读取剪贴板，请切到「文本」模式再按 Ctrl+V。')
+    return
+  }
+  try {
+    const text = await read()
+    if (!text) return
+    if (conn?.sendPaste(text)) {
+      setBanner('粘贴内容超过单条上限（约 1.5 MB），已截断。')
+    }
+  } catch {
+    // 多半是权限被拒（或页面不在安全上下文）。别静默失败，否则又像「按了没反应」。
+    setBanner('浏览器拒绝了剪贴板权限：允许后重按 Ctrl+V，或切到「文本」模式粘贴。')
+  }
 }
 
 /** 失焦或页面隐藏时松开所有按键，免得打字机效应。 */
@@ -1119,7 +1391,11 @@ function drawFrame() {
     }
   }
   frame.close()
-  hasFrame.value = true
+  if (!hasFrame.value) {
+    hasFrame.value = true
+    window.clearTimeout(firstFrameTimer)
+    firstFrameStuck.value = false
+  }
 }
 
 /**
@@ -1146,6 +1422,8 @@ function onCursorImage(ev: Extract<HostEvent, { type: 'cursorImage' }>) {
 function onEvent(ev: HostEvent) {
   if (ev.type === 'hello') {
     hostHostname.value = ev.hostname
+    displays.value = ev.displays
+    currentDisplay.value = ev.current
     // 被控端没声明 touch 时，面板里的「触摸」选项保持不可选。
     hostTouch.value = ev.touch
     if (inputMode.value === 'touch' && !ev.touch) {
@@ -1154,6 +1432,10 @@ function onEvent(ev: HostEvent) {
       inputMode.value = 'pointer'
       try { localStorage.setItem('deskgw.perfInputMode', 'pointer') } catch { /* 忽略 */ }
     }
+  } else if (ev.type === 'displays') {
+    // 被控端换了分辨率、插拔显示器、切换主屏都会发这一条。
+    displays.value = ev.displays
+    currentDisplay.value = ev.current
   } else if (ev.type === 'encoder') {
     encoderName.value = `${ev.name}${ev.hardware ? '（硬件）' : ''}`
   } else if (ev.type === 'cursor') {
@@ -1195,7 +1477,16 @@ function connect() {
       state.value = 'ready'
       // 握手用的是被控端默认画质；连上后按界面选的档位补发一次（client 会在 Worker 就绪后发）。
       conn?.sendSettings(currentQuality())
-      if (inputMode.value === 'pointer' && keyMode.value === 'text') nextTick(() => focusIme())
+      // 触屏上不要主动聚焦输入框：没有用户手势，安卓会「聚焦了但不弹键盘」，
+      // 焦点留在输入框里之后反而更难弹出来。手机/平板要打字按面板里的「键盘」。
+      if (!touchDevice && inputMode.value === 'pointer' && keyMode.value === 'text') nextTick(() => focusIme())
+      // 锁屏、UAC 授权框、采集没起来时画面就是不来。没有时限的话界面一直停在
+      // 「正在等画面」，用户不知道该等还是该重连。
+      window.clearTimeout(firstFrameTimer)
+      firstFrameStuck.value = false
+      firstFrameTimer = window.setTimeout(() => {
+        if (!hasFrame.value && state.value === 'ready') firstFrameStuck.value = true
+      }, FIRST_FRAME_WAIT_MS)
     },
     onEvent,
     onVideo,
@@ -1214,11 +1505,31 @@ function connect() {
       errorText.value = message
       state.value = 'error'
     },
-  })
+  }, displayIndex.value)
+}
+
+/** 换显示器：协议只认握手时给的 view，改完重连一次才生效。 */
+async function switchDisplay(i: number) {
+  if (i === displayIndex.value || switchingDisplay.value) return
+  displayIndex.value = i
+  switchingDisplay.value = true
+  setBanner(`正在切换到显示器 ${i + 1}：需要重连一次会话。`)
+  try {
+    await reconnect()
+  } finally {
+    switchingDisplay.value = false
+  }
 }
 
 function shutdown() {
   window.clearTimeout(bannerTimer)
+  window.clearTimeout(firstFrameTimer)
+  firstFrameStuck.value = false
+  keyboardUp.value = false
+  // 断开时把软键盘一起收掉，别留一个没有会话的键盘。
+  ime.value?.blur()
+  displays.value = []
+  currentDisplay.value = 0
   // 先把按下的键、触摸点松开再断，免得被控端留下按住的状态。
   releaseAll()
   releaseTouches()
@@ -1290,7 +1601,10 @@ async function reconnect() {
     perfSession.current.wsPath = t.ws_path
     connect()
   } catch (e: any) {
-    errorText.value = '重连失败：' + (e.message || '无法签发票据')
+    // 票据接口的错误码与 ws 的 error.kind 是同一套，直接拿来选提示文案，
+    // 否则 limit / disabled 这些写好的提示永远走不到。
+    errorKind.value = typeof e?.code === 'string' ? e.code : 'serverError'
+    errorText.value = '重连失败：' + (e?.message || '无法签发票据')
     state.value = 'error'
   } finally {
     reconnecting.value = false
@@ -1301,14 +1615,23 @@ onMounted(() => {
   loadFabPos()
   nextTick(() => {
     measurePage()
-    if (inputMode.value === 'pointer' && keyMode.value === 'text') focusIme()
+    if (!touchDevice && inputMode.value === 'pointer' && keyMode.value === 'text') focusIme()
   })
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('keyup', onKeyUp)
   window.addEventListener('blur', onBlur)
   window.addEventListener('resize', onWindowResize)
+  // 挂在 window 上：物理键与触屏模式下焦点在 canvas 上，paste 事件落在画布
+  // 或 body 上再冒泡上来，只挂隐藏输入框收不到。
+  window.addEventListener('paste', onPaste)
   document.addEventListener('visibilitychange', onVisibility)
   document.addEventListener('pointerdown', onDocDown)
+  // 原生全屏退出走的是浏览器（Esc / 系统手势），状态得从事件里同步回来。
+  document.addEventListener('fullscreenchange', onFullscreenChange)
+  // 软键盘弹收只是改可视区高度，不会触发 window.resize。
+  const vv = window.visualViewport
+  vv?.addEventListener('resize', onViewportResize)
+  vv?.addEventListener('scroll', onViewportResize)
   connect()
 })
 
@@ -1317,8 +1640,13 @@ onBeforeUnmount(() => {
   window.removeEventListener('keyup', onKeyUp)
   window.removeEventListener('blur', onBlur)
   window.removeEventListener('resize', onWindowResize)
+  window.removeEventListener('paste', onPaste)
   document.removeEventListener('visibilitychange', onVisibility)
   document.removeEventListener('pointerdown', onDocDown)
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
+  const vv = window.visualViewport
+  vv?.removeEventListener('resize', onViewportResize)
+  vv?.removeEventListener('scroll', onViewportResize)
   shutdown()
   // 浏览器后退离开时不会走 leave()，票据留在内存里会被下一次进入误用。
   closePerf()
@@ -1330,10 +1658,20 @@ onBeforeUnmount(() => {
   position: relative;
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 56px);
+  /* 性能模式隐藏了顶部状态条，画面直接吃满视口。dvh 让手机地址栏收起时不跳。 */
+  height: 100vh;
+  height: 100dvh;
   min-height: 0;
   background: #0f1115;
 }
+/* 浏览器不给元素全屏时的退路：铺满可视区，盖住页面其它部分。 */
+.perf-page.immersive { position: fixed; inset: 0; z-index: 9999; }
+
+.exit-fs { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 45;
+  padding: 5px 12px; border-radius: 999px; font-size: 12px;
+  background: rgba(24, 27, 33, .86); border: 1px solid rgba(255, 255, 255, .16);
+  color: #e5e7eb; -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); }
+.exit-fs:hover { background: rgba(38, 43, 52, .94); }
 
 /* ---------- 悬浮按钮与面板（与普通模式同一套路） ---------- */
 .fab { position: absolute; left: 0; top: 0; width: 46px; height: 46px; padding: 0;
@@ -1371,18 +1709,33 @@ onBeforeUnmount(() => {
   font-variant-numeric: tabular-nums; flex: none; }
 .p-meta b { color: #e5e7eb; letter-spacing: .5px; }
 .p-sub { color: #8f9aaa; font-size: 11px; }
+/* 顶栏隐藏后，用户名与「改密码 / 退出」挪到这里。 */
+.p-account { display: flex; align-items: center; gap: 6px; padding: 0 12px 4px;
+  font-size: 12px; color: #e5e7eb; flex: none; }
+.p-account .p-nm { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.p-account .p-role { margin-left: 6px; font-style: normal; font-size: 10px; color: #93c5fd;
+  border: 1px solid rgba(147, 197, 253, .35); border-radius: 4px; padding: 0 4px; }
+.p-account .p-link { flex: none; border: 0; background: transparent; color: #98a1b0;
+  font-size: 12px; padding: 4px 2px; }
+.p-account .p-link:hover { color: #93c5fd; }
 .p-div { padding: 8px 12px 6px; font-size: 11px; color: #98a1b0; flex: none; }
 .p-note { margin: 6px 12px 0; font-size: 11px; color: #8f9aaa; line-height: 1.6; flex: none; }
 .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 0 12px; padding: 3px;
   background: #16191f; border: 1px solid rgba(255, 255, 255, .08); border-radius: 8px; flex: none; }
 /* 画质三档：不加这条会按两列排成 2+1。 */
 .seg.seg3 { grid-template-columns: repeat(3, 1fr); }
+/* 只有「全屏」一个按钮时（桌面没有软键盘），别留半格空位。 */
+.seg.seg1 { grid-template-columns: 1fr; }
+/* 显示器按钮：数量不定（常见 2–3 块），按数量摊开，别沿用两列固定。 */
+.seg.seg-disp { grid-template-columns: repeat(auto-fit, minmax(48px, 1fr)); margin: 6px 0 0; }
 .seg button { border: 0; padding: 6px 0; border-radius: 6px; background: transparent;
   color: #98a1b0; font-size: 12px; }
 .seg button.on { background: #2563eb; color: #fff; }
 .seg button:hover:not(:disabled):not(.on) { background: rgba(255, 255, 255, .06); }
 .seg button:disabled { opacity: .4; cursor: not-allowed; }
-.p-foot { display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+/* 面板底部只有一个动作：「返回主机列表」与「断开」原来并排放着，功能重叠；
+   返回走页面顶部的导航，这里只留当前状态下真正有用的那一个。 */
+.p-foot { display: grid; grid-template-columns: 1fr; gap: 6px;
   padding: 12px 12px 12px; margin-top: auto; flex: none; }
 .p-foot button { font-size: 12px; padding: 6px 0; background: #232830;
   border-color: #333a45; color: #e5e7eb; }

@@ -22,7 +22,21 @@ import (
 // 证书就够用。证书与 HTTPS 用的那张分开：更换 HTTPS 证书的域名时不会连带把
 // 所有被控端的配对打散。
 func loadOrCreateCert(certFile, keyFile string) (tls.Certificate, string, error) {
-	if certExists(certFile) && certExists(keyFile) {
+	certOK, keyOK := certExists(certFile), certExists(keyFile)
+	// 只缺一个时不能「两个一起重写」：之前只要丢掉其中一个文件，证书就被悄悄
+	// 换掉，所有被控端里写死的 server_fp 一起失效，而且日志里只有一句正常启动。
+	// 与 loadOrCreateIdentity 保持一致：损坏/缺失就明确报错，由管理员决定是
+	// 补齐文件还是删掉重来。
+	if certOK != keyOK {
+		missing := keyFile
+		if keyOK {
+			missing = certFile
+		}
+		return tls.Certificate{}, "", fmt.Errorf(
+			"性能模式证书不完整：缺少 %s。补齐该文件后重启；若确实要重新生成，"+
+				"把证书与私钥两个文件都删掉（之后所有被控端的 server_fp 都要重填）", missing)
+	}
+	if certOK && keyOK {
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			return tls.Certificate{}, "", fmt.Errorf("读取性能模式证书: %w", err)
