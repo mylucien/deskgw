@@ -113,7 +113,8 @@ func (r *cbReader) mapLen() (int, error) {
 		return 0, err
 	}
 	// 每个条目至少占两字节（键和值各一），否则一个前缀就能让这边以为要读几十亿项。
-	if major != cbMap || n*2 > uint64(len(r.b)-r.i) {
+	// 先做除法再比较：n*2 在 n 接近 2^63 时会溢出回绕，检查就失效了。
+	if major != cbMap || n > uint64(len(r.b)-r.i)/2 {
 		return 0, errCBOR
 	}
 	return int(n), nil

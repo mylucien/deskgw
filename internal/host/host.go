@@ -285,6 +285,16 @@ func SetPerfKey(db *sql.DB, id int64, key []byte) error {
 	return err
 }
 
+// ClearPerfKey 忘掉记录的公钥，让下次会话重新走 Noise XX 学一遍。
+//
+// 被控端重装系统后会生成新的身份密钥，IK 永远握不上手；批准流程过去只更新
+// 名称与时间，公钥还是旧的，等于「提示你去重新批准，但批准没有用」。批准时
+// 清掉这一列，下一轮握手就能重新学，不必删主机重建。
+func ClearPerfKey(db *sql.DB, id int64) error {
+	_, err := db.Exec(`UPDATE hosts SET perf_key=NULL WHERE id=?`, id)
+	return err
+}
+
 // PerfSecret 返回批准时记下的重连密钥（16 字节）。网关重启后靠它把回来的
 // 被控端认回原身份，不用管理员再批准一次。
 func PerfSecret(db *sql.DB, id int64) ([]byte, error) {

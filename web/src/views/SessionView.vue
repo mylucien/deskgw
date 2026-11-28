@@ -67,6 +67,11 @@
             <option value="1280x720">1280 × 720</option>
             <option value="1920x1080">1920 × 1080</option>
           </select>
+          <!-- 颜色深度是全局设置，下一次建立连接时生效。 -->
+          <select :value="colorDepth" title="颜色深度（下次连接生效）" @change="onDepth">
+            <option value="32">32 位色</option>
+            <option value="16">16 位色</option>
+          </select>
           <button v-if="api.canFile" :class="{ on: api.showFiles }" :disabled="!api.connected"
             @click="act(() => api?.toggleFiles(), true)">文件</button>
           <button :disabled="!api.connected" @click="act(() => api?.toggleFullscreen(), true)">全屏</button>
@@ -305,6 +310,24 @@ function toggleKeyboard() {
 function onResolution(e: Event) {
   const v = (e.target as HTMLSelectElement).value
   act(() => api.value?.setResolution(v), true)
+}
+
+// ---- 颜色深度 -------------------------------------------------------------
+// 之前在网关页用 ?depth=32 才能改，而且只对当前标签页有效；默认还是 16 位，
+// 渐变壁纸上一眼就能看出色带。改成持久化的用户设置，连接时读取。
+const DEPTH_KEY = 'deskgw.rdpDepth'
+function readDepth(): string {
+  try {
+    return localStorage.getItem(DEPTH_KEY) === '16' ? '16' : '32'
+  } catch { /* 隐私模式 */ }
+  return '32'
+}
+const colorDepth = ref(readDepth())
+function onDepth(e: Event) {
+  const v = (e.target as HTMLSelectElement).value === '16' ? '16' : '32'
+  colorDepth.value = v
+  try { localStorage.setItem(DEPTH_KEY, v) } catch { /* 隐私模式 */ }
+  notice.value = `颜色深度已改为 ${v} 位，下一次连接生效`
 }
 function select(key: string) {
   workspace.active = key

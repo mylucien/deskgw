@@ -40,12 +40,18 @@ export interface PerfHandlers {
 }
 
 export interface PerfConnection {
-  /** 发一批输入事件；t 是这些事件在控制端时钟上的时刻（微秒）。 */
-  sendInput(events: InputEvent[], t: number): void
+  /** 发一批输入事件。时间戳由 Worker 取，与心跳同一个时钟。 */
+  sendInput(events: InputEvent[]): void
   /** 设置画质（帧率/码率/短边），连上后与切换档位时各发一次。 */
   sendSettings(quality: QualitySettings): void
   /** 把一段文本推到被控端的剪贴板（大块通道）。 */
   sendClipboard(text: string): void
+  /**
+   * 粘贴：先把文本推到大块通道，等它真的写进 WebSocket 之后再补一次 Ctrl+V。
+   * 剪贴板走大块流、按键走控制流，两条流之间没有先后保证，直接连着发偶尔会
+   * 粘到被控端的旧剪贴板内容。返回 true 表示内容超长被截断了。
+   */
+  sendPaste(text: string): boolean
   close(): void
 }
 
@@ -55,8 +61,44 @@ const READY_TIMEOUT_MS = 20_000
 const BEAT_MS = 30_000
 /** 超过这么久没收到任何消息就认为链路已经断了（半开连接不会触发 onclose）。 */
 const SILENCE_MS = 75_000
+/** 文本写进 WebSocket 之后等被控端收录剪贴板的时间，再让它粘贴。 */
+const PASTE_GAP_MS = 60
+/** 关闭时留给 Worker 把上行队列发完的时间。 */
+const SHUTDOWN_GRACE_MS = 300
+/**
+ * 单条剪贴板的字节上限。网关的读限制是 maxBulkMsg(2MiB) 加转发头与长度前缀，
+ * 这里留出 CBOR 与密封开销的余量。按 UTF-8 字节算：一个汉字占 3 字节，
+ * 按字符数限会在中文上超出一倍多。
+ */
+export const MAX_CLIPBOARD_BYTES = 1_500_000
+/** Worker 启动前最多攒多少个视频块（控制/大块通道的块一律不丢）。 */
+const VIDEO_BACKLOG = 32
 
-export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): PerfConnection {
+/** 按 UTF-8 字节截断，避开被切开的半个字符。返回是否发生了截断。 */
+export function clipClipboard(text: string): { text: string; clipped: boolean } {
+  if (!text) return { text, clipped: false }
+  const bytes = new TextEncoder().encode(text)
+  if (bytes.length <= MAX_CLIPBOARD_BYTES) return { text, clipped: false }
+  const strict = new TextDecoder('utf-8', { fatal: true })
+  // 最多回退 3 个字节就能落到完整字符的边界上。
+  for (let end = MAX_CLIPBOARD_BYTES; end > MAX_CLIPBOARD_BYTES - 4; end--) {
+    try {
+      return { text: strict.decode(bytes.subarray(0, end)), clipped: true }
+    } catch {
+      /* 尾部半个字符，再退一个字节 */
+    }
+  }
+  return { text: new TextDecoder().decode(bytes.subarray(0, MAX_CLIPBOARD_BYTES)), clipped: true }
+}
+
+/** 下行帧：0x01 是流数据，通道号 ≥ 2 表示画面。丢了只会少一帧。 */
+function isVideoFrame(buf: ArrayBuffer): boolean {
+  if (buf.byteLength < 2) return false
+  const u8 = new Uint8Array(buf, 0, 2)
+  return u8[0] === 0x01 && u8[1] >= 2
+}
+
+export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers, display = 0): PerfConnection {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const ws = new WebSocket(proto + '//' + location.host + wsPath)
   ws.binaryType = 'arraybuffer'
@@ -73,29 +115,63 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
   // ready 回调先于 Worker 启动，连上时的首次画质设置先攒着，Worker 就绪再发。
   let pendingQuality: QualitySettings | null = null
   const backlog: ArrayBuffer[] = []
+  let videoBacklog = 0
   let beat = 0
   let readyTimer = 0
   let lastInbound = Date.now()
+  let pasteSeq = 0
 
+  // 关闭时先把 Worker 的上行队列发完再 terminate：加密是异步链，
+  // 立刻 terminate 会让「松开所有按键」一次也发不出去。
   const shutdown = (silent = false) => {
     if (closed) return
     closed = true
     window.clearInterval(beat)
     window.clearTimeout(readyTimer)
-    worker?.terminate()
-    worker = null
-    ws.onclose = null
     ws.onmessage = null
     ws.onerror = null
     ws.onopen = null
-    if (!silent && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(JSON.stringify({ type: 'disconnect' }))
-      } catch {
-        /* 已经断了 */
+
+    const w = worker
+    worker = null
+    workerReady = false
+    let finished = false
+    const finish = () => {
+      if (finished) return
+      finished = true
+      w?.terminate()
+      ws.onclose = null
+      if (!silent && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(JSON.stringify({ type: 'disconnect' }))
+        } catch {
+          /* 已经断了 */
+        }
+      }
+      ws.close()
+    }
+
+    if (!w) {
+      finish()
+      return
+    }
+    w.onmessage = (ev: MessageEvent) => {
+      const m = ev.data
+      if (m?.type === 'uplink') {
+        // 收尾期间的上行帧照常发出去（releaseAll 就在里面）。
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(m.data)
+          } catch {
+            /* 已断 */
+          }
+        }
+      } else if (m?.type === 'flushed') {
+        finish()
       }
     }
-    ws.close()
+    w.postMessage({ type: 'flush' })
+    window.setTimeout(finish, SHUTDOWN_GRACE_MS)
   }
 
   // 只报一次收尾，并顺手把连接关掉。silent 让关闭帧不再发 disconnect。
@@ -104,6 +180,10 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
     settled = true
     fn()
     shutdown(true)
+  }
+
+  const queueInput = (events: InputEvent[]) => {
+    if (workerReady && worker) worker.postMessage({ type: 'input', events })
   }
 
   function startWorker(keys: any) {
@@ -118,10 +198,23 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
             pendingQuality = null
           }
           for (const buf of backlog.splice(0)) worker!.postMessage({ type: 'frame', data: buf }, [buf])
+          videoBacklog = 0
           break
         case 'uplink':
           if (ws.readyState === WebSocket.OPEN) ws.send(m.data)
           break
+        case 'clipboard-sent': {
+          // 文本已经在 WebSocket 上了，稍等被控端收录，再补 Ctrl+V。
+          const id = m.id as number
+          if (id !== pasteSeq) break
+          window.setTimeout(() => {
+            queueInput([
+              { kind: 'key', code: 'KeyV', down: true },
+              { kind: 'key', code: 'KeyV', down: false },
+            ])
+          }, PASTE_GAP_MS)
+          break
+        }
         case 'video':
           h.onVideo?.(m.frame)
           break
@@ -145,7 +238,11 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
   }
 
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'connect', host: 'h' + hostId }))
+    // display 只影响握手时的 ControllerIntro.view：多显示器机器上指定先推
+    // 哪块屏。协议没有运行中切换的消息，换屏要重连（面板里选完就重连）。
+    const hello: Record<string, unknown> = { type: 'connect', host: 'h' + hostId }
+    if (display > 0) hello.display = display
+    ws.send(JSON.stringify(hello))
   }
 
   ws.onerror = () => {
@@ -174,8 +271,17 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
       return
     }
     const buf = ev.data as ArrayBuffer
-    if (workerReady && worker) worker.postMessage({ type: 'frame', data: buf }, [buf])
-    else if (backlog.length < 64) backlog.push(buf)
+    if (workerReady && worker) {
+      worker.postMessage({ type: 'frame', data: buf }, [buf])
+      return
+    }
+    // Worker 启动前的积压。只丢视频块：控制通道与大块通道是长度前缀流，
+    // 丢掉中间一块会让浏览器从错位的位置继续切帧，最终报「控制通道解密失败」。
+    if (isVideoFrame(buf)) {
+      if (videoBacklog >= VIDEO_BACKLOG) return
+      videoBacklog++
+    }
+    backlog.push(buf)
   }
 
   ws.onclose = () => {
@@ -224,10 +330,20 @@ export function connectPerf(wsPath: string, hostId: number, h: PerfHandlers): Pe
 
   return {
     sendClipboard(text: string) {
-      if (worker && workerReady && text) worker.postMessage({ type: 'clipboard', text })
+      const clipped = clipClipboard(text)
+      if (worker && workerReady && clipped.text) {
+        worker.postMessage({ type: 'clipboard', text: clipped.text })
+      }
     },
-    sendInput(events: InputEvent[], t: number) {
-      if (workerReady && worker) worker.postMessage({ type: 'input', events, t })
+    sendPaste(text: string) {
+      const clipped = clipClipboard(text)
+      if (!worker || !workerReady || !clipped.text) return clipped.clipped
+      const id = ++pasteSeq
+      worker.postMessage({ type: 'clipboard', text: clipped.text, ack: id })
+      return clipped.clipped
+    },
+    sendInput(events: InputEvent[]) {
+      queueInput(events)
     },
     sendSettings(quality: QualitySettings) {
       if (workerReady && worker) worker.postMessage({ type: 'settings', quality })

@@ -30,7 +30,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { connectRdp, describeError, isFingerprintMismatch, isLogonFailure, pickDesktopSize, resolveWsUrl } from '../rdp'
 import type { InputMode, RdpSession } from '../rdp'
 import { post } from '../api'
@@ -105,12 +105,16 @@ function fitViewport() {
   if (resolution.value !== '0') return
   // 软键盘弹出会把可视高度压掉一半，此时按剩余空间算分辨率会让远端画面缩水。
   if (keyboardOpen.value) return
+  // 元素脱离文档或整块隐藏时 clientWidth/Height 是 0。原来会回落到 1280×720，
+  // 于是「在主机页缩放窗口 → 已保活的会话被重设成 1280×720」。
+  // 量不到尺寸就跳过，等回到工作区 onActivated 再量。
+  if (el.clientWidth < 2 || el.clientHeight < 2) return
   // 按物理像素取基准（DPR 封顶 2）；手机再压一道长边上限，避免 wasm 解码跟不上。
   const dpr = Math.min(window.devicePixelRatio || 1, 2)
   const coarse = window.matchMedia('(pointer: coarse)').matches
   const size = pickDesktopSize(
-    (el.clientWidth || 1280) * dpr,
-    (el.clientHeight || 720) * dpr,
+    el.clientWidth * dpr,
+    el.clientHeight * dpr,
     coarse ? 1280 : 1920,
   )
   if (size.width === vpWidth.value && size.height === vpHeight.value) return
@@ -193,6 +197,14 @@ watch(() => props.active, async (v) => {
 
 interface SessionTicket { session_id: number; ws_path: string }
 
+/** 颜色深度是全局设置，下一次建立连接时生效（wasm 侧在 connect 时读取）。 */
+function readColorDepth(): 16 | 32 {
+  try {
+    return localStorage.getItem('deskgw.rdpDepth') === '16' ? 16 : 32
+  } catch { /* 隐私模式 */ }
+  return 32
+}
+
 async function openSession(): Promise<RdpSession> {
   if (!canvas.value) throw new Error('画布未就绪')
   const creds = props.tab.creds
@@ -204,6 +216,7 @@ async function openSession(): Promise<RdpSession> {
     credentials: { username: creds.username, password: creds.password, domain: creds.domain },
     width: vpWidth.value,
     height: vpHeight.value,
+    colorDepth: readColorDepth(),
     allowClipboard: state.user?.allow_clipboard !== false,
     inputMode: touch ? inputMode.value : undefined,
     onLog: addLog,
@@ -309,6 +322,12 @@ onMounted(async () => {
   await nextTick()
   fitViewport()
   await connect()
+})
+
+// SessionView 被 keep-alive 缓存：切到主机页时会 deactivate，容器宽高变成 0，
+// 再切回来必须重新量一次，否则仍按离开时的尺寸显示（或停在 1280×720）。
+onActivated(() => {
+  void nextTick(() => scheduleFit())
 })
 
 onBeforeUnmount(() => {

@@ -78,10 +78,34 @@ self.onmessage = (ev: MessageEvent) => {
   if (!m || typeof m !== 'object') return
   if (m.type === 'start') void start(m.keys)
   else if (m.type === 'frame') onBinary(new Uint8Array(m.data as ArrayBuffer))
-  else if (m.type === 'input') sendControl(encodeInput(m.t, m.events as InputEvent[]))
+  // 输入的时间戳在这里取：协议要求它与 Ping 用同一个时钟，而 Ping 用的是
+  // Worker 里的 performance.now()。主线程是另一个 realm，时间原点不同。
+  else if (m.type === 'input') sendControl(encodeInput(nowUs(), m.events as InputEvent[]))
   else if (m.type === 'settings') sendControl(encodeSettings(m.quality as QualitySettings))
-  else if (m.type === 'clipboard') sendBulk(encodeClipboard(String(m.text || '')))
-  else if (m.type === 'stop') stop()
+  else if (m.type === 'clipboard') {
+    const text = String(m.text || '')
+    void sendBulk(encodeClipboard(text)).then(() => {
+      // 告诉主线程这块文本已经交给 WebSocket，它才会补 Ctrl+V。
+      if (m.ack) post({ type: 'clipboard-sent', id: m.ack })
+    })
+  } else if (m.type === 'flush') {
+    // 主线程要关连接了：把队列里剩下的上行帧发完（含 releaseAll），并停掉
+    // 定时器，但不要置 stopped —— 否则链上的帧会被直接丢掉。
+    flush()
+  } else if (m.type === 'stop') stop()
+}
+
+/**
+ * flush 等上行链跑完再回报。加密与封包都是异步的，主线程如果直接 terminate，
+ * 退出时那一批「松开按键」永远发不出去。
+ */
+function flush() {
+  if (pingTimer !== undefined) (self as any).clearInterval(pingTimer)
+  if (reportTimer !== undefined) (self as any).clearInterval(reportTimer)
+  pingTimer = undefined
+  reportTimer = undefined
+  const p = upChain.catch(() => {})
+  p.then(() => post({ type: 'flushed' }))
 }
 
 async function start(bundle: any) {
@@ -425,7 +449,7 @@ function sendAck(seq: number, arrived: number, stream: number) {
 
 function sendDatagram(plain: Uint8Array) {
   if (!keys) return
-  upChain = upChain.then(async () => {
+  void enqueue(async () => {
     if (!keys || stopped) return
     const sealed = await sealUnit(keys.datagramSend, keys.datagramSendCounter++, plain)
     const out = new Uint8Array(2 + sealed.length)
@@ -437,9 +461,10 @@ function sendDatagram(plain: Uint8Array) {
 }
 
 // sendBulk 写大块通道：帧里只有长度前缀，网关负责写会话头、开流。
-function sendBulk(plain: Uint8Array) {
-  if (!keys) return
-  upChain = upChain.then(async () => {
+// 返回的 Promise 在这条帧真的交给主线程（并已 ws.send）之后才 resolve。
+function sendBulk(plain: Uint8Array): Promise<void> {
+  if (!keys) return Promise.resolve()
+  return enqueue(async () => {
     if (!keys || stopped) return
     const sealed = await sealUnit(keys.bulkSend, keys.bulkSendCounter++, plain)
     const out = new Uint8Array(6 + sealed.length)
@@ -453,7 +478,7 @@ function sendBulk(plain: Uint8Array) {
 
 function sendControl(plain: Uint8Array) {
   if (!keys) return
-  upChain = upChain.then(async () => {
+  void enqueue(async () => {
     if (!keys || stopped) return
     const sealed = await sealUnit(keys.controlSend, keys.sendCounter++, plain)
     const out = new Uint8Array(6 + sealed.length)
@@ -463,6 +488,18 @@ function sendControl(plain: Uint8Array) {
     out.set(sealed, 6)
     post({ type: 'uplink', data: out.buffer }, [out.buffer])
   })
+}
+
+/**
+ * enqueue 串行化上行：控制通道的计数必须一个接一个，剪贴板与按键也要保持
+ * 调用顺序。链上一次失败不能让它永久断掉，否则后面所有输入都发不出去。
+ */
+function enqueue(work: () => Promise<void>): Promise<void> {
+  const p = upChain.then(work).catch((e) => {
+    console.warn('[perf] 上行失败', e)
+  })
+  upChain = p
+  return p
 }
 
 let askedAt = 0

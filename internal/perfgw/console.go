@@ -27,13 +27,28 @@ const (
 	// connectWait 是建立 WebSocket 之后等第一条 connect 消息的时间。
 	connectWait = 10 * time.Second
 	// consolePing 是路由器主动发心跳的间隔；pongWait 是收不到任何消息的上限。
-	consolePing = 30 * time.Second
-	pongWait    = 90 * time.Second
+	//
+	// pongWait 直接决定「浏览器异常断线后会话名额还被占多久」：Wi-Fi 掉线、
+	// 手机关屏都不会立刻发 FIN，原来的 90 秒意味着重连要报近两分钟的
+	// hostBusy。心跳加密文往返只有几毫秒，收到就回，45 秒足够容忍抖动。
+	consolePing = 15 * time.Second
+	pongWait    = 45 * time.Second
 	// readyTimeout 是写 ready 的时限。ready 里有密钥，不能写到一半就挂着。
 	readyTimeout = 10 * time.Second
 	// 上行违规次数上限：偶尔一条格式不对可以忽略，连续几十条说明对端不是
 	// 我们的控制端，直接断开。
 	maxViolations = 32
+	// violationWindow 是违规计数的衰减窗口：窗内没有新的违规就清零。
+	// 计数只增不减时，一次长会话迟早会因为几次偶发违规被杀掉。
+	violationWindow = 30 * time.Second
+
+	// maxUpMsg 是浏览器单条上行消息的上限。大块通道（剪贴板）的负载上限是
+	// maxBulkMsg，整条 WebSocket 消息还要加 2 字节转发头与 4 字节长度前缀。
+	//
+	// 这个值必须与 upBulk 的校验一致：之前按控制通道的 64KiB 设，粘一段两万
+	// 多字的文本就会超限，gorilla 直接断开连接，整个会话跟着结束，用户只看到
+	// 「连接已关闭」。
+	maxUpMsg = maxBulkMsg + upHeader + 8
 )
 
 var (
@@ -41,6 +56,10 @@ var (
 	errKeyChanged = errors.New("被控端公钥无效")
 	// errBadHost 表示 connect 里的主机占位符不合法。
 	errBadHost = errors.New("主机占位符不合法")
+	// errPeerKey 表示按记录的公钥做 IK 握手失败：被控端重装过、换了机器，或者
+	// 数据库里的公钥已经不是它的了。单列一个错误，界面上才能引导去重新批准，
+	// 而不是含糊地说「两端版本不一致」。
+	errPeerKey = errors.New("被控端的身份密钥与记录的不一致，需要在后台重新批准")
 )
 
 // HostInfo 是接入层要的上层数据：主机名、系统、已记录的公钥。
@@ -129,6 +148,17 @@ func (c *Console) CloseUser(userID int64) int {
 	return c.closeWhere(func(e liveConsole) bool { return e.userID == userID })
 }
 
+// CloseUserHosts 断开某个用户落在指定主机上的性能模式会话。
+// 撤销单台主机授权时用，别的会话不受影响。
+func (c *Console) CloseUserHosts(userID int64, lost map[int64]bool) int {
+	if len(lost) == 0 {
+		return 0
+	}
+	return c.closeWhere(func(e liveConsole) bool {
+		return e.userID == userID && lost[e.hostID]
+	})
+}
+
 func (c *Console) closeWhere(match func(liveConsole) bool) int {
 	c.mu.Lock()
 	var targets []func()
@@ -191,11 +221,14 @@ func (c *Console) Serve(w http.ResponseWriter, r *http.Request, cl ConsoleClient
 		return
 	}
 	defer ws.Close()
-	ws.SetReadLimit(maxControlMsg + upHeader)
+	// 读限制按最大的一条上行消息算：控制帧 64KiB、剪贴板 2MiB。按下行控制帧的
+	// 64KiB 设会让「粘贴一段长文本」变成断线。
+	ws.SetReadLimit(maxUpMsg)
 
 	// 第一条必须是 connect，带上主机占位符。票据已经绑了主机，这里再核一次，
 	// 避免浏览器拿着 A 的票据去连 B。
-	if err := checkConnect(ws, info.ID); err != nil {
+	display, err := checkConnect(ws, info.ID)
+	if err != nil {
 		c.reject(ws, tk, cl, "codeNotFound", err.Error())
 		return
 	}
@@ -214,7 +247,7 @@ func (c *Console) Serve(w http.ResponseWriter, r *http.Request, cl ConsoleClient
 	}
 	started := time.Now()
 	// 被控端托盘上显示的控制端名称用登录名，方便本机用户知道是谁连进来的。
-	intro := browserIntro()
+	intro := browserIntro(display)
 	if name := textutil.Runes(cl.Username, 32); name != "" {
 		intro.name = name
 	}
@@ -279,6 +312,7 @@ func (c *Console) pump(ws *websocket.Conn, rl *relay) {
 		return ws.SetReadDeadline(time.Now().Add(pongWait))
 	})
 	bad := 0
+	badAt := time.Time{}
 	for {
 		_ = ws.SetReadDeadline(time.Now().Add(pongWait))
 		mt, data, err := ws.ReadMessage()
@@ -301,23 +335,31 @@ func (c *Console) pump(ws *websocket.Conn, rl *relay) {
 				return
 			}
 		case websocket.BinaryMessage:
-			if len(data) >= upHeader {
-				var err error
-				switch data[0] {
-				case frameUpStream:
-					err = rl.upStream(data[1], data[upHeader:])
-				case frameUpDatagram:
-					err = rl.upDatagram(data[1], data[upHeader:])
-				default:
-					err = errUpLane
+			if len(data) < upHeader {
+				continue
+			}
+			var err error
+			switch data[0] {
+			case frameUpStream:
+				err = rl.upStream(data[1], data[upHeader:])
+			case frameUpDatagram:
+				err = rl.upDatagram(data[1], data[upHeader:])
+			default:
+				err = errUpLane
+			}
+			if err == nil {
+				// 好帧：距上次违规超过窗口就清零。限速抖动、浏览器回收内存丢掉
+				// 半帧都只算偶发，不该在长会话里攒到 32 次把会话杀掉。
+				if bad > 0 && time.Since(badAt) > violationWindow {
+					bad = 0
 				}
-				if err != nil {
-					bad++
-					if bad > maxViolations {
-						rl.stop("上行消息不合法")
-						return
-					}
-				}
+				continue
+			}
+			bad++
+			badAt = time.Now()
+			if bad > maxViolations {
+				rl.stop("上行消息不合法")
+				return
 			}
 		}
 	}
@@ -339,28 +381,37 @@ func keepalive(ws *websocket.Conn, rl *relay) {
 	}
 }
 
-// checkConnect 读第一条消息并核对主机占位符。
-func checkConnect(ws *websocket.Conn, hostID int64) error {
+// checkConnect 读第一条消息并核对主机占位符，顺带取出想看的显示器序号。
+//
+// display 是可选的：老前端不带这个字段，按 0 处理。它只进 ControllerIntro 的
+// view，会话中途换显示器要重连（协议里没有运行时切换的消息）。
+func checkConnect(ws *websocket.Conn, hostID int64) (uint8, error) {
 	_ = ws.SetReadDeadline(time.Now().Add(connectWait))
 	mt, data, err := ws.ReadMessage()
 	if err != nil {
-		return errors.New("没有收到 connect")
+		return 0, errors.New("没有收到 connect")
 	}
 	if mt != websocket.TextMessage {
-		return errors.New("第一条消息必须是 connect")
+		return 0, errors.New("第一条消息必须是 connect")
 	}
 	var m struct {
-		Type string `json:"type"`
-		Host string `json:"host"`
+		Type    string `json:"type"`
+		Host    string `json:"host"`
+		Display int    `json:"display"`
 	}
 	if err := json.Unmarshal(data, &m); err != nil || m.Type != "connect" {
-		return errors.New("第一条消息必须是 connect")
+		return 0, errors.New("第一条消息必须是 connect")
 	}
 	id, err := parseHostRef(m.Host)
 	if err != nil || id != hostID {
-		return errors.New("主机与票据不符")
+		return 0, errors.New("主机与票据不符")
 	}
-	return nil
+	// 一台机器最多 16 个显示器；超出的值当 0，别让畸形请求影响握手。
+	d := m.Display
+	if d < 0 || d > 15 {
+		d = 0
+	}
+	return uint8(d), nil
 }
 
 // parseHostRef 解析主机占位符 `h<id>`。
@@ -388,11 +439,14 @@ func parsePeerKey(b []byte) (*ecdh.PublicKey, error) {
 }
 
 // browserIntro 是握手时交给被控端的控制端介绍。初始画质用固定默认值，
-// 浏览器在 ready 之后用 Settings / View 消息再改。
-func browserIntro() controllerIntro {
+// 浏览器在 ready 之后用 Settings 消息再改。
+//
+// display 决定被控端先推哪一块屏。协议里没有运行中切换显示器的消息，
+// 所以换屏要在 connect 时指定、靠重连生效（前端在面板里选完就重连）。
+func browserIntro(display uint8) controllerIntro {
 	return controllerIntro{
 		name: "deskgw", os: "Web", settings: defaultQuality(),
-		view: []streamView{{display: 0, maxShort: 1080}},
+		view: []streamView{{display: display, maxShort: 1080}},
 	}
 }
 
@@ -449,11 +503,17 @@ func errorKind(err error) string {
 		return "limit"
 	case errors.Is(err, errPairingRequired):
 		return "pairingRequired"
-	case errors.Is(err, errHostOffline), errors.Is(err, errNotApproved),
-		errors.Is(err, errBadHost):
-		return "codeNotFound"
-	case errors.Is(err, errKeyChanged):
+	case errors.Is(err, errHostOffline):
+		// 不在线、未批准、主机停用、占位符不符原来都并成 codeNotFound，界面只能
+		// 说一句「被控端不在线」。现在分开：用户下一步该做什么完全不同 ——
+		// 一台去开 Airhand，一台去后台点批准。
+		return "hostOffline"
+	case errors.Is(err, errNotApproved):
+		return "notApproved"
+	case errors.Is(err, errPeerKey), errors.Is(err, errKeyChanged):
 		return "hostKeyChanged"
+	case errors.Is(err, errBadHost):
+		return "codeNotFound"
 	case errors.Is(err, errVersion), errors.Is(err, errNoise):
 		return "incompatible"
 	default:

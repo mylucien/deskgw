@@ -82,6 +82,18 @@ var (
 type outFrame struct {
 	text bool
 	data []byte
+	// recycle 在写完（或确定不再写）之后调用，把整块缓冲还给池子。视频块走
+	// 池子：一帧 32MiB 按 64KiB 切，MIPS 小路由上每次分配都会加重 GC。
+	recycle func()
+}
+
+// framePool 复用下行流数据块。缓冲大小固定为 downHeader+downChunk，恰好装下
+// 一块最大的转发帧；用完由 sink 归还。
+var framePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, downHeader+downChunk)
+		return &b
+	},
 }
 
 // sink 是单会话的 WebSocket 写队列。
@@ -198,6 +210,11 @@ func (s *sink) run() {
 }
 
 func (s *sink) write(f outFrame) bool {
+	defer func() {
+		if f.recycle != nil {
+			f.recycle()
+		}
+	}()
 	_ = s.ws.SetWriteDeadline(time.Now().Add(writeTimeout))
 	var err error
 	if f.text {
@@ -342,10 +359,9 @@ func (r *relay) acceptStreams(ctx context.Context) {
 			switch {
 			case st.lane == laneBulk:
 				// 剪贴板、光标图像：一条流挂整个会话，不能丢（丢了浏览器会
-				// 一直等长度前缀后面那半截），也不能设读超时。
-				// quic-go v0.66 的接收流要设过 deadline 才会把已到的数据交给
-				// 阻塞的读者：给一个很长的期限，相当于"不超时"。
-				_ = st.rs.SetReadDeadline(time.Now().Add(24 * time.Hour))
+				// 一直等长度前缀后面那半截），也不能设读超时 —— 会话空闲几小时
+				// 是常态，原来那句 24 小时的期限会让长会话的剪贴板与光标通道
+				// 无声失效。控制通道握手后同样清掉了 deadline，这里保持一致。
 				r.track(st.rs)
 				go func() {
 					defer r.untrack(st.rs)
@@ -408,35 +424,46 @@ func (r *relay) forward(rd io.Reader, lane uint8, seq uint32, droppable bool) {
 }
 
 // pushStream 发一块下行流数据。flags 为 0 表示这是流中间的普通块。
+//
+// 缓冲从池子取，队列满被丢弃时立刻归还；成功入队的由 sink 在写完后归还。
 func (r *relay) pushStream(lane uint8, seq uint32, flags uint8, data []byte, droppable bool) bool {
-	f := make([]byte, downHeader+len(data))
-	f[0] = frameDownStream
-	f[1] = lane
-	binary.LittleEndian.PutUint32(f[2:6], seq)
-	f[6] = flags
-	copy(f[downHeader:], data)
-	ok := r.sink.push(outFrame{data: f}, droppable)
-	return ok
+	fp := framePool.Get().(*[]byte)
+	buf := (*fp)[:downHeader+len(data)]
+	buf[0] = frameDownStream
+	buf[1] = lane
+	binary.LittleEndian.PutUint32(buf[2:6], seq)
+	buf[6] = flags
+	copy(buf[downHeader:], data)
+	if !r.sink.push(outFrame{data: buf, recycle: func() { framePool.Put(fp) }}, droppable) {
+		framePool.Put(fp)
+		return false
+	}
+	return true
 }
 
 // readDatagrams 转发控制数据报（Ping/Pong、Ack、Lost、Report 都在里面）。
+//
+// ReceiveDatagram 是整条 QUIC 连接共享的：同一台被控端上开两个会话时，如果每个
+// relay 各自读，谁先读到谁拿走，会话号不对的那条就被当成杂包丢掉。Pong/Ack/Report
+// 会随机落到错误的会话上，RTT 与码率自适应随之失灵。所以真正的读者只有一个
+// （hostConn.readDatagrams），这里按会话号从分发通道里取。
 func (r *relay) readDatagrams(ctx context.Context) {
+	ch := r.sess.host.subscribeDatagram(r.sid)
+	defer r.sess.host.unsubscribeDatagram(r.sid)
 	for {
-		b, err := r.conn.ReceiveDatagram(ctx)
-		if err != nil {
-			return
-		}
-		if len(b) < sessionHeaderLen || len(b) > datagramMax {
-			continue
-		}
-		if binary.LittleEndian.Uint64(b[:8]) != r.sid || b[8] != kindControlDatagram {
-			continue
-		}
-		f := make([]byte, datagramHeader+len(b)-sessionHeaderLen)
-		f[0] = frameDownDatagram
-		f[1] = b[8]
-		copy(f[datagramHeader:], b[sessionHeaderLen:])
-		if !r.sink.push(outFrame{data: f}, false) {
+		select {
+		case sealed, ok := <-ch:
+			if !ok {
+				return
+			}
+			f := make([]byte, datagramHeader+len(sealed))
+			f[0] = frameDownDatagram
+			f[1] = kindControlDatagram
+			copy(f[datagramHeader:], sealed)
+			if !r.sink.push(outFrame{data: f}, false) {
+				return
+			}
+		case <-ctx.Done():
 			return
 		}
 	}
